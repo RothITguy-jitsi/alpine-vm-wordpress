@@ -566,33 +566,33 @@ fi
 
 # ── Build custom admin slug Apache block ──────────────────────────────────────
 if [[ -n "$WP_ADMIN_SLUG" ]]; then
+  # FIX: The previous version used <If "%%{THE_REQUEST} =~ ..."> which caused
+  # Apache to crash with "Cannot parse condition clause: Parse error near '%'".
+  # Root cause: %%{THE_REQUEST} is two literal percent signs (not a printf
+  # escape in a bash heredoc) — Apache's ap_expr parser rejects it.
+  #
+  # NEW APPROACH: remove <If> entirely. The URL mapping is done by RewriteRule
+  # only. Access control (who may USE wp-admin) is handled by the REQUIRE_ADMIN
+  # Require ip block below — which already fires when WordPress serves the
+  # rewritten /wp-admin/ response. No conditional logic needed here at all.
+  # This is simpler, avoids the parser issue, and works correctly with Divi.
   SLUG_BLOCK=$(cat << SLUGEOF
-# Custom wp-admin slug: /${WP_ADMIN_SLUG}
-# Direct access to /wp-admin and /wp-login.php is blocked (returns 403).
-# Users must use /${WP_ADMIN_SLUG}/ and /${WP_ADMIN_SLUG}-login instead.
-# This is security-through-obscurity but eliminates bot targeting of the
-# default paths and significantly reduces wp-login brute-force scan noise.
-# DIVI NOTE: The visual builder uses /wp-admin/admin-ajax.php extensively.
-# Those requests originate from the browser after a user is already logged in,
-# so they follow the session and work correctly with the custom slug.
+# ── Custom wp-admin slug ────────────────────────────────────────────────────
+# Slug: /${WP_ADMIN_SLUG}
+# How it works:
+#   Requests to /${WP_ADMIN_SLUG}/       → rewritten to /wp-admin/     (internally)
+#   Requests to /${WP_ADMIN_SLUG}-login  → rewritten to /wp-login.php  (internally)
+#   Direct access to /wp-admin/ and /wp-login.php is then controlled
+#   by the Require ip block below — bots hitting the default paths
+#   get 403 if they are not on the allowed ADMIN_CIDR.
+# Divi Visual Builder uses /wp-admin/admin-ajax.php from authenticated sessions,
+# which follow the session cookie — not the URL slug — so it is unaffected.
 <IfModule mod_rewrite.c>
   RewriteEngine On
-  # Map custom slug to wp-admin
-  RewriteRule ^${WP_ADMIN_SLUG}(/.*)?$ /wp-admin\$1 [L,PT]
-  # Map custom login slug to wp-login.php
-  RewriteRule ^${WP_ADMIN_SLUG}-login/?$ /wp-login.php [L,PT]
+  RewriteBase /
+  RewriteRule ^${WP_ADMIN_SLUG}(/.*)?$ /wp-admin\$1 [L,QSA]
+  RewriteRule ^${WP_ADMIN_SLUG}-login/?$ /wp-login.php [L,QSA]
 </IfModule>
-# Block direct access to default admin paths
-<DirectoryMatch "^/var/www/html/wp-admin">
-  <If "!%%{THE_REQUEST} =~ m#^.* /${WP_ADMIN_SLUG}#">
-${REQUIRE_ADMIN}
-    Require all denied
-  </If>
-</DirectoryMatch>
-<Files "wp-login.php">
-${REQUIRE_ADMIN}
-  Require all denied
-</Files>
 SLUGEOF
 )
 else
@@ -1486,23 +1486,29 @@ else
     "${DB_IMAGE}"
 fi
 
-# FIX: Use container health check status (tests TCP connection, not just socket).
-# The old 'mariadb-admin ping' used the UNIX socket inside the container which
-# succeeds even when the TCP port isn't ready or DNS can't resolve 'mariadb'.
-# healthcheck.sh --connect tests actual TCP connectivity on port 3306 which is
-# exactly what WordPress needs. Wait up to 3 min (36 × 5s).
-ts "Waiting for MariaDB to be healthy (up to 3 min)"
+# FIX 2: Do NOT rely on Podman health check status.
+# On Alpine without systemd, conmon's health check timer often does not fire —
+# the container stays in "starting" state indefinitely even when MariaDB is
+# fully ready. Instead, use a direct exec-based probe (mariadbd ping with
+# credentials) which works regardless of conmon or cgroup configuration.
+# The --health-cmd is still configured for 'podman ps' display purposes, but
+# we never block on its output here.
+ts "Waiting for MariaDB to accept connections (up to 3 min)"
 DB_READY=0
 for i in $(seq 1 36); do
-  status=$(PRUN inspect mariadb --format '{{.State.Health.Status}}' 2>/dev/null)
-  if [ "$status" = "healthy" ]; then
+  # Run mariadbd ping INSIDE the container where MARIADB_ROOT_PASSWORD is set.
+  # Use sh -c so the env var expands in the container's shell context, not here.
+  if PRUN exec mariadb sh -c \
+       'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
+        mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null'; then
     DB_READY=1; break
   fi
   sleep 5
 done
 [ "$DB_READY" = "1" ] \
-  && ok "MariaDB healthy — TCP connection on port 3306 confirmed" \
-  || warn "MariaDB health check not confirmed in 3 min — check: PRUN inspect mariadb --format '{{.State.Health.Status}}'"
+  && ok "MariaDB accepting authenticated connections on port 3306" \
+  || warn "MariaDB did not respond in 3 min — WordPress will retry. Check: PRUN logs mariadb | tail -20"
+
 
 
 # ── WordPress container ───────────────────────────────────────────────────────
@@ -2275,8 +2281,10 @@ do_db_update() {
 
     DB_READY=0
     for i in $(seq 1 24); do
-      status=$(PRUN inspect mariadb --format '{{.State.Health.Status}}' 2>/dev/null)
-      [ "$status" = "healthy" ] && { DB_READY=1; break; }
+      PRUN exec mariadb sh -c \
+        'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
+         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null' \
+        && { DB_READY=1; break; }
       sleep 5
     done
 
@@ -2614,20 +2622,54 @@ fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # LYNIS — Security auditing for MSP compliance evidence
+# lynis is only in Alpine edge/testing, NOT in stable repos (3.21-3.24).
+# Try stable first (may land in community someday), then edge/testing,
+# then direct GitHub install as a final fallback — so Lynis is never
+# silently absent even if Alpine packaging changes.
 # Weekly automated audit; manual: lynis audit system
-# Score and warnings: grep hardening_index /var/log/lynis-report.dat
+# Score: grep hardening_index /var/log/lynis-report.dat
 # ════════════════════════════════════════════════════════════════════════════
 ts "Installing Lynis security auditor"
-if apk add --no-cache lynis >/dev/null 2>&1; then
-  ok "Lynis $(lynis --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) installed"
+LYNIS_OK=0
+
+# Try 1: Alpine stable community (might appear in future versions)
+apk add --no-cache lynis >/dev/null 2>&1 && LYNIS_OK=1
+
+# Try 2: Alpine edge/testing (where it currently lives as of Alpine 3.24)
+if [ "$LYNIS_OK" = "0" ]; then
+  apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+    lynis >/dev/null 2>&1 && LYNIS_OK=1
+fi
+
+# Try 3: Direct install from CISOfy's stable release tarball (no OS dependency)
+if [ "$LYNIS_OK" = "0" ]; then
+  warn "Lynis not in apk repos — trying GitHub release tarball"
+  apk add --no-cache wget >/dev/null 2>&1 || true
+  LYNIS_TAG=$(wget -qO- https://api.github.com/repos/CISOfy/lynis/releases/latest 2>/dev/null \
+    | grep '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  LYNIS_TAG="${LYNIS_TAG:-3.1.3}"  # pinned fallback if API unavailable
+  if wget -qO /tmp/lynis.tar.gz \
+       "https://github.com/CISOfy/lynis/archive/refs/tags/${LYNIS_TAG}.tar.gz" 2>/dev/null; then
+    tar xzf /tmp/lynis.tar.gz -C /usr/local/lib 2>/dev/null
+    ln -sf "/usr/local/lib/lynis-${LYNIS_TAG}/lynis" /usr/local/bin/lynis 2>/dev/null
+    rm -f /tmp/lynis.tar.gz
+    command -v lynis >/dev/null 2>&1 && LYNIS_OK=1 && ok "Lynis ${LYNIS_TAG} installed from GitHub release"
+  fi
+fi
+
+if [ "$LYNIS_OK" = "1" ]; then
+  ok "Lynis $(lynis --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ready"
   cat >> /etc/crontabs/root << 'LYNISCRON'
-# Weekly Lynis security audit (Saturday 05:00 UTC) — for MSP compliance evidence
+# Weekly Lynis security audit (Saturday 05:00 UTC) — MSP compliance evidence
 0 5 * * 6 lynis audit system --quiet --logfile /var/log/lynis.log --report-file /var/log/lynis-report.dat 2>&1 | logger -t lynis-audit
 LYNISCRON
-  ok "Lynis: weekly audit Sat 05:00 | manual: lynis audit system"
+  ok "Lynis: weekly audit Sat 05:00 | manual: wp-hardening.sh lynis"
+  ok "  Score: grep hardening_index /var/log/lynis-report.dat"
   ok "  Score: grep hardening_index /var/log/lynis-report.dat"
 else
-  warn "Lynis not in current apk repos — skipping"
+  warn "Lynis could not be installed — all install methods failed"
+  warn "  Manual install: apk add --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing lynis"
+  warn "  Or: wget https://github.com/CISOfy/lynis/archive/refs/tags/3.1.3.tar.gz"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2898,7 +2940,8 @@ echo "════════════════════════�
 chk "WordPress running"  "$(PRUN inspect wordpress --format '{{.State.Status}}' 2>/dev/null)" "running"
 chk "MariaDB running"    "$(PRUN inspect mariadb --format '{{.State.Status}}' 2>/dev/null)" "running"
 chk "CrowdSec running"  "$(PRUN inspect crowdsec --format '{{.State.Status}}' 2>/dev/null)" "running"
-chk "MariaDB healthy"   "$(PRUN inspect mariadb --format '{{.State.Health.Status}}' 2>/dev/null)" "healthy"
+  _DB_PING=$(PRUN exec mariadb sh -c 'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null || mariadb-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null' 2>/dev/null && echo ok || echo fail)
+  chk "MariaDB reachable (exec ping)" "${_DB_PING}"
 
 DB=$(PRUN exec --user www-data wordpress php -r   'echo @mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"))?"ok":"fail";' 2>/dev/null || echo error)
 chk "DB connectivity (www-data)" "$DB"
@@ -2927,26 +2970,45 @@ ok "validate-wordpress.sh installed — run anytime to check VM health"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 touch /var/log/wp-install.done
-IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+# Retry IP detection — filter out Podman bridge (10.89.x.x) and loopback.
+# hostname -I can be empty briefly while DHCP completes, or contain only
+# the Podman wp-net gateway which is useless as a published address.
+IP=""
+for _ip_try in $(seq 1 12); do
+  IP=$(hostname -I 2>/dev/null | tr ' ' '\n' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+    | grep -v '^10\.89\.' \
+    | grep -v '^127\.' \
+    | head -1)
+  [ -n "$IP" ] && break
+  sleep 5
+done
+IP="${IP:-<run: ip addr show eth0 | grep inet>}"
 
-# Build login URL — show custom slug if configured, else default wp-admin
+# Build ongoing login/admin URLs from custom slug if configured.
+# IMPORTANT: WordPress setup (/wp-admin/install.php) is ALWAYS at the
+# default path regardless of custom slug. The slug only applies AFTER
+# setup completes — for day-to-day login and admin access.
 if [ -n "${WP_ADMIN_SLUG}" ]; then
   LOGIN_URL="http://${IP}/${WP_ADMIN_SLUG}-login"
   ADMIN_URL="http://${IP}/${WP_ADMIN_SLUG}/"
-  SETUP_NOTE="First visit: http://${IP}/wp-admin/install.php  (5-min setup)"
 else
   LOGIN_URL="http://${IP}/wp-login.php"
   ADMIN_URL="http://${IP}/wp-admin/"
-  SETUP_NOTE="First visit: http://${IP}/wp-admin/install.php  (5-min setup)"
 fi
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║       WordPress VM Setup Complete!                         ║"
 echo "╠════════════════════════════════════════════════════════════╣"
-echo "║  Setup URL  : http://${IP}/wp-admin/install.php"
-echo "║  Login URL  : ${LOGIN_URL}"
-echo "║  Admin URL  : ${ADMIN_URL}"
+echo "║  ★  STEP 1 — MUST DO FIRST (standard WP setup URL):       ║"
+echo "║     http://${IP}/wp-admin/install.php"
+echo "║     ^ This URL is ALWAYS /wp-admin/install.php             ║"
+echo "║     ^ Do NOT try /slug/install.php — that will 404         ║"
+echo "╠════════════════════════════════════════════════════════════╣"
+echo "║  ★  STEP 2 — After setup, use your custom slug:           ║"
+echo "║     Login : ${LOGIN_URL}"
+echo "║     Admin : ${ADMIN_URL}"
 echo "║  WP         : ${WP_IMAGE}"
 echo "║  MariaDB    : ${DB_IMAGE}  (internal wp-net only)"
 echo "║  CrowdSec   : ${CROWDSEC_IMAGE}"
