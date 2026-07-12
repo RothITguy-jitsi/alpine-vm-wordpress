@@ -1151,23 +1151,34 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   ts "Resolving SHA256 digests for image pinning"
   _pin_digest() {
     local ref="$1" label="$2" digest repo_only candidate
+    # BUG FIX (v7-5b): CRITICAL — ok()/warn() print to plain stdout (see their
+    # definitions above: `echo "  ✔  $*"`), and this function is called as
+    # WP_IMAGE=$(_pin_digest ...). A command substitution captures EVERYTHING
+    # the function writes to stdout, not just the final `echo "$candidate"` —
+    # so the human-readable "pinned to sha256:..." status line was landing
+    # IN THE VARIABLE, ahead of the actual image reference, on its own line.
+    # WP_IMAGE/DB_IMAGE/CROWDSEC_IMAGE ended up as two-line garbage strings,
+    # and every subsequent `podman run ... "${DB_IMAGE}"` failed with
+    # "invalid reference format" — confirmed in the field, MariaDB never
+    # started. Every ok/warn call in this function must go to stderr (>&2)
+    # so it still displays/logs normally but does NOT get captured here.
     if ! podman pull "$ref" >/dev/null 2>&1; then
-      warn "${label}: pull failed — continuing with tag-only reference (no digest pin)"
+      warn "${label}: pull failed — continuing with tag-only reference (no digest pin)" >&2
       echo "$ref"; return 0
     fi
     digest=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null \
       | grep -oE 'sha256:[0-9a-f]{64}' || true)
     if [ -z "$digest" ]; then
-      warn "${label}: could not resolve a digest — continuing with tag-only reference"
+      warn "${label}: could not resolve a digest — continuing with tag-only reference" >&2
       echo "$ref"; return 0
     fi
     repo_only="${ref%:*}"
     candidate="${ref}@${digest}"
     if podman inspect "$candidate" >/dev/null 2>&1; then
-      ok "${label}: pinned to ${digest} (tag+digest)"
+      ok "${label}: pinned to ${digest} (tag+digest)" >&2
       echo "$candidate"
     else
-      ok "${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)"
+      ok "${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
       echo "${repo_only}@${digest}"
     fi
   }
@@ -2471,20 +2482,27 @@ ask_yn() { printf "%s [y/N]: " "$1"; read ans; case "$ans" in [Yy]*) return 0;; 
 # rather than assuming this Podman build accepts it.
 _pin_digest() {
   local ref="$1" label="$2" digest repo_only candidate
+  # BUG FIX (v7-5b): CRITICAL — this function is called as
+  # target_img_pinned=$(_pin_digest ...), which captures EVERYTHING written
+  # to stdout, not just the final `echo "$candidate"`. The status lines below
+  # must go to stderr (>&2) or they end up prepended to the image reference
+  # itself, producing a two-line string that fails podman run with "invalid
+  # reference format" — confirmed in the field (this exact bug broke every
+  # digest-pinned install). See the longer note in install-wordpress.sh.
   [ "${USE_DIGEST_PINNING:-1}" = "1" ] || { echo "$ref"; return 0; }
   digest=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null \
     | grep -oE 'sha256:[0-9a-f]{64}' || true)
   if [ -z "$digest" ]; then
-    echo "  ⚠  ${label}: could not resolve a digest — continuing with tag-only reference"
+    echo "  ⚠  ${label}: could not resolve a digest — continuing with tag-only reference" >&2
     echo "$ref"; return 0
   fi
   repo_only="${ref%:*}"
   candidate="${ref}@${digest}"
   if podman inspect "$candidate" >/dev/null 2>&1; then
-    echo "  ✔  ${label}: pinned to ${digest} (tag+digest)"
+    echo "  ✔  ${label}: pinned to ${digest} (tag+digest)" >&2
     echo "$candidate"
   else
-    echo "  ✔  ${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)"
+    echo "  ✔  ${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
     echo "${repo_only}@${digest}"
   fi
 }
