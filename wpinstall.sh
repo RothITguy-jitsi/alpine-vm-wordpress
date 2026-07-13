@@ -1,108 +1,115 @@
 #!/usr/bin/env bash
 # =============================================================================
-# v7-1 PATCH NOTES (on top of v7):
-#   1. [CRITICAL — root cause of the crash-loop] Removed "RewriteBase /" from
-#      the custom wp-admin slug block that gets written into wp-security.conf.
-#      That directive is only valid in per-directory context (.htaccess or
-#      <Directory>), but wp-security.conf loads as server/vhost-level config
-#      (conf-enabled/*.conf). Every Apache start therefore failed its config
-#      test with "RewriteBase: only valid in per-directory config files" and
-#      the wordpress container crash-looped indefinitely — nothing was ever
-#      actually served on port 80, only Podman's own port-forward stayed up
-#      behind it. This is what caused essentially every other post-install
-#      validation failure (DB connectivity, uploads writable, port 80
-#      listening, HTTP check) — all downstream of Apache never starting.
-#      The slug RewriteRule patterns also gained a leading "/", which they
-#      need to match correctly outside per-directory context.
-#   2. Inline post-install "MariaDB health" check no longer trusts
-#      .State.Health.Status — Podman's health-check timer frequently never
-#      fires on Alpine without systemd/conmon polling (this script already
-#      found and worked around this once, see FIX 2 near the MariaDB wait
-#      loop, but the fix wasn't applied here too). Now uses the same direct
-#      exec ping already used by the install/update wait loops.
-#   3. MariaDB exec-ping checks (inline + validate-wordpress.sh) now redirect
-#      stdout, not just stderr — mariadb-admin/mariadbd-admin ping --silent
-#      still prints "mysqld is alive" on success, which was leaking into the
-#      captured variable and failing the "ok" string comparison even when
-#      the ping succeeded.
-#   4. "Port 80 listening" checks (inline + validate-wordpress.sh) switched
-#      from `ss` to `netstat` — Alpine doesn't ship iproute2/ss by default
-#      and this script never installs it, so the check always read "0"
-#      regardless of the real port state. Busybox's netstat is present
-#      out of the box and takes the same flags.
-# =============================================================================
-# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (v4 — production-ready)
+# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
-# CRITICAL BUGS FIXED vs v3:
-#   1. netavark firewall_driver now set to "nftables" — eliminates the
-#      "netavark: iptables: No such file or directory" error on Alpine.
-#      Alpine's netavark defaults to iptables which isn't installed; setting
-#      nftables here uses the already-installed 'nft' binary instead.
-#   2. nftables forward chain now allows 10.89.1.0/24 (wp-net subnet) before
-#      the policy drop — without this containers couldn't reach the internet
-#      even after fix #1, because nftables DROP preempts any iptables ACCEPT.
-#   3. aardvark-dns installed explicitly — provides container-to-container DNS
-#      on wp-net so WordPress can resolve hostname 'mariadb:3306'. Without it
-#      the container starts but the DB connection fails with a name lookup error.
-#   4. /var/log/messages touched before CrowdSec starts — Podman fails with
-#      "No such file or directory" if the bind-mount source doesn't exist yet.
-#   5. wp-net created with explicit subnet 10.89.1.0/24 — makes nftables
-#      forward rule deterministic; without it netavark assigns a random subnet.
-#   6. rp_filter changed from strict (1) to loose (2) — strict mode can drop
-#      container NAT traffic due to asymmetric routing on the Podman bridge.
-#   7. net.ipv4.ip_forward=1 now explicit in sysctl — required for container
-#      packet forwarding; netavark enables it but explicit is more resilient.
+# v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
+# through v7-1) have been removed from this header — those bugs are long
+# fixed and stable, and kept growing into a changelog nobody was reading;
+# this starts fresh. Every fix below was diagnosed from a real install log,
+# not speculation.
 #
-# WRONG VERSIONS FIXED vs v3:
-#   8. WordPress: 6.7.2 → 6.8 floating tag (6.8.x security patches auto)
-#      6.8 is current stable; 7.0.0 released June 2026 but too new for MSP.
-#   9. CrowdSec: v1.6.8 (DOES NOT EXIST) → v1.7.4 (latest stable, Dec 2024).
-#      v1.7.0+ requires /var/lib/crowdsec/data volume — already mounted ✓.
+# CUSTOM WP-ADMIN SLUG — was completely non-functional, no error anywhere:
+#   1. [CRITICAL] The slug's RewriteRules lived bare in wp-security.conf,
+#      which loads in Apache's main-server context — but the <VirtualHost>
+#      that actually serves every request never inherits main-server
+#      rewrite rules without an explicit `RewriteOptions Inherit` (never
+#      set). Dead config: no error, nothing in any log, slug just silently
+#      never fired.
+#   2. mod_rewrite has a SECOND, independent non-inheritance boundary
+#      between a <Directory> block and a .htaccess file at the same path.
+#      Fixed by placing the same rules directly in .htaccess — the same
+#      per-directory ruleset that already makes permalinks and the 8G
+#      firewall work — ahead of the WordPress-managed BEGIN/END block, with
+#      the <Directory> copy kept as free defense-in-depth.
+#   3. The author=N enumeration block had the identical bug; fixed the same way.
 #
-# FUNCTIONAL ISSUES FIXED vs v3:
-#  10. PHP session.cookie_samesite: Strict → Lax. Strict breaks WordPress
-#      OAuth flows, WooCommerce payment gateway callbacks, and SSO plugins.
-#  11. PHP allow_url_fopen: Off → On. Many WooCommerce payment gateways and
-#      plugin APIs use file_get_contents() with URLs; Off breaks them silently.
-#      allow_url_include stays Off (blocks remote code inclusion attacks).
-#  12. DISABLE_WP_CRON=true added to wp-config — WP-Cron only fires on page
-#      loads and is unreliable in production. Real system cron added instead.
-#  13. WordPress system cron added (*/5 * * * *) — runs wp-cron.php inside
-#      the container; handles scheduled posts, updates, and plugin jobs.
-#  14. Daily MariaDB backup cron (02:00) — gzipped mysqldump to /root/wp-db-
-#      backups/ with 7-day auto-retention. Essential for MSP production.
-#  15. MariaDB InnoDB buffer pool capped (256M) — without a limit MariaDB can
-#      consume all available VM RAM, evicting other containers.
-#      Also enables slow query log for performance debugging.
-#  16. MariaDB conf mounted in OpenRC service and update.sh — consistent
-#      between first install, reboots, and updates.
-#   1. mariadb:11.4-lts → mariadb:11.4   (11.4-lts tag does not exist on Hub)
-#   2. wordpress pin updated to 6.7.2-php8.3-apache (full semver, more stable)
-#   3. mariadb-admin ping now passes credentials (anonymous ping can be denied)
-#   4. WordPress container now has --cap-drop ALL + exact cap-add (was missing)
-#   5. mariadb-container + wp-container services now export PODMAN_IGNORE env
-#   6. wp-container service now has lsmod + modprobe calls (matched mariadb-svc)
-#   7. mount --make-shared / added to both container services (Podman overlay)
-#   8. podman-compose removed — podman auto-update is a built-in, needs no pkg
+# GEOIP COUNTRY FILTERING — was silently never applying, even with valid
+# MaxMind credentials:
+#   4. [CRITICAL] The mod_maxminddb build container ran on Podman's default
+#      bridge subnet, which the wp-net-only nftables forward rule silently
+#      dropped — no internet access during build, apt-get/curl failed,
+#      `podman build` failed, and every downstream step (geoip.conf, the
+#      compiled module, the mmdb database) never ran, with nothing surfaced
+#      as an error. Fixed with --network host for that one build step.
+#   5. [CRITICAL] A bare `make` (no `make install`) never installs the
+#      compiled module into /usr/lib/apache2/modules — confirmed directly
+#      from a real build log where make succeeded but the module stayed in
+#      the build tree at .libs/mod_maxminddb.so. Fixed by searching
+#      recursively under the build directory instead of a hardcoded (and
+#      wrong) install path, with a hard failure if it's still not found
+#      instead of a confusing error two steps later.
+#   6. GeoIP setup is now its own standalone, idempotent script —
+#      /usr/local/bin/wp-geoip-setup.sh — so a bad credential or a
+#      transient network issue can be fixed and retried on a live VM with
+#      one command: no reboot, no re-running the full installer.
+#   7. `update.sh wp` used to silently destroy GeoIP on every WordPress
+#      update (pulled the bare upstream image with no knowledge of the
+#      custom GeoIP image or its mounts). Now re-invokes
+#      wp-geoip-setup.sh automatically after a successful base-image update.
 #
-# SECURITY IMPROVEMENTS vs v2:
-#   A. wp-admin / wp-login.php Apache IP restriction (new prompts)
-#      — separate from nftables WEB_CIDR; works at HTTP request layer
-#   B. mod_remoteip enabled when behind a reverse proxy (new PROXY_IP prompt)
-#      — ensures Require ip checks real client IP through NPM/nginx/Caddy
-#   C. WordPress now has --cap-drop ALL (same discipline as MariaDB)
-#      + NET_BIND_SERVICE (Apache binds port 80 in container netns)
-#      + SETUID/SETGID/CHOWN/DAC_OVERRIDE/FOWNER (same as MariaDB)
-#   D. PHP: allow_url_fopen=Off + allow_url_include=Off (blocks RFI attacks)
-#   E. Apache: Content-Security-Policy + Permissions-Policy headers
-#   F. Apache: PHP execution blocked in wp-content/uploads (webshell guard)
-#   G. Apache: author=N query string blocked (username enumeration)
-#   H. Apache: debug.log access blocked
-#   I. Apache config now built HOST-SIDE with CIDRs baked in, injected via
-#      qemu-nbd — same pattern as nftables, no runtime substitution needed
+# SHA256 DIGEST PINNING — new:
+#   8. WordPress/MariaDB/CrowdSec are pinned to the exact digest resolved at
+#      install time, not just the tag — resolved dynamically via
+#      `podman pull` + `podman inspect`, never hardcoded (a hardcoded digest
+#      goes stale the moment a registry rebuilds an image under the same
+#      tag). Toggle at the install prompt, or via USE_DIGEST_PINNING in
+#      /etc/wp-install/vars.sh afterward.
+#   9. Podman's support for combined tag+digest references varies across
+#      versions (older releases hard-reject it; some newer ones accept it
+#      but drop the local tag) — tested directly against this host's Podman
+#      rather than assumed, with a safe digest-only fallback either way.
+#  10. Pull and digest-resolution each retry up to 3 attempts before falling
+#      back to an unpinned reference. Every outcome — success or fallback —
+#      is logged with the real podman error text to
+#      /var/log/wp-digest-pinning.log, and a pin-count summary
+#      ("Digest pinning: 3/3 pinned") is shown at install and in
+#      `update.sh check`.
+#  11. `update.sh digest-check` finds and offers to move to a newer digest
+#      published under the SAME tag (e.g. a same-version security rebuild),
+#      which a tag-only version comparison would never catch.
+#  12. [CRITICAL, since fixed] An earlier iteration of this feature
+#      corrupted every pinned image reference: ok()/warn() print to stdout,
+#      and `$(...)` command substitution captures a function's ENTIRE
+#      stdout, not just its final `echo` — so the human-readable status
+#      line was landing inside the variable itself. Fixed by routing every
+#      in-function diagnostic to stderr.
 #
-# ROOTFUL vs ROOTLESS DECISION (documented):
+# ALPINE IMAGE INTEGRITY:
+#  13. The downloaded Alpine cloud image is now verified against a freshly
+#      fetched .sha512 (Alpine publishes SHA-512 for cloud/ qcow2 images,
+#      not SHA-256 — confirmed directly against the CDN), fetched fresh
+#      every run rather than a hash hardcoded against a version selector
+#      that floats across point releases.
+#
+# RELIABILITY FIXES:
+#  14. `update.sh wp`/`all` always failed: "-p ${WP_PORT}:80" was one single
+#      quoted shell argument instead of two, so podman's flag parser tried
+#      to read " 80" (stray leading space included) as the port number.
+#  15. CrowdSec's firewall bouncer routinely came up crashed on first start
+#      (a real race against LAPI still initializing) — now retries up to 5
+#      times, both in the one-time installer AND baked into
+#      crowdsec-container's own OpenRC service, so every future reboot is
+#      covered too (an earlier fix only helped the very first boot).
+#  16. Uploads were frequently not writable right after install, and stayed
+#      that way across a reboot. Two causes: (a) a single blind chown raced
+#      the entrypoint's own file creation, and (b) wp-content/uploads may
+#      not exist at all until the first real media operation, which makes a
+#      write-test fail exactly like a permissions problem that no amount of
+#      chown can fix. Fixed with a wait-for-entrypoint retry loop plus an
+#      unconditional mkdir -p before every writability check (install-time,
+#      inline validation, and validate-wordpress.sh).
+#  17. WP_DEBUG validation always showed "?": WORDPRESS_CONFIG_EXTRA never
+#      actually defined WP_DEBUG, and PHP 8.3 throws a fatal error
+#      referencing an undefined constant (older PHP just warned) — this
+#      also silently broke wp-hardening.sh's enable/disable debug toggle,
+#      whose sed pattern had nothing to match. WP_DEBUG is now explicitly
+#      defined, and both checks are defensive either way.
+#  18. CrowdSec bumped v1.7.6 → v1.7.8, patching a disclosed WAF-bypass CVE
+#      in the AppSec datasource that directly affects the
+#      crowdsecurity/appsec-wordpress collection this script enables.
+#
+# ROOTFUL vs ROOTLESS DECISION (still the current design, not a dated note):
 #   MariaDB  — rootful, --cap-drop ALL + 5 caps, isolated to wp-net, no host
 #              port. Equivalent security to rootless for this workload.
 #   WordPress — rootful, --cap-drop ALL + 6 caps. Requires NET_BIND_SERVICE
