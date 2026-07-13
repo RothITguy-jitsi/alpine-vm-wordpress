@@ -1147,10 +1147,21 @@ ok "Storage driver: ${DRIVER_CHOSEN}"
 # back to the universally-supported digest-only form ("repo@sha256:digest")
 # otherwise. Either form gives the same reproducibility guarantee; the
 # combined form is just more readable in `podman ps`/logs when available.
+#
+# RETRY + DIAGNOSTICS (v7-5c): a bare "pull failed once, give up" was too
+# brittle — a single DNS blip or registry rate-limit during boot silently
+# downgraded a whole image to unpinned with no record of why. Both the pull
+# and the digest-resolution step now retry up to 3 times, and any final
+# failure writes the ACTUAL podman error text (not just "failed") to
+# /var/log/wp-digest-pinning.log for later diagnosis, plus a short pointer
+# to that log in the normal warn() output. A pin-count summary is also
+# printed once all three images are resolved.
+DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   ts "Resolving SHA256 digests for image pinning"
   _pin_digest() {
     local ref="$1" label="$2" digest repo_only candidate
+    local attempt pull_ok pull_output inspect_ok inspect_output
     # BUG FIX (v7-5b): CRITICAL — ok()/warn() print to plain stdout (see their
     # definitions above: `echo "  ✔  $*"`), and this function is called as
     # WP_IMAGE=$(_pin_digest ...). A command substitution captures EVERYTHING
@@ -1162,30 +1173,76 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
     # "invalid reference format" — confirmed in the field, MariaDB never
     # started. Every ok/warn call in this function must go to stderr (>&2)
     # so it still displays/logs normally but does NOT get captured here.
-    if ! podman pull "$ref" >/dev/null 2>&1; then
-      warn "${label}: pull failed — continuing with tag-only reference (no digest pin)" >&2
+
+    # ── Pull, up to 3 attempts ────────────────────────────────────────────
+    pull_ok=0
+    for attempt in 1 2 3; do
+      if pull_output=$(podman pull "$ref" 2>&1); then
+        pull_ok=1
+        break
+      fi
+      warn "${label}: pull attempt ${attempt}/3 failed, retrying…" >&2
+      [ "$attempt" -lt 3 ] && sleep 4
+    done
+    if [ "$pull_ok" != "1" ]; then
+      warn "${label}: pull failed after 3 attempts — continuing with tag-only reference (no digest pin). Detail: ${DIGEST_PIN_LOG}" >&2
+      {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PULL FAILED after 3 attempts — ref=${ref}"
+        echo "${pull_output}" | sed 's/^/    /'
+      } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "$ref"; return 0
     fi
-    digest=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null \
-      | grep -oE 'sha256:[0-9a-f]{64}' || true)
-    if [ -z "$digest" ]; then
-      warn "${label}: could not resolve a digest — continuing with tag-only reference" >&2
+
+    # ── Resolve digest, up to 3 attempts ──────────────────────────────────
+    digest="" inspect_ok=0
+    for attempt in 1 2 3; do
+      if inspect_output=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>&1); then
+        digest=$(echo "$inspect_output" | grep -oE 'sha256:[0-9a-f]{64}' || true)
+        if [ -n "$digest" ]; then inspect_ok=1; break; fi
+      fi
+      [ "$attempt" -lt 3 ] && sleep 3
+    done
+    if [ "$inspect_ok" != "1" ]; then
+      warn "${label}: could not resolve a digest after 3 attempts — continuing with tag-only reference. Detail: ${DIGEST_PIN_LOG}" >&2
+      {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST RESOLUTION FAILED after 3 attempts — ref=${ref}"
+        echo "    Last 'podman inspect --format {{index .RepoDigests 0}}' output: ${inspect_output:-<empty — image has no RepoDigests>}"
+      } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "$ref"; return 0
     fi
+
     repo_only="${ref%:*}"
     candidate="${ref}@${digest}"
     if podman inspect "$candidate" >/dev/null 2>&1; then
       ok "${label}: pinned to ${digest} (tag+digest)" >&2
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (tag+digest) — ${candidate}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "$candidate"
     else
       ok "${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (digest-only) — ${repo_only}@${digest}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "${repo_only}@${digest}"
     fi
   }
   WP_IMAGE=$(_pin_digest "$WP_IMAGE" "WordPress")
   DB_IMAGE=$(_pin_digest "$DB_IMAGE" "MariaDB")
   CROWDSEC_IMAGE=$(_pin_digest "$CROWDSEC_IMAGE" "CrowdSec")
+
+  # ── Visibility: pin-count summary, captured now before GeoIP can later
+  # reassign WP_IMAGE to a locally-built (never digest-pinned) image, which
+  # would otherwise make a successfully-pinned upstream pull look like a
+  # failure in any summary computed after that point. ──────────────────────
+  DIGEST_PIN_COUNT=0
+  case "$WP_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
+  case "$DB_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
+  case "$CROWDSEC_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
+  DIGEST_PIN_SUMMARY="${DIGEST_PIN_COUNT}/3 pinned"
+  if [ "$DIGEST_PIN_COUNT" = "3" ]; then
+    ok "Digest pinning: ${DIGEST_PIN_SUMMARY}"
+  else
+    warn "Digest pinning: ${DIGEST_PIN_SUMMARY} — see ${DIGEST_PIN_LOG} for exactly why the rest fell back to tag-only"
+  fi
 else
+  DIGEST_PIN_SUMMARY="disabled"
   ok "Digest pinning disabled (USE_DIGEST_PINNING=0) — using tag-only references"
 fi
 
@@ -2480,8 +2537,19 @@ ask_yn() { printf "%s [y/N]: " "$1"; read ans; case "$ans" in [Yy]*) return 0;; 
 # sourced above). Tests the combined tag+digest form against the local
 # Podman before using it (see the longer explanation in install-wordpress.sh)
 # rather than assuming this Podman build accepts it.
+#
+# RETRY + DIAGNOSTICS (v7-5c): digest resolution retries up to 3 times before
+# falling back to an unpinned reference, and any final failure writes the
+# actual podman error text to the same /var/log/wp-digest-pinning.log the
+# installer uses, rather than just discarding it and printing "failed". The
+# pull itself isn't retried here — do_wp_update/do_db_update/do_cs_update
+# already pull before calling this, and abort the whole update loudly if
+# that fails, which is the right behavior for an explicit update (you can't
+# proceed at all without the new image, pinning aside).
+DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 _pin_digest() {
   local ref="$1" label="$2" digest repo_only candidate
+  local attempt inspect_ok inspect_output
   # BUG FIX (v7-5b): CRITICAL — this function is called as
   # target_img_pinned=$(_pin_digest ...), which captures EVERYTHING written
   # to stdout, not just the final `echo "$candidate"`. The status lines below
@@ -2490,22 +2558,36 @@ _pin_digest() {
   # reference format" — confirmed in the field (this exact bug broke every
   # digest-pinned install). See the longer note in install-wordpress.sh.
   [ "${USE_DIGEST_PINNING:-1}" = "1" ] || { echo "$ref"; return 0; }
-  digest=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null \
-    | grep -oE 'sha256:[0-9a-f]{64}' || true)
-  if [ -z "$digest" ]; then
-    echo "  ⚠  ${label}: could not resolve a digest — continuing with tag-only reference" >&2
+
+  digest="" inspect_ok=0
+  for attempt in 1 2 3; do
+    if inspect_output=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>&1); then
+      digest=$(echo "$inspect_output" | grep -oE 'sha256:[0-9a-f]{64}' || true)
+      if [ -n "$digest" ]; then inspect_ok=1; break; fi
+    fi
+    [ "$attempt" -lt 3 ] && sleep 3
+  done
+  if [ "$inspect_ok" != "1" ]; then
+    echo "  ⚠  ${label}: could not resolve a digest after 3 attempts — continuing with tag-only reference. Detail: ${DIGEST_PIN_LOG}" >&2
+    {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST RESOLUTION FAILED after 3 attempts (update.sh) — ref=${ref}"
+      echo "    Last 'podman inspect --format {{index .RepoDigests 0}}' output: ${inspect_output:-<empty — image has no RepoDigests>}"
+    } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
     echo "$ref"; return 0
   fi
   repo_only="${ref%:*}"
   candidate="${ref}@${digest}"
   if podman inspect "$candidate" >/dev/null 2>&1; then
     echo "  ✔  ${label}: pinned to ${digest} (tag+digest)" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (tag+digest, update.sh) — ${candidate}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
     echo "$candidate"
   else
     echo "  ✔  ${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (digest-only, update.sh) — ${repo_only}@${digest}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
     echo "${repo_only}@${digest}"
   fi
 }
+
 
 # ── Trivy: container vulnerability scanner ────────────────────────────────────
 # Scans images BEFORE pulling to gate updates on security posture.
@@ -2869,7 +2951,15 @@ case "${1:-check}" in
     echo "║  WordPress: running=${RUNNING_WP}  pinned=${PINNED_WP_VER}"
     echo "║  MariaDB  : running=${RUNNING_DB}  pinned=${PINNED_DB_VER}"
     echo "║  CrowdSec : running=${RUNNING_CS}  pinned=${PINNED_CS_VER}"
-    echo "║  Digest pinning: $([ "${USE_DIGEST_PINNING:-1}" = "1" ] && echo enabled || echo disabled)"
+    if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
+      _CHK_PIN_COUNT=0
+      case "$RUNNING_WP_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
+      case "$RUNNING_DB_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
+      case "$RUNNING_CS_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
+      echo "║  Digest pinning: enabled — ${_CHK_PIN_COUNT}/3 currently pinned$([ "$_CHK_PIN_COUNT" != "3" ] && echo "  (see ${DIGEST_PIN_LOG})")"
+    else
+      echo "║  Digest pinning: disabled"
+    fi
     echo "╚══════════════════════════════════════════════════════════╝"
     echo ""
     do_os_update; do_wp_update; do_db_update; do_cs_update; do_digest_check; show_status ;;
@@ -3524,6 +3614,7 @@ echo "║     Admin : ${ADMIN_URL}"
 echo "║  WP         : ${WP_IMAGE}"
 echo "║  MariaDB    : ${DB_IMAGE}  (internal wp-net only)"
 echo "║  CrowdSec   : ${CROWDSEC_IMAGE}"
+echo "║  Digest pin : ${DIGEST_PIN_SUMMARY:-disabled}$([ "${DIGEST_PIN_COUNT:-0}" != "3" ] && [ "${DIGEST_PIN_SUMMARY:-}" != "disabled" ] && echo " — see ${DIGEST_PIN_LOG}")"
 echo "║  Kernel     : $(uname -r)"
 echo "╠════════════════════════════════════════════════════════════╣"
 echo "║  Credentials  : /root/.wp-credentials (chmod 600)        ║"
