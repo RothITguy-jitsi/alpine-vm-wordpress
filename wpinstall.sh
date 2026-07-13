@@ -399,7 +399,7 @@ echo -e "  ${YW}When enabled, WordPress/MariaDB/CrowdSec are pinned to the exact
 echo -e "  ${YW}digest resolved at install time, not just the floating tag. This${CL}"
 echo -e "  ${YW}guarantees the bits that get audited/tested are the exact bits that${CL}"
 echo -e "  ${YW}run — a registry silently repointing a tag can't change what's deployed.${CL}"
-echo -e "  ${YW}what's deployed. update.sh re-pins on every update, and${CL}"
+echo -e "  ${YW}update.sh re-pins on every update, and${CL}"
 echo -e "  ${YW}'update.sh digest-check' can find and move to a newer digest published${CL}"
 echo -e "  ${YW}under the SAME tag (e.g. a same-version security rebuild).${CL}"
 read -rp "  Use SHA256 image digest pinning? [Y/n] : " PINNING_SEL
@@ -1664,7 +1664,7 @@ else
     -e WORDPRESS_DB_HOST=mariadb:3306 \\
     -e WORDPRESS_DEBUG="" \\
     --add-host "mariadb:10.89.1.2" \\
-    -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
     -v /home/wpuser/wp/html:/var/www/html \\
     -v /home/wpuser/wp/logs:/var/log/apache2 \\
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
@@ -1904,7 +1904,7 @@ else
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     --add-host "mariadb:10.89.1.2" \
-    -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
     ${WP_VOL_ARGS} \
     "${WP_IMAGE}"
 fi
@@ -1950,6 +1950,13 @@ UPLOADS_FIXED=0
 for attempt in 1 2 3 4 5; do
   # Wait for a sign the entrypoint has finished its initial copy.
   PRUN exec wordpress sh -c '[ -d /var/www/html/wp-content/plugins ]' >/dev/null 2>&1 || { sleep 4; continue; }
+  # BUG FIX (v7-5d): WordPress doesn't necessarily create wp-content/uploads
+  # until the first real media operation — confirmed in the field, this
+  # retry loop kept "failing" even with correct ownership because the
+  # touch-test's target directory simply didn't exist yet, which looks
+  # identical to a permissions failure but chown can never fix it. Create it
+  # unconditionally (safe no-op if it already exists) before testing.
+  PRUN exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
   PRUN exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
   if PRUN exec --user www-data wordpress sh -c \
        'touch /var/www/html/wp-content/uploads/.write_test 2>/dev/null && rm -f /var/www/html/wp-content/uploads/.write_test' \
@@ -2102,7 +2109,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL -o /tmp/mod_maxminddb.tar.gz "${MMDB_ASSET_URL}" \
     && mkdir -p /tmp/build && tar xzf /tmp/mod_maxminddb.tar.gz -C /tmp/build --strip-components=1 \
     && cd /tmp/build && ./configure --with-apxs=/usr/bin/apxs && make \
-    && find /usr/lib/apache2/modules -name 'mod_maxminddb.so' -exec cp {} /tmp/mod_maxminddb.so \;
+    && find /tmp/build -name 'mod_maxminddb.so' -exec cp {} /tmp/mod_maxminddb.so \; \
+    && test -s /tmp/mod_maxminddb.so || { echo "FATAL: mod_maxminddb.so not found anywhere under /tmp/build after make — the mod_maxminddb build layout may have changed upstream" >&2; exit 1; }
 
 FROM ${CURRENT_WP_IMAGE}
 COPY --from=builder /tmp/mod_maxminddb.so /etc/apache2/maxminddb-module/mod_maxminddb.so
@@ -2199,7 +2207,7 @@ else
     -e WORDPRESS_DB_HOST=mariadb:3306 \\
     -e WORDPRESS_DEBUG="" \\
     --add-host "mariadb:10.89.1.2" \\
-    -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
     -v /home/wpuser/wp/html:/var/www/html \\
     -v /home/wpuser/wp/logs:/var/log/apache2 \\
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
@@ -2232,7 +2240,7 @@ else
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     --add-host "mariadb:10.89.1.2" \
-    -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
     -v /home/wpuser/wp/html:/var/www/html \
     -v /home/wpuser/wp/logs:/var/log/apache2 \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
@@ -2416,7 +2424,7 @@ start() {
       -e WORDPRESS_DB_HOST=mariadb:3306 \\
       -e WORDPRESS_DEBUG="" \\
       --add-host "mariadb:10.89.1.2" \\
-      -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
+      -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
       -v /home/wpuser/wp/html:/var/www/html \\
       -v /home/wpuser/wp/logs:/var/log/apache2 \\
       -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
@@ -2689,7 +2697,7 @@ do_wp_update() {
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     --add-host "mariadb:10.89.1.2" \
-    -e WORDPRESS_CONFIG_EXTRA='define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
     -v /home/wpuser/wp/html:/var/www/html \
     -v /home/wpuser/wp/logs:/var/log/apache2 \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
@@ -3126,13 +3134,36 @@ start() {
   fi
   mount --make-shared / 2>/dev/null || true
   [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+  # BUG FIX (v7-5d): cs-firewall-bouncer is a SEPARATE OpenRC service that
+  # starts independently and can lose a race against CrowdSec's LAPI still
+  # coming up — confirmed in the field to recur on every reboot, not just
+  # the first install (an earlier fix only lived in the one-shot installer
+  # script, so it never helped subsequent boots). Waiting here for LAPI to
+  # actually respond, then restarting the bouncer, runs on EVERY boot that
+  # brings this service up, not just the first one.
   if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
     su -s /bin/sh wpuser -c '/home/wpuser/wp/run-crowdsec.sh' >/dev/null 2>&1
-    eend $?
+    CS_START_STATUS=$?
+    if [ "$CS_START_STATUS" = "0" ]; then
+      for _i in 1 2 3 4 5 6; do
+        su -s /bin/sh wpuser -c 'podman exec crowdsec cscli lapi status' >/dev/null 2>&1 && break
+        sleep 5
+      done
+      rc-service cs-firewall-bouncer restart >/dev/null 2>&1 || true
+    fi
+    eend "$CS_START_STATUS"
     return
   fi
-  podman container exists crowdsec 2>/dev/null && podman start crowdsec >/dev/null 2>&1 || true
-  eend $?
+  podman container exists crowdsec 2>/dev/null && podman start crowdsec >/dev/null 2>&1
+  CS_START_STATUS=$?
+  if [ "$CS_START_STATUS" = "0" ]; then
+    for _i in 1 2 3 4 5 6; do
+      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && break
+      sleep 5
+    done
+    rc-service cs-firewall-bouncer restart >/dev/null 2>&1 || true
+  fi
+  eend "$CS_START_STATUS"
 }
 stop() {
   ebegin "Stopping CrowdSec"
@@ -3320,7 +3351,7 @@ feature_state() {
     8g)          grep -q '^# 8G DISABLED' "$HTACCESS" 2>/dev/null && echo DISABLED || echo ENABLED ;;
     xmlrpc)      grep -q 'xmlrpc.php.*Require all denied' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
     uploads-php) grep -q 'wp-content/uploads' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
-    debug)       PRUN exec wordpress php -r 'echo WP_DEBUG?"ON":"OFF";' 2>/dev/null || echo UNKNOWN ;;
+    debug)       PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo UNKNOWN ;;
   esac
 }
 
@@ -3476,6 +3507,11 @@ HTTP_CODE=$(podman exec --user www-data wordpress php -r   'error_reporting(0);$
 [ "$HTTP_CODE" = "skip" ] && ok "  SKIP  WordPress HTTP check (PHP network unavailable)"   || check "WordPress HTTP response (non-error)" "$HTTP_CODE"
 
 # uploads directory writable by www-data
+# BUG FIX (v7-5d): ensure the directory exists first — WordPress doesn't
+# necessarily create wp-content/uploads until first real media use, and a
+# missing directory makes this touch-test fail identically to a real
+# permissions problem, even with correct ownership already in place.
+podman exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
 UPLOADS_CHECK=$(podman exec --user www-data wordpress sh -c   'touch /var/www/html/wp-content/uploads/.write_test && rm /var/www/html/wp-content/uploads/.write_test && echo ok || echo fail'   2>/dev/null || echo "fail")
 check "Uploads dir writable (www-data)" "$UPLOADS_CHECK"
 
@@ -3548,6 +3584,7 @@ chk "CrowdSec running"  "$(PRUN inspect crowdsec --format '{{.State.Status}}' 2>
 DB=$(PRUN exec --user www-data wordpress php -r   'echo @mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"))?"ok":"fail";' 2>/dev/null || echo error)
 chk "DB connectivity (www-data)" "$DB"
 
+PRUN exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
 UPL=$(PRUN exec --user www-data wordpress sh -c   'touch /var/www/html/wp-content/uploads/.wt && rm /var/www/html/wp-content/uploads/.wt && echo ok || echo fail' 2>/dev/null || echo fail)
 chk "Uploads writable (www-data)" "$UPL"
 
@@ -3558,7 +3595,7 @@ chk "8G .htaccess"      "$(grep -c '8G FIREWALL' /home/wpuser/wp/htaccess/.htacc
 chk "Trivy available"   "$(command -v trivy >/dev/null 2>&1 && echo ok || echo missing)"
 chk "Lynis available"   "$(command -v lynis >/dev/null 2>&1 && echo ok || echo missing)"
 
-WP_DEBUG=$(PRUN exec wordpress php -r 'echo WP_DEBUG?"ON":"OFF";' 2>/dev/null || echo "?")
+WP_DEBUG=$(PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo "?")
 chk "WP_DEBUG is OFF"   "$WP_DEBUG" "OFF"
 
 echo ""
