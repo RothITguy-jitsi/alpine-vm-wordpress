@@ -138,6 +138,20 @@
 #      connect` after the container starts); MariaDB joins only wp-db.
 #      nftables' forward chain now allow-lists both subnets instead of one.
 #
+#  21. [BUG FIX] update.sh's do_wp_update/do_db_update rename the running
+#      container to *-old (not stop it) and keep it alive until the new
+#      one passes its health check, so a fixed --ip on the new container
+#      collides with the -old one still holding that same address on the
+#      same network — the new `podman run`/`network connect` fails
+#      outright and the update always rolls back. do_db_update already
+#      omitted --ip for MariaDB for this exact reason; do_wp_update did
+#      NOT (it kept a fixed IP against the old single wp-net address,
+#      1.3, which had the identical latent bug pre-dating this network
+#      split). Both update paths now leave IP assignment to netavark on
+#      both networks; only the create-time paths (install, GeoIP rebuild,
+#      OpenRC recreate-if-missing) use fixed IPs, since none of those have
+#      an -old container coexisting to conflict with.
+#
 # ROOTFUL vs ROOTLESS DECISION (still the current design, not a dated note):
 #   MariaDB  — rootful, --cap-drop ALL + 5 caps, isolated to wp-db (internal,
 #              no host port, no egress). Equivalent security to rootless for
@@ -1729,9 +1743,9 @@ else
     -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \\
     "${WP_IMAGE}"
   # Second network: wp-db (--internal) for MariaDB access only. Podman's
-  # --network flag on `run` only takes a static --ip for the primary network
+  # --network flag on \`run\` only takes a static --ip for the primary network
   # in this Podman/Alpine combination, so wp-db is attached post-create via
-  # `network connect` — the same pattern Podman's own docs recommend for
+  # \`network connect\` — the same pattern Podman's own docs recommend for
   # multi-network containers, and portable across older Podman releases.
   podman network connect --ip 10.89.20.3 wp-db wordpress
 fi
@@ -2757,7 +2771,14 @@ do_wp_update() {
 
   # shellcheck disable=SC2086
   WP_PORT="$( [ "${ROOTLESS_MODE:-0}" = "1" ] && echo 8080 || echo 80 )"
-  if PRUN run -d --name wordpress --network wp-front --ip 10.89.10.3 -p "${WP_PORT}:80" --restart always \
+  # No --ip on wp-front: wordpress-old (renamed above) is still RUNNING and
+  # still holds 10.89.10.3 until it's removed after the health check below
+  # passes, so requesting that same address now would fail with an
+  # IP-already-allocated error. (This exact conflict already existed here
+  # against the old single-network 10.89.1.3 before the wp-front/wp-db
+  # split — carrying a fixed IP into the new second interface too would
+  # have doubled it instead of fixing it, so both are left to netavark.)
+  if PRUN run -d --name wordpress --network wp-front -p "${WP_PORT}:80" --restart always \
     --label io.containers.autoupdate=image \
     --cap-drop ALL --cap-add NET_BIND_SERVICE \
     --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
@@ -2778,7 +2799,7 @@ do_wp_update() {
     ${RI_VOLS} \
     "${target_img_pinned}"; then
 
-    PRUN network connect --ip 10.89.20.3 wp-db wordpress 2>/dev/null || true
+    PRUN network connect wp-db wordpress 2>/dev/null || true
     HEALTHY=0
     for i in $(seq 1 6); do WEB_CHECK=$([ "${ROOTLESS_MODE:-0}" = "1" ] && echo 8080 || echo 80)
       wget -qO- "http://127.0.0.1:${WEB_CHECK}/" >/dev/null 2>&1 && { HEALTHY=1; break; }; sleep 5; done
@@ -2856,7 +2877,14 @@ do_db_update() {
   PRUN stop wordpress 2>/dev/null || true
   PRUN rename mariadb mariadb-old 2>/dev/null || true
 
-  if PRUN run -d --name mariadb --network wp-db --ip 10.89.20.2 --restart always \
+  # No --ip here: mariadb-old (renamed above) is still RUNNING and still
+  # holds 10.89.20.2 on wp-db until it's removed further below, so claiming
+  # that same address now would fail with an IP-already-allocated error.
+  # netavark auto-assigns a free wp-db address instead — WordPress still
+  # finds it via aardvark-dns (the --add-host static entry is a fallback
+  # only; a stale IP there after an update is a pre-existing, accepted
+  # limitation of that fallback, not something this change affects).
+  if PRUN run -d --name mariadb --network wp-db --restart always \
     --label io.containers.autoupdate=image \
     --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
     --cap-add DAC_OVERRIDE --cap-add FOWNER \
