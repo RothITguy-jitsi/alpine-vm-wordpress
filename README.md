@@ -367,7 +367,7 @@ This script has been through more than one structured security review. In the in
 - A dedicated non-root SSH account exists; root SSH login is disabled unconditionally in the normal path, with a `wheel`+`doas` admin account instead.
 - Update operations are serialized behind an exclusive lock, and both MariaDB and CrowdSec are fully stopped — and verified stopped — before a replacement container is started against the same data/state.
 
-**Not yet addressed**
+**Not yet addressed but in progress**
 - **MariaDB updates have no volume-level rollback.** The pre-update `mariadb-dump` backup isn't validated (no integrity check, no size/content check, and the pipeline isn't `pipefail`-protected, so a failed dump piped into a working `gzip` can still report success). If a rollback triggers, the "old" container restarts against the *same* data directory the new engine may have already modified.
 - **`mariadb-upgrade` failures are ignored**, and **WordPress isn't health-checked after a MariaDB update** before the pre-update container is deleted — only MariaDB itself is re-verified.
 - **A static `--add-host mariadb:...` entry persists** alongside DNS-based resolution, while MariaDB's replacement container is deliberately given a dynamic IP during updates — so the static entry can go stale, and can shadow the correct DNS answer, right after a DB update.
