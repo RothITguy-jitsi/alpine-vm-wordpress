@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
+# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT
 # =============================================================================
 #
 # v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
@@ -152,20 +152,319 @@
 #      OpenRC recreate-if-missing) use fixed IPs, since none of those have
 #      an -old container coexisting to conflict with.
 #
-# ROOTFUL vs ROOTLESS DECISION (still the current design, not a dated note):
-#   MariaDB  — rootful, --cap-drop ALL + 5 caps, isolated to wp-db (internal,
-#              no host port, no egress). Equivalent security to rootless for
-#              this workload.
+# v7-6d PATCH NOTES (on top of v7-6c baseline) — ROOTLESS REMOVED:
+#  22. ROOTLESS PODMAN REMOVED. This script now provisions rootful Podman
+#      ONLY — the rootless deployment path (wpuser-owned containers, the
+#      port-8080 + nftables-redirect story, pasta source-IP forwarding, the
+#      generated run-mariadb.sh/run-wordpress.sh/run-crowdsec.sh launcher
+#      scripts, and every ROOTLESS_MODE branch in the installer, update.sh,
+#      wp-hardening.sh, validate-wordpress.sh, wp-geoip-setup.sh, and the
+#      three OpenRC service scripts) has been deleted rather than kept as a
+#      second, less-tested path running alongside the wp-front/wp-db network
+#      split introduced in v7-6. Rootful was already this script's
+#      battle-tested recommended default; removing the alternative removes
+#      an entire class of dispatch-related bugs (see 23 below) instead of
+#      continuing to carry them through an increasingly complex two-network
+#      topology.
+#  23. [SECURITY] PRUN dispatch wrapper fixed. The old PRUN() had a rootless
+#      branch that re-flattened every argument through
+#      `su -s /bin/sh wpuser -c "podman $*"` — "$*" joins all arguments into
+#      a single string on IFS, discarding the argument boundaries "$@" would
+#      have preserved, and that string is then RE-PARSED by the inner
+#      `sh -c`. Any argument containing shell metacharacters (spaces,
+#      quotes, `;`, `$()`) would be reinterpreted rather than passed through
+#      intact — and this script's own WORDPRESS_CONFIG_EXTRA value
+#      ('define("WP_DEBUG",false);define(...);...') is exactly that kind of
+#      argument. With rootless gone, PRUN is now a trivial `podman "$@"` in
+#      every script that defines it — "$@" always preserves argument
+#      boundaries, so this failure mode is gone entirely, not just avoided
+#      in the common case.
+#  24. Added validate_image_tag()/validate_digest_ref() to update.sh. The
+#      VER argument to `update.sh wp|db|crowdsec [VER]` previously flowed
+#      straight into an image reference with no validation of its own —
+#      relying entirely on podman's own parser to reject anything malformed.
+#      Both functions now run before that argument is used for anything,
+#      giving a clear error message instead of a delayed, cryptic podman
+#      failure.
+#
+# v7-6f PATCH NOTES (on top of v7-6e baseline) — SKOPEO + PINNED STATE:
+#  25. SKOPEO-BASED DIGEST RESOLUTION. Resolving "what digest does this tag
+#      point to right now" used to mean pulling the FULL image (150-200+ MB
+#      each for WordPress/MariaDB) just to ask Podman what it downloaded —
+#      both at install time and on every `update.sh check`. Skopeo's
+#      `inspect docker://ref` asks the registry's manifest endpoint directly
+#      (a few KB, no layer data), so both the installer's digest-pinning
+#      step and update.sh now know the digest before anything is pulled.
+#      A `podman pull` still happens, but only once, for the exact
+#      `repo@sha256:digest` reference that's actually going to be pinned or
+#      run — never as a separate discovery step. update.sh's read-only
+#      `check`/`status` path (the default when it's run with no argument)
+#      is now a genuinely read-only Skopeo manifest query — no pulls at
+#      all. Skopeo missing or a lookup failing is never fatal: every call
+#      site falls back to the pre-v7-6f pull-then-inspect method on its own.
+#  26. PINNED STATE EXTERNALIZED to /etc/wp-install/pinned.env. Previously
+#      "what tag/digest is currently pinned" had to be re-derived by
+#      sed-parsing it back out of the running container's own
+#      `{{.Config.Image}}` string, and update.sh kept itself current by
+#      rewriting its own PINNED_WP_VER/PINNED_DB_VER/PINNED_CS_VER constants
+#      on disk (`sed -i` against /usr/local/bin/update.sh itself) after
+#      every successful update. Both patterns are gone: pinned.env is now
+#      the single source of truth, written by the installer at install time
+#      and kept current by update.sh's `_save_pinned()` after every
+#      successful wp/db/crowdsec update — update.sh no longer self-modifies
+#      at all. If pinned.env doesn't exist yet (a VM upgraded from a
+#      pre-v7-6f update.sh), it's bootstrapped on first run from whatever's
+#      currently running.
+#  27. DIGEST-ONLY REFERENCES, ALWAYS. Item 9's runtime test for whether the
+#      local Podman accepts a combined `repo:tag@sha256:digest` reference is
+#      gone — every pinned reference is now the universally-supported
+#      digest-only form (`repo@sha256:digest`), with the tag tracked
+#      separately in pinned.env instead of inside the reference itself.
+#      wp-geoip-setup.sh's tag-derivation logic, which used to special-case
+#      "tag+digest present" vs. "digest-only" based on that now-removed
+#      test, was updated to read the tag from pinned.env directly instead —
+#      unchanged, the old heuristic would have silently degraded to its
+#      short-digest-fragment fallback on every single run (digest-only was
+#      no longer the exception, it's now the rule), producing GeoIP image
+#      tags like `wordpress-geoip:a1b2c3d4e5f6` instead of a readable
+#      version.
+#  28. OpenRC recreate-fallback paths (wp-container, mariadb-container) now
+#      also consult pinned.env before falling back to their install-time-
+#      baked WP_IMAGE/DB_IMAGE. Necessary consequence of 26: since update.sh
+#      no longer rewrites those baked-in values on disk, leaving this
+#      unaddressed would mean the recreate-if-missing path (the branch that
+#      only fires if a container is ever removed outside of update.sh) could
+#      silently drift back to whatever was pinned at install time. WordPress
+#      skips this override when a local GeoIP image is already in play,
+#      since pinned.env's WP_DIGEST tracks the upstream image, not the
+#      locally-built GeoIP layer.
+#
+# v7-6k PATCH NOTES (on top of v7-6j baseline) — DEDICATED ADMIN ACCOUNT:
+#  29. [SECURITY] Root SSH login is now disabled unconditionally
+#      (PermitRootLogin no) regardless of whether an SSH key was supplied —
+#      closing remaining_tasks.txt item 5 ("SSH still allows root + password
+#      login when no key is given... no dedicated non-root admin account is
+#      created either way"). A dedicated admin account (name prompted,
+#      default wpadmin) is created in the wheel group, with doas configured
+#      (`permit persist :wheel` in /etc/doas.d/doas.conf, per Alpine's own
+#      documented pattern — doas prompts for the ACCOUNT'S OWN password, not
+#      root's, so it authenticates independently of however that account
+#      itself logs in). If an SSH key was supplied, it's placed on the admin
+#      account (not root) and password auth is disabled server-wide; if not,
+#      the admin account gets an operator-chosen password (prompted/
+#      confirmed the same way the VM's root console password already is)
+#      and THAT is what SSH accepts — never a root password over SSH, key or
+#      no key. Root keeps its console password unconditionally (`qm
+#      terminal`/noVNC access is unrelated to and unaffected by any of this).
+#  30. Account creation needs adduser/addgroup writing into the target
+#      filesystem's own passwd/group/shadow, and doas needs apk + network —
+#      both require a live chroot, exactly like the QEMU Guest Agent
+#      pre-install already did. Rather than mount and unmount /proc and
+#      /dev twice for two separate chroot calls, both now share one: the
+#      combined chroot runs immediately after the root password is set,
+#      and /proc and /dev stay bind-mounted through the rest of injection
+#      (nothing written in between cares whether they're mounted), torn
+#      down once at the very end instead of twice.
+#  31. Safety fallback: adduser inside a chroot is a simple, local,
+#      network-independent operation and should essentially never fail —
+#      but if it somehow does, the script does NOT silently leave the VM
+#      unreachable over SSH. It verifies the account actually exists
+#      (grep against the target's own /etc/passwd, not the chroot's exit
+#      code, since a later doas/network failure in the same chroot must
+#      not be misread as "account missing") and, only on genuine failure,
+#      falls back to the pre-v7-6k behavior (root SSH, key or password per
+#      what was supplied) with a loud warning in the install log and in
+#      both summary banners — a degraded fallback, not a silent one.
+#  32. SSH_KEYS and the admin password are deliberately never interpolated
+#      into the chroot's `sh -c` string at all (unlike the sanitized,
+#      regex-constrained ADMIN_USER, which is safe to interpolate) —
+#      operator-pasted key content or a chosen password could contain
+#      anything. Both are written host-side via plain redirection or a
+#      shadow sed, after the chroot exits, the exact same mechanism root's
+#      own password and key already used before this change — never passed
+#      through a shell for re-interpretation.
+#  33. doas installation inside the pre-boot chroot depends on the PROXMOX
+#      HOST reaching Alpine's CDN at provisioning time — normally fine (the
+#      QEMU Guest Agent pre-install already relies on the same path), but
+#      as a redundant safety net Stage 1 of the installer also attempts
+#      `apk add doas` (idempotent, no-op if already present) once the VM
+#      has its own guaranteed-working network, closing the one plausible
+#      network-dependent gap in an otherwise network-independent setup.
+#  34. Auto-generated vs. operator-chosen admin passwords are handled the
+#      same way root's own password already is: an operator-typed password
+#      (no-key path, actually used for SSH) is never written to disk in
+#      plaintext — they typed it, they know it. An auto-generated one
+#      (key-provided path, used only by doas — nobody types or needs to
+#      remember it) IS written, to /root/.wp-admin-credentials (chmod 600),
+#      the same treatment already given to the openssl-rand DB passwords in
+#      /root/.wp-credentials, and for the identical reason: without writing
+#      it down it would be permanently unusable.
+#
+# v7-6k PATCH NOTES (on top of v7-6j baseline) — TWO PARALLEL PRODUCTION-
+# SAFETY REVIEWS MERGED INTO ONE:
+#  35. [PRODUCTION SAFETY] Strengthened MariaDB health checks. wp-health-
+#      check.sh (v7-6g) closed the shallow-check gap for WordPress, but
+#      every MariaDB readiness gate — the install-time wait loop (before
+#      either container exists yet) and update.sh's do_db_update()
+#      rollback decision — was still a bare `mariadbd-admin ping`, which
+#      proves only that the server accepts TCP and that root
+#      authenticates. It proves nothing about InnoDB actually being usable
+#      or about whether WordPress's OWN database/user (MARIADB_DATABASE/
+#      MARIADB_USER, not root) can run a query — the same shallow-success/
+#      broken-application blind spot the old WordPress `wget -qO-` check
+#      had. New /usr/local/bin/mariadb-health-check.sh adds a root query,
+#      the exact wordpress-credential query, and an InnoDB-initialized
+#      check, and is wired into the install-time wait loop, do_db_update(),
+#      and both validate-wordpress.sh and the post-install validation
+#      suite — mirroring wp-health-check.sh's role for WordPress. Falls
+#      back to the old ping-only check automatically if the script is
+#      somehow missing (e.g. a VM recreated from an older installer).
+#  36. [PRODUCTION SAFETY] Container-swap error handling. Every "swap in a
+#      replacement container" path in update.sh (do_wp_update/do_db_update/
+#      do_cs_update) previously suppressed the result of `podman rename`
+#      with `2>/dev/null || true` on the forward swap, and discarded the
+#      result of both `podman rename` and `podman start` the same way on
+#      every rollback swap. Concretely, in do_wp_update(): if
+#      `podman rename wordpress wordpress-old` silently failed, "wordpress"
+#      kept its name, so the following `podman run -d --name wordpress`
+#      failed too (a name collision) — a failure that WAS checked, so
+#      control fell into the "container start failed — rolled back"
+#      branch, whose first line was `podman rm -f wordpress`: deleting the
+#      still-good, still-running ORIGINAL container in the mistaken belief
+#      it was cleaning up a failed new attempt. One suppressed error could
+#      cascade into deleting a healthy production container. New
+#      require_clean_container_state() preflights every rename's own
+#      preconditions (missing source container; a stale *-old container
+#      left over from a previous crashed/interrupted update) before
+#      attempting it, across WordPress, MariaDB, and CrowdSec. Every
+#      rename+start pair — forward swap and rollback swap alike — is now
+#      checked directly instead of discarding its result, with a loud
+#      "ROLLBACK FAILED" message plus manual-recovery commands printed if a
+#      rollback itself doesn't work, since that's the one moment silence is
+#      most dangerous: the site, database, or CrowdSec is down right now
+#      and nobody has been told. A leftover *-old container after a
+#      SUCCESSFUL update is also now flagged (it would otherwise silently
+#      block the next update's preflight check).
+#  37. [PRODUCTION SAFETY] update.sh update lock. Nothing previously stopped
+#      two update.sh invocations from running at once — an admin running
+#      `update.sh wp` while a cron-triggered `update.sh digest-check` is
+#      already mid-run, say. That could race two processes renaming the
+#      same container to *-old, or writing /etc/wp-install/pinned.env at
+#      the same time, or overlapping MariaDB dumps against the same data
+#      directory. A plain mkdir-based lock at /run/lock/wordpress-update.lock
+#      closes this — mkdir is atomic on every storage backend this script
+#      runs on, so only one invocation can ever hold it. The holder's PID is
+#      recorded inside the lock so a stale lock left by a crashed update
+#      (OOM-killed, VM rebooted mid-update) is detected via `kill -0` and
+#      cleared automatically. Only the state-changing subcommands
+#      (os/wp/db/crowdsec/all/digest-check) take the lock — check/status/
+#      trivy stay lock-free since they're read-only and meant to stay safe
+#      to run anytime, including while an update is in progress.
+#
+# v7-7 PATCH NOTES (on top of the v7-6k baseline) — MERGE OF THE TWO
+# PARALLEL v7-6k LINES ABOVE INTO ONE SCRIPT:
+#  38. The dedicated-admin-account line (items 29-34) and the production-
+#      safety line (items 35-37) were developed in parallel off the same
+#      v7-6j baseline and touch different, non-overlapping parts of the
+#      script — host-side provisioning/SSH/chroot injection vs. update.sh
+#      and its health-check scripts — so reconciling them was a straight
+#      union of both feature sets rather than a resolution of competing
+#      designs. Every item above (29-37) is present and active in this
+#      version.
+#  39. do_db_update()/do_cs_update() now keep BOTH styles of
+#      require_clean_container_state() check that existed separately across
+#      the two parallel lines: the EARLY fail-fast call (before any backup,
+#      pull, or container is stopped — dropped in the production-safety
+#      line's rewrite of item 36) AND the check immediately before the
+#      actual rename (added by that same rewrite as tighter defense-in-depth
+#      right at the point of use). Keeping both is strictly safer than
+#      either alone and costs almost nothing (one extra `podman container
+#      exists` call): the early check avoids a wasted backup + pull + a
+#      brief unnecessary WordPress/MariaDB stop/start cycle when the update
+#      was going to be refused anyway (a stale *-old container from a
+#      previous crashed run, most commonly), while the later check still
+#      catches state that changed during that window — an operator manually
+#      intervening mid-update, for instance. At the time this note was
+#      written, do_wp_update() was unaffected: neither parallel line above
+#      had more than one check site for it, since nothing destructive
+#      happened before its single rename point. Item 40 below changes that.
+#
+# v7-7 PATCH NOTES (continued) — WORDPRESS UPDATE CUTOVER MERGED IN:
+#  40. [CRITICAL] A third line of work, developed in parallel off the same
+#      v7-6f baseline as the two lines merged into v7-7 above (items 29-37),
+#      had never been folded in until now: a candidate/cutover rewrite of
+#      update.sh's do_wp_update() that fixes a structural bug making
+#      `update.sh wp` — and so `update.sh all` / `update.sh digest-check`,
+#      which both call it — unable to ever actually complete a WordPress
+#      update. Before this merge, do_wp_update() renamed the running
+#      "wordpress" container to wordpress-old — a rename, not a stop — and
+#      immediately tried to `podman run` a brand-new container ALSO
+#      publishing -p 80:80. wordpress-old was still running and still
+#      holding host port 80 at that exact moment (renaming a container
+#      never stops it or releases its published ports), so the new
+#      container's own port publish failed every time — not an occasional
+#      race, a structural guarantee. That `podman run` sat inside an
+#      `if ...; then`, so the failure was caught, but only after the fact:
+#      control fell into the existing rollback branch, renamed wordpress-old
+#      back to "wordpress" (which had never actually stopped serving traffic
+#      under its temporary name), and reported a plain "Container start
+#      failed — rolled back" with nothing distinguishing this from a
+#      genuine one-off failure. Item 36's container-swap error-handling
+#      rewrite (the production-safety line) fixed how this failure was
+#      reported and rolled back — every rename/start result checked, loud
+#      "ROLLBACK FAILED" messages if even the rollback failed — but never
+#      touched the underlying port-80 collision itself, since neither
+#      parallel line was aware of the other's changes to this function.
+#      (The dedicated-admin-account line was a straight ancestor of neither;
+#      this candidate/cutover rewrite was developed on a separate branch off
+#      v7-6f, alongside — not as part of — the two lines items 29-39
+#      describe.) Net effect prior to this merge: `update.sh wp` would ask,
+#      Trivy-scan, and pull a new WordPress image, then reliably fail to
+#      deploy it and roll back (safely and loudly, thanks to item 36 — but
+#      roll back regardless), every single time.
+#      FIX: candidate/cutover. The freshly pulled image now starts first as
+#      a throwaway "wordpress-candidate" container published ONLY to
+#      127.0.0.1:18080 (WP_CANDIDATE_PORT) — loopback-only, so it can never
+#      collide with production's 0.0.0.0:80 and is never reachable from
+#      outside the VM. It runs against the same volumes, env file, and
+#      wp-front/wp-db networks as production, so the check is real rather
+#      than a synthetic smoke test, and it must pass the same
+#      wp-health-check.sh validation (HTTP + PHP execution + mariadb DNS +
+#      a real WordPress-credential query) used at every other health-check
+#      call site in this script. Production is not touched while this
+#      runs — if the candidate never starts, or starts but fails
+#      validation, the update aborts here with nothing changed. Only once
+#      the candidate proves the new image actually works is
+#      require_clean_container_state() consulted again and "wordpress"
+#      renamed to wordpress-old and explicitly STOPPED — freeing host port
+#      80 for real, not just freeing the name — and only then is the real
+#      "wordpress" container created against port 80 and health-checked a
+#      second time, with every rename/start result checked and a loud
+#      "ROLLBACK FAILED" report if even the rollback doesn't work, exactly
+#      per item 36's existing standard for MariaDB and CrowdSec. An early
+#      require_clean_container_state() check was also added before the
+#      pull/candidate sequence even begins — item 39's reasoning for
+#      MariaDB/CrowdSec (avoid wasting work on an update that was going to
+#      be refused anyway) now applies to WordPress too, since the candidate
+#      step means substantial work happens before the rename point for the
+#      first time. A short downtime window during the final cutover itself
+#      is unavoidable — host port 80 can only ever be held by one container
+#      at a time on a single Apache-on-:80 VM, with no second reverse-proxy
+#      layer in front of it — but it's now short and high-confidence, since
+#      the image was already proven to work before production was ever
+#      stopped. Needs 127.0.0.1:18080 free on the VM; change
+#      WP_CANDIDATE_PORT in update.sh if that port is already in use for
+#      something else.
+#
+# ROOTFUL DEPLOYMENT (fixed design — not a dated note):
+#   MariaDB   — rootful, --cap-drop ALL + 5 caps, isolated to wp-db
+#               (--internal, no host port, no egress).
 #   WordPress — rootful, --cap-drop ALL + 6 caps. Requires NET_BIND_SERVICE
-#              because Apache binds port 80 inside the container's own network
-#              namespace even with -p 80:80 (Podman's host-side port publish
-#              is separate from Apache's in-netns bind). Making WordPress
-#              rootless requires either running Apache on port 8080+ (needs
-#              a ports.conf override) or sysctl ip_unprivileged_port_start=0,
-#              both of which add fragility with no meaningful security gain
-#              given the VM is the primary isolation boundary.
+#               because Apache binds port 80 inside the container's own
+#               network namespace even with -p 80:80 (Podman's host-side
+#               port publish is separate from Apache's in-netns bind).
 #   CrowdSec  — rootful, --network host, --read-only, minimal caps.
-#              Must use host network to see syslog and write nftables rules.
+#               Must use host network to see syslog and write nftables rules.
 # =============================================================================
 set -e
 
@@ -328,6 +627,10 @@ fi
 
 echo ""
 echo -e "  ${BLD}SSH access${CL}"
+echo -e "  ${YW}Root SSH login is always disabled on this VM. A dedicated admin account${CL}"
+echo -e "  ${YW}is created instead, in the 'wheel' group, with doas configured for root${CL}"
+echo -e "  ${YW}access after login (root still has a local console password for${CL}"
+echo -e "  ${YW}'qm terminal' access — that's separate from SSH).${CL}"
 echo "  Paste your public key (starts with ssh-ed25519 or ssh-rsa),"
 echo "  or press Enter to load from a file path."
 read -rp "  Public key (paste, or blank) : " SSH_KEY_PASTE
@@ -335,13 +638,40 @@ SSH_KEYS=""
 if [[ -n "$SSH_KEY_PASTE" ]]; then
   SSH_KEYS="$SSH_KEY_PASTE"
 else
-  read -rp "  ...or path to a .pub file (blank = keep password login) : " SK
+  read -rp "  ...or path to a .pub file (blank = set an admin password instead) : " SK
   [[ -n "$SK" && -f "$SK" ]] && SSH_KEYS=$(cat "$SK")
 fi
+
+# Sanitise: lowercase, alnum + underscore/hyphen, must start with a letter
+# (POSIX username rules) — same sanitisation style as WP_ADMIN_SLUG below,
+# plus an explicit leading-character check that a URL slug doesn't need.
+read -rp "  Admin account username [wpadmin] : " ADMIN_USER_RAW
+ADMIN_USER=$(echo "${ADMIN_USER_RAW:-wpadmin}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | sed 's/^-//;s/-$//')
+[[ "$ADMIN_USER" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || ADMIN_USER="wpadmin"
+# Reserved names: root (this whole feature's point), wpuser (already used
+# for file/volume ownership — see wpuser creation later — colliding would
+# make adduser fail and trip the ADMIN_USER_CREATED fallback further down).
+[[ "$ADMIN_USER" == "root" || "$ADMIN_USER" == "wpuser" ]] && ADMIN_USER="wpadmin"
+
+ADMIN_PASS=""
 if [[ -n "$SSH_KEYS" ]]; then
-  DISABLE_PW_AUTH=1; msg_ok "SSH key set — password login disabled"
+  DISABLE_PW_AUTH=1
+  # Password auth is off session-wide, so this account's password is never
+  # typed over SSH — it exists purely so doas has something to authenticate
+  # against once logged in. Generated the same way the DB passwords are
+  # (openssl rand, unknown to the operator, written to a credentials file
+  # on disk) rather than asked for, since nobody needs to remember it.
+  ADMIN_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 24)
+  msg_ok "SSH key set — password login disabled. Admin account: ${ADMIN_USER}"
 else
-  DISABLE_PW_AUTH=0; msg_warn "No SSH key — password login remains enabled"
+  DISABLE_PW_AUTH=0
+  msg_warn "No SSH key — ${ADMIN_USER} will use password login (root SSH stays disabled either way)"
+  while [[ -z "$ADMIN_PASS" ]]; do
+    read -rsp "  Password for ${ADMIN_USER} : " ap1; echo
+    read -rsp "  Confirm                  : " ap2; echo
+    [[ "$ap1" == "$ap2" && -n "$ap1" ]] && ADMIN_PASS="$ap1" \
+      || echo -e "  ${RD}Passwords do not match.${CL}"
+  done
 fi
 
 echo ""
@@ -384,7 +714,7 @@ echo ""
 echo -e "  ${BLD}CrowdSec Console enrolment (optional — can be done after install):${CL}"
 echo -e "  ${YW}Get your enrolment key at https://app.crowdsec.net → Security Engines → Add${CL}"
 echo -e "  ${YW}This automates the enrolment step so you don't need to SSH in afterwards.${CL}"
-read -rp "  CrowdSec enrolment key (blank = skip, enrol manually later) : " CROWDSEC_ENROLL_KEY
+read -rsp "  CrowdSec enrolment key (blank = skip, enrol manually later) : " CROWDSEC_ENROLL_KEY; echo
 
 echo ""
 echo -e "  ${BLD}GeoIP country filtering (optional — Layer 2 Apache, site-wide)${CL}"
@@ -398,7 +728,7 @@ GEOIP_ENABLED=0 GEOIP_MODE="" GEOIP_WHITELIST="" GEOIP_BLOCKLIST=""
 MAXMIND_ACCOUNT_ID="" MAXMIND_LICENSE_KEY=""
 if [[ "${GEOIP_ENABLE:-N}" =~ ^[Yy] ]]; then
   read -rp "  MaxMind Account ID  : " MAXMIND_ACCOUNT_ID
-  read -rp "  MaxMind License Key : " MAXMIND_LICENSE_KEY
+  read -rsp "  MaxMind License Key : " MAXMIND_LICENSE_KEY; echo
   if [[ -z "$MAXMIND_ACCOUNT_ID" || -z "$MAXMIND_LICENSE_KEY" ]]; then
     msg_warn "Both Account ID and License Key are required — GeoIP filtering will be skipped"
   else
@@ -417,39 +747,13 @@ if [[ "${GEOIP_ENABLE:-N}" =~ ^[Yy] ]]; then
   fi
 fi
 
-echo ""
-echo -e "  ${BLD}Deployment mode — rootful (default) or rootless Podman${CL}"
-echo -e "  ${YW}Rootful (default): containers run as the host's root user via Podman.${CL}"
-echo -e "  ${YW}  This is the battle-tested path used throughout this script's${CL}"
-echo -e "  ${YW}  development and debugging history. Recommended for production.${CL}"
-echo -e "  ${YW}Rootless: containers run as the unprivileged 'wpuser' account.${CL}"
-echo -e "  ${YW}  WordPress publishes on host port 8080 (not 80) because an${CL}"
-echo -e "  ${YW}  unprivileged user cannot bind ports below 1024 — nftables adds${CL}"
-echo -e "  ${YW}  a redirect so visitors still use plain port 80 externally.${CL}"
-echo -e "  ${YW}  KNOWN TRADE-OFF: rootless port-forwarding (rootlessport) does${CL}"
-echo -e "  ${YW}  not preserve the visitor's real source IP by default — this can${CL}"
-echo -e "  ${YW}  blind CrowdSec banning and the wp-admin CIDR check. The script${CL}"
-echo -e "  ${YW}  attempts the experimental pasta source-IP-preserving forwarder${CL}"
-echo -e "  ${YW}  and will warn loudly in the install log if it cannot confirm${CL}"
-echo -e "  ${YW}  this works. Treat rootless as newer/less proven — test before${CL}"
-echo -e "  ${YW}  relying on it for a production client site.${CL}"
-read -rp "  Use rootless Podman? [y/N] : " ROOTLESS_SEL
-ROOTLESS_MODE=0
-[[ "${ROOTLESS_SEL:-N}" =~ ^[Yy] ]] && ROOTLESS_MODE=1
-if (( ROOTLESS_MODE )); then
-  msg_warn "Rootless mode selected — WordPress will be reachable on host port 8080,"
-  msg_warn "with an nftables redirect from 80. Review the install log for the"
-  msg_warn "source-IP preservation check before trusting CrowdSec bans / CIDR rules."
-else
-  msg_ok "Rootful Podman (default, fully validated path)"
-fi
 
-echo ""
-echo -e "  ${BLD}Container image digest pinning${CL}"
 echo -e "  ${YW}When enabled, WordPress/MariaDB/CrowdSec are pinned to the exact SHA256${CL}"
 echo -e "  ${YW}digest resolved at install time, not just the floating tag. This${CL}"
 echo -e "  ${YW}guarantees the bits that get audited/tested are the exact bits that${CL}"
 echo -e "  ${YW}run — a registry silently repointing a tag can't change what's deployed.${CL}"
+echo -e "  ${YW}Digests are resolved via Skopeo (a registry manifest query, a few KB —${CL}"
+echo -e "  ${YW}no image is pulled just to check), so this stays cheap on every check.${CL}"
 echo -e "  ${YW}update.sh re-pins on every update, and${CL}"
 echo -e "  ${YW}'update.sh digest-check' can find and move to a newer digest published${CL}"
 echo -e "  ${YW}under the SAME tag (e.g. a same-version security rebuild).${CL}"
@@ -457,7 +761,7 @@ read -rp "  Use SHA256 image digest pinning? [Y/n] : " PINNING_SEL
 USE_DIGEST_PINNING=1
 [[ "${PINNING_SEL:-Y}" =~ ^[Nn] ]] && USE_DIGEST_PINNING=0
 if (( USE_DIGEST_PINNING )); then
-  msg_ok "Digest pinning enabled — resolved during install (adds a short pull-and-inspect step)"
+  msg_ok "Digest pinning enabled — resolved during install via Skopeo (manifest query, not a full pull)"
 else
   msg_warn "Digest pinning disabled — images run by floating tag only"
 fi
@@ -481,7 +785,7 @@ printf  "  %-18s %s\n"  "VM ID:"       "$VMID"
 printf  "  %-18s %s\n"  "Hostname:"    "$HN"
 printf  "  %-18s %s CPU · %s MB · %s\n" "Resources:"  "$CORES" "$RAM" "$DISK"
 printf  "  %-18s Alpine %s (auto)\n"   "OS:"          "$ALPINE_VER"
-printf  "  %-18s %s\n"  "SSH:"         "$([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password (no key)')"
+printf  "  %-18s %s\n"  "SSH:"         "${ADMIN_USER} — $([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')  (root SSH disabled)"
 printf  "  %-18s nft SSH=%-15s  nft Web=%s\n"   "L1 Firewall:"  "${SSH_CIDR:-any}" "${WEB_CIDR:-any}"
 printf  "  %-18s admin-cidr=%-18s  allowed-ip=%s\n" "L2 wp-admin:" "${ADMIN_CIDR:-none}" "${ALLOWED_ADMIN_IP:-none}"
 printf  "  %-18s %s\n"  "Proxy IP:"    "${PROXY_IP:-direct (no proxy)}"
@@ -489,7 +793,6 @@ printf  "  %-18s %s\n"  "Admin slug:"  "${WP_ADMIN_SLUG:+/${WP_ADMIN_SLUG} (cust
 printf  "  %-18s %s\n"  "CS enrolment:" "${CROWDSEC_ENROLL_KEY:+key provided (auto-enrol)}${CROWDSEC_ENROLL_KEY:-manual (after install)}"
 printf  "  %-18s WordPress + MariaDB (internal) + CrowdSec\n" "Containers:"
 printf  "  %-18s %s\n"  "Network:"     "${NET_MODE}${VM_STATIC_IP:+ ($VM_STATIC_IP/$VM_PREFIX)}"
-printf  "  %-18s %s\n"  "Podman mode:" "$([[ $ROOTLESS_MODE -eq 1 ]] && echo 'rootless (port 8080→80 via nftables)' || echo 'rootful (default)')"
 printf  "  %-18s %s\n"  "GeoIP:"       "$([[ $GEOIP_ENABLED -eq 1 ]] && echo "${GEOIP_MODE} (${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST})" || echo 'disabled')"
 printf  "  %-18s %s\n"  "Digest pinning:" "$([[ $USE_DIGEST_PINNING -eq 1 ]] && echo 'enabled (SHA256-pinned images)' || echo 'disabled (tag-only)')"
 [[ -n "$WEB_CIDR" && -n "$PROXY_IP" ]] && msg_warn "WEB_CIDR set + PROXY_IP set → ${PROXY_IP} auto-added to nftables so NPM can reach port 80/443"
@@ -571,31 +874,9 @@ qemu-img resize "$WORK_IMG" "$DISK" >/dev/null
 msg_ok "Working image ready (${DISK})"
 
 # ── Build nftables ruleset (host-side substitution) ───────────────────────────
-# WEB_CONTAINER_PORT is what the *filter* chain must match: in rootful mode
-# WordPress publishes -p 80:80 so this is 80 (zero behaviour change from the
-# default path). In rootless mode WordPress publishes -p 8080:80 (an
-# unprivileged user cannot bind <1024 on the host), so a separate nat table
-# DNAT-redirects public port 80 to 8080 — and because nftables NAT redirects
-# run in the prerouting hook BEFORE the filter/input hook, by the time the
-# packet reaches our input chain its destination port has ALREADY been
-# rewritten to 8080. The filter rule must therefore match 8080, not 80.
+# WEB_CONTAINER_PORT is what the *filter* chain must match. Rootful Podman
+# always publishes -p 80:80, so this is fixed at 80.
 WEB_CONTAINER_PORT=80
-ROOTLESS_NAT_BLOCK=""
-if [[ "${ROOTLESS_MODE:-0}" == "1" ]]; then
-  WEB_CONTAINER_PORT=8080
-  ROOTLESS_NAT_BLOCK=$(cat << 'NATEOF'
-
-# Rootless mode: redirect public port 80 to the unprivileged host port 8080
-# that WordPress actually publishes to (wpuser cannot bind <1024 directly).
-table inet nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat;
-        tcp dport 80 redirect to :8080
-    }
-}
-NATEOF
-)
-fi
 
 if [[ -n "$SSH_CIDR" ]]; then
   SSH_RULE="ip saddr ${SSH_CIDR} tcp dport 22"
@@ -658,7 +939,6 @@ table inet filter {
         type filter hook output priority filter; policy accept;
     }
 }
-${ROOTLESS_NAT_BLOCK}
 NFTEOF
 )
 
@@ -798,6 +1078,23 @@ ServerSignature Off
 # The bind-mount at /var/log/apache2 hides Docker's default stdout symlinks,
 # so Apache creates real files here that CrowdSec reads from the host.
 CustomLog /var/log/apache2/access.log combined
+
+# BUG FIX (v7-6e): dual-IP diagnostic log, added alongside — not instead of —
+# the access.log above. mod_remoteip rewrites %h/%a to the X-Forwarded-For-
+# derived "logical" client once a trusted proxy is configured, which is
+# exactly what CrowdSec's apache2 collection needs for correct IP-based
+# banning — so access.log's format is deliberately left untouched here.
+# Prepending or appending a field to it instead would risk either breaking
+# CrowdSec's grok parser outright, or worse, silently rebinding every ban to
+# the reverse proxy's own IP instead of the real visitor (the exact failure
+# this script has already fixed once via mod_remoteip in the first place).
+# This second log captures both IPs side by side purely for verification:
+# %{c}a is the raw connection peer (the proxy's own IP, if any), %a is the
+# post-substitution address. If a trusted proxy is configured and these two
+# never differ, RemoteIPTrustedProxy doesn't match the real proxy source —
+# a silent misconfiguration that would otherwise be invisible.
+LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
+CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
 
 ${WP_ADMIN_BLOCK}
 
@@ -965,6 +1262,25 @@ REPOS
   rc-service qemu-guest-agent start      2>/dev/null || true
   ok "Agent running"
 
+  ts "Admin account doas (redundant safety net)"
+  # The admin account, its wheel-group membership, and doas.conf normally
+  # already exist by this point — created host-side before first boot in
+  # create-wordpress-vm.sh's pre-boot chroot (see ADMIN_USER_CREATED in
+  # /etc/wp-install/vars.sh). That chroot only needs local filesystem
+  # writes for the account/group itself, so it's virtually guaranteed to
+  # succeed regardless of network — but installing the `doas` PACKAGE from
+  # that same chroot did depend on the PROXMOX HOST reaching Alpine's CDN
+  # at provisioning time. This VM now has its own real networking (Stage 1
+  # already ran a full apk update/upgrade above), so retry here — cheap,
+  # fully idempotent, and closes the one plausible network-dependent gap
+  # in an otherwise network-independent setup.
+  command -v doas >/dev/null 2>&1 || apk add --no-cache doas >/dev/null 2>&1 || true
+  if command -v doas >/dev/null 2>&1; then
+    ok "doas present"
+  else
+    warn "doas still unavailable — install manually: apk add doas"
+  fi
+
   ts "Clock sync"
   apk add --no-cache chrony >/dev/null
   for s in pool.ntp.org time.cloudflare.com time.google.com; do
@@ -1013,12 +1329,12 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 ts "Stage 2 — kernel: $(uname -r)"
 
-# ── Source installer variables (slug, CS key, GeoIP, rootless, network) ──────
+# ── Source installer variables (slug, CS key, GeoIP, network) ────────────────
 # These were injected at provisioning time into /etc/wp-install/vars.sh
 # because the INSTALLER_EOF heredoc is single-quoted (no host var expansion).
 if [ -f /etc/wp-install/vars.sh ]; then
   . /etc/wp-install/vars.sh
-  ok "Installer vars loaded: slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE:-dhcp}, geoip=${GEOIP_ENABLED:-0}, rootless=${ROOTLESS_MODE:-0}"
+  ok "Installer vars loaded: slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE:-dhcp}, geoip=${GEOIP_ENABLED:-0}"
 else
   WP_ADMIN_SLUG=""
   CROWDSEC_ENROLL_KEY=""
@@ -1030,35 +1346,269 @@ else
   GEOIP_BLOCKLIST=""
   MAXMIND_ACCOUNT_ID=""
   MAXMIND_LICENSE_KEY=""
-  ROOTLESS_MODE="0"
+  ADMIN_USER=""
+  ADMIN_USER_CREATED="0"
   warn "/etc/wp-install/vars.sh not found — new features default off"
 fi
 # Defensive defaults in case vars.sh exists but is missing newer keys
 # (e.g. a VM re-provisioned from an older version of this script's injection)
 GEOIP_ENABLED="${GEOIP_ENABLED:-0}"
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
+ADMIN_USER="${ADMIN_USER:-}"
+ADMIN_USER_CREATED="${ADMIN_USER_CREATED:-0}"
 
 # ── PRUN: podman dispatch wrapper ─────────────────────────────────────────────
-# Rootless Podman keeps a COMPLETELY SEPARATE container/image state per user
-# (under ~/.local/share/containers). If wpuser created the containers, root
-# running a bare `podman ps` sees NOTHING — not an error, just an empty list,
-# which is a silent and confusing failure mode. Every podman lifecycle/inspect
-# call in this installer, in update.sh, and in wp-hardening.sh routes through
-# PRUN so the correct user is always targeted regardless of deployment mode.
-# Safe for simple arguments (inspect/ps/logs/exec/stop/rm/rename/start) because
-# none of those carry embedded spaces requiring re-quoting through su -c.
-# The three actual container-CREATION commands (which DO have complex quoted
-# values like WORDPRESS_CONFIG_EXTRA) are handled separately via run-*.sh
-# files invoked by file path — see the "ROOTLESS MODE" section below.
+# BUG FIX (v7-6d): PRUN used to have a rootless branch that rebuilt the whole
+# command as a single string — su -s /bin/sh wpuser -c "podman $*" — and "$*"
+# joins every argument on IFS, discarding the argument boundaries "$@" would
+# have preserved. That string was then RE-PARSED by the inner `sh -c`, so any
+# argument containing shell metacharacters (spaces, quotes, ;, $()) got
+# reinterpreted instead of passed through intact — exactly what happens to
+# WORDPRESS_CONFIG_EXTRA's 'define("WP_DEBUG",false);define(...);...' value.
+# Now that this script is rootful-only, that dispatch — and the vulnerable
+# reconstruction it required — is gone. PRUN is kept as a thin wrapper (so
+# every "PRUN <cmd>" call site elsewhere in this installer, update.sh,
+# wp-hardening.sh, and validate-wordpress.sh needs no changes), but it now
+# ALWAYS calls podman directly with "$@", which preserves argument
+# boundaries exactly.
 PRUN() {
-  if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c "podman $*"
-  else
-    podman "$@"
-  fi
+  podman "$@"
 }
 
+# ── wp-health-check.sh — real WordPress health validation ────────────────────
+# BUG FIX (v7-6g, item #6 from the 7-6f review): every prior "is WordPress
+# ready?" gate in this script (initial install, GeoIP rebuild, and
+# update.sh's rollback decision) was a bare `wget -qO- http://127.0.0.1/`
+# treating any non-500 HTTP response as success. That proves Apache answered
+# a socket — nothing more. It happily passes on "Error establishing a
+# database connection", a PHP fatal-error page, a WordPress maintenance
+# page, a partially initialized site, or the Apache default page — every one
+# of which returns 200/302 while WordPress itself is broken. This is
+# especially dangerous in update.sh's do_wp_update(): a health check that
+# lies "healthy" is exactly the case that skips rollback and leaves a broken
+# site live.
+#
+# Installed once, here, before MariaDB/WordPress ever start, so it's
+# available to every later health-check call site in this file (initial
+# install, wp-geoip-setup.sh, and update.sh) without duplicating the logic
+# three times and letting the copies drift.
+#
+# Checks, in order, each independently gating pass/fail:
+#   1. HTTP response      — sanity check only; proves a socket answers.
+#   2. PHP execution      — proves PHP itself runs inside the container,
+#                            not just that Apache is up.
+#   3. MariaDB DNS         — `getent hosts mariadb` proves Aardvark DNS /
+#                            the wp-db network path resolves the hostname,
+#                            independent of credentials.
+#   4+5. MariaDB auth + real WordPress DB query — one PHP mysqli call using
+#        WordPress's own WORDPRESS_DB_HOST/USER/PASSWORD/NAME env vars (the
+#        exact values Apache/PHP itself uses) that opens a connection AND
+#        runs `SELECT 1`. This is the check that actually proves "WordPress
+#        can talk to its database", not just "MariaDB's TCP port is open".
+# Recent container logs are also grepped for fatal/uncaught/segfault/
+# permission-denied lines and printed for a human to review — informational
+# only, since some of these can be transient noise during first boot, so it
+# never gates pass/fail on its own.
+ts "Installing wp-health-check.sh (real health validation, not just HTTP)"
+cat > /usr/local/bin/wp-health-check.sh << 'HEALTHEOF'
+#!/bin/sh
+# wp-health-check.sh — proves WordPress is actually functional, not just
+# that Apache answers a socket. See the long comment above this heredoc in
+# create-wordpress-vm.sh for the full rationale.
+# Usage: wp-health-check.sh [container_name] [http_port]
+# Exit 0 = all critical checks passed. Exit 1 = one or more failed.
+CONTAINER="${1:-wordpress}"
+HTTP_PORT="${2:-80}"
+FAIL=0
+
+_pass() { echo "  ✔  $*"; }
+_fail() { echo "  ✗  $*" >&2; FAIL=1; }
+
+# 1) HTTP response — sanity check only, proves nothing about WordPress
+# itself (a DB-error page or PHP fatal page can still answer 200/302).
+HTTP_CODE=$(wget -S -O /dev/null "http://127.0.0.1:${HTTP_PORT}/" 2>&1 \
+  | awk '/HTTP\// {print $2}' | tail -1)
+if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "500" ] && [ "$HTTP_CODE" != "000" ]; then
+  _pass "HTTP response: ${HTTP_CODE}"
+else
+  _fail "HTTP response: ${HTTP_CODE:-none}"
+fi
+
+# 2) PHP actually executes inside the container.
+PHP_OK=$(podman exec "$CONTAINER" php -r 'echo "ok";' 2>/dev/null)
+if [ "$PHP_OK" = "ok" ]; then
+  _pass "PHP executes"
+else
+  _fail "PHP did not execute inside ${CONTAINER}"
+fi
+
+# 3) MariaDB name resolution via Aardvark DNS — proves the wp-db network
+# path is up, independent of credentials.
+if podman exec "$CONTAINER" getent hosts mariadb >/dev/null 2>&1; then
+  _pass "mariadb hostname resolves"
+else
+  _fail "mariadb hostname does not resolve (Aardvark DNS / wp-db network issue)"
+fi
+
+# 4+5) MariaDB authentication AND a real WordPress DB query — using
+# WordPress's own WORDPRESS_DB_* env vars (the exact values Apache/PHP
+# itself uses), proving both that MariaDB accepts these credentials and
+# that a real query succeeds — not just that a TCP socket opens.
+DB_CHECK=$(podman exec "$CONTAINER" php -r '
+$host = getenv("WORDPRESS_DB_HOST");
+$user = getenv("WORDPRESS_DB_USER");
+$pass = getenv("WORDPRESS_DB_PASSWORD");
+$name = getenv("WORDPRESS_DB_NAME");
+$db = @new mysqli($host, $user, $pass, $name);
+if ($db->connect_errno) {
+    fwrite(STDERR, $db->connect_error . PHP_EOL);
+    echo "connect_fail";
+    exit(0);
+}
+$result = $db->query("SELECT 1");
+echo $result ? "ok" : "query_fail";
+' 2>/dev/null)
+case "$DB_CHECK" in
+  ok) _pass "MariaDB auth + WordPress DB query (SELECT 1)" ;;
+  connect_fail) _fail "MariaDB connection failed (auth/DNS/credentials) — see: podman logs ${CONTAINER}" ;;
+  query_fail) _fail "MariaDB connected but SELECT 1 failed" ;;
+  *) _fail "DB check did not run (PHP/mysqli unavailable in ${CONTAINER}?)" ;;
+esac
+
+# Informational only — recent fatal/uncaught/segfault/permission lines from
+# the container's own logs, surfaced for a human. Never gates pass/fail by
+# itself: some of these can be transient noise during first boot (e.g. a
+# plugin autoloader race), and the checks above are what actually decide
+# health.
+RECENT_ERRORS=$(podman logs --since 2m "$CONTAINER" 2>&1 \
+  | grep -Ei 'fatal|uncaught|segmentation|permission denied' | tail -5)
+if [ -n "$RECENT_ERRORS" ]; then
+  echo "  ⚠  Recent log lines worth reviewing (informational, not fatal):"
+  echo "$RECENT_ERRORS" | sed 's/^/       /'
+fi
+
+if [ "$FAIL" = "0" ]; then
+  echo "  ✔  WordPress health: ALL CRITICAL CHECKS PASSED"
+  exit 0
+fi
+echo "  ✗  WordPress health: ONE OR MORE CRITICAL CHECKS FAILED"
+exit 1
+HEALTHEOF
+chmod +x /usr/local/bin/wp-health-check.sh
+ok "wp-health-check.sh installed — HTTP + PHP + DB-DNS + DB-auth + real query"
+ok "  Manual use: wp-health-check.sh [container] [port]"
+
+# ── mariadb-health-check.sh — real MariaDB health validation ─────────────────
+# PRODUCTION SAFETY FIX (v7-6k, "Strengthen service health checks" from the
+# 7-6f review): wp-health-check.sh (above) closed this gap for WordPress,
+# but every MariaDB readiness gate in this script — the wait loop just
+# below (before either container even exists yet) AND update.sh's
+# do_db_update() rollback decision — was still a bare
+# `mariadbd-admin ping`. A ping only proves the server accepts a TCP
+# connection and that ROOT authenticates; it proves nothing about InnoDB
+# actually being usable, and nothing about whether WordPress's OWN
+# database/user (MARIADB_DATABASE/MARIADB_USER, not root) can run a query.
+# That is the identical blind spot the old `wget -qO-` WordPress check had
+# — a shallow protocol-level success coexisting with a broken
+# application-level path (see the long comment above the wp-health-check.sh
+# heredoc). It matters most inside do_db_update(): DB_READY there directly
+# decides whether the new MariaDB container is kept or rolled back to
+# mariadb-old, and at that point in the update WordPress is deliberately
+# stopped, so wp-health-check.sh — which needs a running WordPress
+# container to test through — cannot be used to validate the new database.
+# A MariaDB-only check is the only way to test it there.
+#
+# Installed once, here, before either container starts, so it's available
+# to every later call site (the wait loop just below, and update.sh)
+# without duplicating the query logic and letting copies drift.
+ts "Installing mariadb-health-check.sh (real health validation, not just ping)"
+cat > /usr/local/bin/mariadb-health-check.sh << 'DBHEALTHEOF'
+#!/bin/sh
+# mariadb-health-check.sh — proves MariaDB is actually functional, not just
+# that mariadbd-admin ping succeeds. See the long comment above this
+# heredoc in create-wordpress-vm.sh for the full rationale.
+# Usage: mariadb-health-check.sh [container_name]
+# Exit 0 = all critical checks passed. Exit 1 = one or more failed.
+CONTAINER="${1:-mariadb}"
+FAIL=0
+
+_pass() { echo "  ✔  $*"; }
+_fail() { echo "  ✗  $*" >&2; FAIL=1; }
+
+# 1) Root ping — sanity check only. Proves the server accepts TCP and root
+# authenticates; proves nothing about InnoDB or WordPress's own grants.
+if podman exec "$CONTAINER" sh -c \
+     'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
+      mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null' \
+     >/dev/null 2>&1; then
+  _pass "root ping"
+else
+  _fail "root ping failed"
+fi
+
+# 2) A real query as root — proves the SQL engine itself answers, not just
+# that the ping protocol handshake succeeds (ping and query are different
+# code paths inside mariadbd).
+ROOT_QUERY=$(podman exec "$CONTAINER" sh -c \
+  'mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -N -e "SELECT 1;" 2>/dev/null ||
+   mysql   -uroot -p"${MARIADB_ROOT_PASSWORD}" -N -e "SELECT 1;" 2>/dev/null')
+if [ "$ROOT_QUERY" = "1" ]; then
+  _pass "root SELECT 1"
+else
+  _fail "root SELECT 1 did not return 1 (got: '${ROOT_QUERY}')"
+fi
+
+# 3) The EXACT credentials WordPress itself uses — MARIADB_USER/PASSWORD/
+# DATABASE come from the same /etc/wordpress/env file mounted into both the
+# mariadb and wordpress containers, so this is the identical database,
+# user, and password WORDPRESS_DB_* resolves to on the WordPress side. A
+# root-only check can report healthy while WordPress's own grants are
+# broken (e.g. a botched restore, a user dropped by an errant migration) —
+# proving root works is not the same as proving WordPress can log in.
+WP_QUERY=$(podman exec "$CONTAINER" sh -c \
+  'mariadb -u"${MARIADB_USER}" -p"${MARIADB_PASSWORD}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null ||
+   mysql   -u"${MARIADB_USER}" -p"${MARIADB_PASSWORD}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null')
+if [ "$WP_QUERY" = "1" ]; then
+  _pass "wordpress-user SELECT 1 (same credentials WordPress itself uses)"
+else
+  _fail "wordpress-user SELECT 1 failed — WordPress's own DB user/grants may be broken"
+fi
+
+# 4) InnoDB actually initialized — read directly via the same healthcheck.sh
+# shipped in the official MariaDB image and already used as this
+# container's own --health-cmd, but invoked here directly rather than
+# trusting Podman's health-check timer: this script's own install-time
+# comments already document that timer as unreliable on Alpine (no
+# systemd/conmon poller to drive it — .State.Health.Status can sit on
+# "starting" forever even once MariaDB is fully usable).
+if podman exec "$CONTAINER" healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1; then
+  _pass "InnoDB initialized"
+else
+  _fail "InnoDB not confirmed initialized (healthcheck.sh --innodb_initialized)"
+fi
+
+# Informational only — recent error/corruption-flavoured log lines, surfaced
+# for a human. Never gates pass/fail by itself, same rationale as
+# wp-health-check.sh's own log scan: some of these can be transient noise
+# (e.g. a single retried connection during startup), and the checks above
+# are what actually decide health.
+RECENT_ERRORS=$(podman logs --since 2m "$CONTAINER" 2>&1 \
+  | grep -Ei 'error|corrupt|assertion|crashed' | tail -5)
+if [ -n "$RECENT_ERRORS" ]; then
+  echo "  ⚠  Recent log lines worth reviewing (informational, not fatal):"
+  echo "$RECENT_ERRORS" | sed 's/^/       /'
+fi
+
+if [ "$FAIL" = "0" ]; then
+  echo "  ✔  MariaDB health: ALL CRITICAL CHECKS PASSED"
+  exit 0
+fi
+echo "  ✗  MariaDB health: ONE OR MORE CRITICAL CHECKS FAILED"
+exit 1
+DBHEALTHEOF
+chmod +x /usr/local/bin/mariadb-health-check.sh
+ok "mariadb-health-check.sh installed — ping + root query + wpdb query + InnoDB"
+ok "  Manual use: mariadb-health-check.sh [container]"
 
 ts "Loading kernel modules"
 modprobe overlay 2>/dev/null && ok "overlay" || warn "overlay modprobe failed"
@@ -1095,6 +1645,21 @@ net.ipv4.conf.default.accept_source_route=0
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
+# BUG FIX (v7-6e): the remaining review item on kernel hardening — none of
+# these were present before. All are standard, low-risk hardening values
+# that nothing in this stack (Podman/crun, Apache/PHP, MariaDB, CrowdSec,
+# Trivy, Lynis) needs to be more permissive than; Lynis's own hardening_index
+# (already tracked via wp-hardening.sh lynis) scores several of these
+# directly, so this also raises that number.
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.yama.ptrace_scope=1
+kernel.unprivileged_bpf_disabled=1
+fs.protected_fifos=2
+fs.protected_regular=2
+fs.protected_hardlinks=1
+fs.protected_symlinks=1
+fs.suid_dumpable=0
 SYSCTL
 sysctl -p /etc/sysctl.d/99-hardening.conf >/dev/null 2>&1
 ok "Sysctls applied"
@@ -1103,6 +1668,21 @@ ts "Installing Podman"
 apk add --no-cache podman crun >/dev/null
 ok "Podman $(podman --version 2>/dev/null | awk '{print $3}')"
 echo 'export PODMAN_IGNORE_CGROUPSV1_WARNING=1' >> /etc/profile
+
+# Skopeo: registry manifest inspection — lets digest pinning (below) and
+# update.sh ask "what digest does this tag point to right now" by querying
+# the registry's manifest endpoint directly (a few KB) instead of pulling
+# the full image just to find out. Lives in Alpine's standard repos, built
+# on the same containers/image library as podman/buildah — plain apk add,
+# no edge/testing repo needed. Never fatal if it fails: every digest lookup
+# that uses it falls back to the older pull-then-inspect method on its own.
+ts "Installing Skopeo (registry manifest inspection — powers cheap digest checks)"
+if apk add --no-cache skopeo >/dev/null 2>&1; then
+  ok "Skopeo $(skopeo --version 2>/dev/null | awk '{print $NF}') ready"
+else
+  warn "Skopeo install failed — digest pinning/checks will fall back to the"
+  warn "  slower pull-then-inspect method (still correct, just heavier)"
+fi
 
 # aardvark-dns: required for container-to-container DNS resolution on wp-db.
 # Without it WordPress can't resolve the hostname 'mariadb:3306'.
@@ -1130,12 +1710,6 @@ cat > /etc/containers/containers.conf.d/10-netavark-nftables.conf << 'CONTAINERS
 firewall_driver = "nftables"
 CONTAINERSCONF
 ok "netavark: firewall_driver=nftables (drop-in: containers.conf.d/)"
-
-# ── Sub-UID/GID — set up now even though we use rootful; enables future ───────
-# rootless or --userns=auto migration without reinstall.
-grep -q '^root:100000' /etc/subuid 2>/dev/null || echo 'root:100000:65536' >> /etc/subuid
-grep -q '^root:100000' /etc/subgid 2>/dev/null || echo 'root:100000:65536' >> /etc/subgid
-ok "subuid/subgid ranges provisioned for root (100000:65536)"
 
 ts "Configuring Podman storage"
 mkdir -p /etc/containers
@@ -1183,63 +1757,114 @@ ok "Storage driver: ${DRIVER_CHOSEN}"
 # a hardcoded placeholder. A hardcoded digest goes stale the instant any of
 # these images is rebuilt under the same tag — which registries do routinely
 # for security patches — silently pinning every future install to a WORSE,
-# older image forever with no warning. Instead: pull the tag once here, ask
-# Podman what digest it actually resolved to, then rewrite
-# WP_IMAGE/DB_IMAGE/CROWDSEC_IMAGE to a pinned reference for the rest of this
-# run. Every OpenRC service, every rootless run-*.sh script, and the GeoIP
-# builder all read these same three variables (unquoted heredocs substitute
-# at write time), so pinning here propagates everywhere with zero other code
-# changes. It does NOT freeze out security updates: update.sh re-resolves and
-# re-pins on every wp/db/crowdsec update, and `update.sh digest-check`
-# explicitly checks for a newer digest published under the SAME tag (e.g. a
-# same-version security rebuild) without waiting for a version bump.
+# older image forever with no warning.
 #
-# FORMAT NOTE: Podman's support for combining a tag AND a digest in one
-# reference ("repo:tag@sha256:digest") has genuinely varied across releases —
-# some older versions hard-reject it with "invalid image reference" (which
-# would break every single container operation in this script, since
-# WP_IMAGE/DB_IMAGE/CROWDSEC_IMAGE are used everywhere), while some newer
-# ones accept it for pull/run but don't locally tag the stored image. Rather
-# than guess which behavior this host's Podman has, _pin_digest tests the
-# combined form directly against the local Podman (a fast, read-only,
-# network-free `podman inspect`) and only uses it if that succeeds — falling
-# back to the universally-supported digest-only form ("repo@sha256:digest")
-# otherwise. Either form gives the same reproducibility guarantee; the
-# combined form is just more readable in `podman ps`/logs when available.
+# SKOPEO REWRITE (v7-6f): resolving "what digest does this tag point to right
+# now" used to mean a full `podman pull` (150-200+ MB each for WordPress/
+# MariaDB) just to ask Podman what it downloaded. Skopeo's `inspect
+# docker://ref` asks the registry's manifest endpoint directly — a few KB, no
+# layer data — so the digest is known before anything is pulled. A `podman
+# pull` still happens here (the image needs to actually land locally to run
+# it), but only once, against the exact `repo@sha256:digest` reference that's
+# actually going to be pinned — not as a separate discovery pull first. If
+# Skopeo is missing or a lookup fails, _pin_digest falls back to the
+# pre-v7-6f method (pull by tag, ask Podman what it resolved) automatically
+# — never fatal, just the old bandwidth cost for that one image. update.sh
+# uses this same Skopeo-first approach for its own checks, where the payoff
+# is bigger: a routine `update.sh check` no longer pulls anything at all.
 #
-# RETRY + DIAGNOSTICS (v7-5c): a bare "pull failed once, give up" was too
-# brittle — a single DNS blip or registry rate-limit during boot silently
-# downgraded a whole image to unpinned with no record of why. Both the pull
-# and the digest-resolution step now retry up to 3 times, and any final
-# failure writes the ACTUAL podman error text (not just "failed") to
+# FORMAT NOTE (v7-6f): the old "does this Podman accept a combined
+# repo:tag@sha256:digest reference" compatibility test is gone. Every pinned
+# reference is now the universally-supported digest-only form
+# (`repo@sha256:digest`); the tag is tracked separately in the new
+# /etc/wp-install/pinned.env instead of inside the image reference itself —
+# see the PERSIST block below. update.sh's `check`/`status` output is the
+# place to see tag info now, not `podman ps`. wp-geoip-setup.sh's tag
+# derivation was updated to match — it now reads pinned.env directly instead
+# of trying to sed the tag back out of a reference that may no longer
+# contain one (see that script for details).
+#
+# RETRY + DIAGNOSTICS (v7-5c, carried forward unchanged): both the pull and
+# the digest-resolution step retry up to 3 times, and any final failure
+# writes the ACTUAL error text (not just "failed") to
 # /var/log/wp-digest-pinning.log for later diagnosis, plus a short pointer
 # to that log in the normal warn() output. A pin-count summary is also
 # printed once all three images are resolved.
 DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
-if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
-  ts "Resolving SHA256 digests for image pinning"
-  _pin_digest() {
-    local ref="$1" label="$2" digest repo_only candidate
-    local attempt pull_ok pull_output inspect_ok inspect_output
-    # BUG FIX (v7-5b): CRITICAL — ok()/warn() print to plain stdout (see their
-    # definitions above: `echo "  ✔  $*"`), and this function is called as
-    # WP_IMAGE=$(_pin_digest ...). A command substitution captures EVERYTHING
-    # the function writes to stdout, not just the final `echo "$candidate"` —
-    # so the human-readable "pinned to sha256:..." status line was landing
-    # IN THE VARIABLE, ahead of the actual image reference, on its own line.
-    # WP_IMAGE/DB_IMAGE/CROWDSEC_IMAGE ended up as two-line garbage strings,
-    # and every subsequent `podman run ... "${DB_IMAGE}"` failed with
-    # "invalid reference format" — confirmed in the field, MariaDB never
-    # started. Every ok/warn call in this function must go to stderr (>&2)
-    # so it still displays/logs normally but does NOT get captured here.
 
-    # ── Pull, up to 3 attempts ────────────────────────────────────────────
+_skopeo_digest() {
+  # $1 = full tag reference, e.g. docker.io/wordpress:6.9.4-php8.3-apache
+  # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
+  # missing, network error, unparseable output) — treated as "fall back",
+  # never as fatal.
+  local ref="$1" out digest
+  command -v skopeo >/dev/null 2>&1 || return 1
+  out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
+  digest=$(printf '%s' "$out" \
+    | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+    | grep -oE 'sha256:[0-9a-f]{64}')
+  [ -n "$digest" ] || return 1
+  printf '%s\n' "$digest"
+}
+
+_resolve_digest() {
+  local ref="$1" attempt digest
+  for attempt in 1 2 3; do
+    digest=$(_skopeo_digest "$ref") && [ -n "$digest" ] && { printf '%s\n' "$digest"; return 0; }
+    [ "$attempt" -lt 3 ] && sleep 2
+  done
+  return 1
+}
+
+if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
+  ts "Resolving image digests (Skopeo registry query — no image pulled yet)"
+
+  _pin_digest() {
+    # $1 = tag reference   $2 = label (for logs)
+    # stdout: repo@sha256:digest if a digest was resolved (the common case),
+    # or the original tag reference if resolution failed outright (that one
+    # image falls back to tag-only, same graceful-degradation behavior as
+    # USE_DIGEST_PINNING=0 for just that image).
+    # BUG FIX (v7-5b, still applies): ok()/warn() print to plain stdout, and
+    # this function is called as WP_IMAGE=$(_pin_digest ...) — a command
+    # substitution captures EVERYTHING written to stdout, not just the final
+    # `echo`. Every ok/warn call in this function must go to stderr (>&2).
+    local ref="$1" label="$2" repo tag digest candidate attempt pull_ok pull_output
+    repo="${ref%:*}"; tag="${ref##*:}"
+
+    # Preferred path: Skopeo resolves the digest with no image pull at all.
+    digest=""
+    if command -v skopeo >/dev/null 2>&1; then
+      digest=$(_resolve_digest "$ref") || digest=""
+    fi
+
+    if [ -n "$digest" ]; then
+      candidate="${repo}@${digest}"
+      pull_ok=0
+      for attempt in 1 2 3; do
+        if pull_output=$(podman pull "$candidate" 2>&1); then pull_ok=1; break; fi
+        warn "${label}: pull attempt ${attempt}/3 failed, retrying…" >&2
+        [ "$attempt" -lt 3 ] && sleep 4
+      done
+      if [ "$pull_ok" = "1" ]; then
+        ok "${label}: pinned to ${digest} (Skopeo — no full pull needed just to check)" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (skopeo) — ${candidate}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
+        echo "$candidate"
+        return 0
+      fi
+      warn "${label}: Skopeo resolved a digest but pulling it failed after 3 attempts — trying a plain tag pull instead. Detail: ${DIGEST_PIN_LOG}" >&2
+      {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST PULL FAILED after 3 attempts — ref=${candidate}"
+        echo "${pull_output}" | sed 's/^/    /'
+      } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
+    else
+      warn "${label}: Skopeo digest lookup unavailable or failed — falling back to tag pull + local inspect" >&2
+    fi
+
+    # Fallback: pull by tag, then ask Podman what digest it resolved to.
     pull_ok=0
     for attempt in 1 2 3; do
-      if pull_output=$(podman pull "$ref" 2>&1); then
-        pull_ok=1
-        break
-      fi
+      if pull_output=$(podman pull "$ref" 2>&1); then pull_ok=1; break; fi
       warn "${label}: pull attempt ${attempt}/3 failed, retrying…" >&2
       [ "$attempt" -lt 3 ] && sleep 4
     done
@@ -1251,37 +1876,21 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
       } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "$ref"; return 0
     fi
-
-    # ── Resolve digest, up to 3 attempts ──────────────────────────────────
-    digest="" inspect_ok=0
-    for attempt in 1 2 3; do
-      if inspect_output=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>&1); then
-        digest=$(echo "$inspect_output" | grep -oE 'sha256:[0-9a-f]{64}' || true)
-        if [ -n "$digest" ]; then inspect_ok=1; break; fi
-      fi
-      [ "$attempt" -lt 3 ] && sleep 3
-    done
-    if [ "$inspect_ok" != "1" ]; then
-      warn "${label}: could not resolve a digest after 3 attempts — continuing with tag-only reference. Detail: ${DIGEST_PIN_LOG}" >&2
-      {
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST RESOLUTION FAILED after 3 attempts — ref=${ref}"
-        echo "    Last 'podman inspect --format {{index .RepoDigests 0}}' output: ${inspect_output:-<empty — image has no RepoDigests>}"
-      } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
+    digest=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+      | grep -oE 'sha256:[0-9a-f]{64}' || true)
+    if [ -z "$digest" ]; then
+      warn "${label}: could not resolve a digest after pulling — continuing with tag-only reference. Detail: ${DIGEST_PIN_LOG}" >&2
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST RESOLUTION FAILED (post-pull) — ref=${ref}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
       echo "$ref"; return 0
     fi
-
-    repo_only="${ref%:*}"
-    candidate="${ref}@${digest}"
-    if podman inspect "$candidate" >/dev/null 2>&1; then
-      ok "${label}: pinned to ${digest} (tag+digest)" >&2
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (tag+digest) — ${candidate}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
-      echo "$candidate"
-    else
-      ok "${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (digest-only) — ${repo_only}@${digest}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
-      echo "${repo_only}@${digest}"
-    fi
+    ok "${label}: pinned to ${digest} (tag pull + local inspect — Skopeo path unavailable)" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (fallback) — ${repo}@${digest}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
+    echo "${repo}@${digest}"
   }
+
+  WP_TAG_INIT="${WP_IMAGE##*:}"
+  DB_TAG_INIT="${DB_IMAGE##*:}"
+  CS_TAG_INIT="${CROWDSEC_IMAGE##*:}"
   WP_IMAGE=$(_pin_digest "$WP_IMAGE" "WordPress")
   DB_IMAGE=$(_pin_digest "$DB_IMAGE" "MariaDB")
   CROWDSEC_IMAGE=$(_pin_digest "$CROWDSEC_IMAGE" "CrowdSec")
@@ -1301,28 +1910,48 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
     warn "Digest pinning: ${DIGEST_PIN_SUMMARY} — see ${DIGEST_PIN_LOG} for exactly why the rest fell back to tag-only"
   fi
 else
+  WP_TAG_INIT="${WP_IMAGE##*:}"
+  DB_TAG_INIT="${DB_IMAGE##*:}"
+  CS_TAG_INIT="${CROWDSEC_IMAGE##*:}"
   DIGEST_PIN_SUMMARY="disabled"
   ok "Digest pinning disabled (USE_DIGEST_PINNING=0) — using tag-only references"
 fi
 
+# ── Persist pinned tag+digest — the source of truth update.sh reads ────────
+# BUG FIX (v7-6f): previously there was no persisted record of this at all —
+# "what tag/digest is pinned" had to be re-derived later by sed-parsing it
+# back out of the running container's own image string, which only worked
+# because a pinned reference still had a visible tag in it
+# (repo:tag@sha256:digest). Now that every pinned reference is digest-only
+# (see FORMAT NOTE above), that string has no tag left in it to parse out.
+# /etc/wp-install/pinned.env is the fix: written here at install time, kept
+# current by update.sh (see its _save_pinned()) after every successful
+# wp/db/crowdsec update, and read by both update.sh and wp-geoip-setup.sh.
+WP_PIN_DIGEST=""; case "$WP_IMAGE" in *@sha256:*) WP_PIN_DIGEST="${WP_IMAGE#*@}" ;; esac
+DB_PIN_DIGEST=""; case "$DB_IMAGE" in *@sha256:*) DB_PIN_DIGEST="${DB_IMAGE#*@}" ;; esac
+CS_PIN_DIGEST=""; case "$CROWDSEC_IMAGE" in *@sha256:*) CS_PIN_DIGEST="${CROWDSEC_IMAGE#*@}" ;; esac
+mkdir -p /etc/wp-install
+cat > /etc/wp-install/pinned.env << PINNEDENV
+# WordPress VM — pinned image tag + digest per component.
+# Written by the installer; kept current by update.sh after every
+# successful update. update.sh treats this file as authoritative for
+# "what is currently pinned" instead of parsing tags back out of the
+# running container's image reference. Do not edit by hand while update.sh
+# might be running.
+WP_TAG="${WP_TAG_INIT}"
+WP_DIGEST="${WP_PIN_DIGEST}"
+DB_TAG="${DB_TAG_INIT}"
+DB_DIGEST="${DB_PIN_DIGEST}"
+CS_TAG="${CS_TAG_INIT}"
+CS_DIGEST="${CS_PIN_DIGEST}"
+PINNEDENV
+chmod 600 /etc/wp-install/pinned.env
+ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}"
+
 ts "Creating wpuser account"
 apk add --no-cache shadow >/dev/null
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  # Rootless mode needs a real shell for wpuser since OpenRC services and
-  # update.sh invoke podman commands as wpuser via 'su -s /bin/sh wpuser -c'.
-  id wpuser >/dev/null 2>&1 || adduser -D -s /bin/sh wpuser
-  usermod -s /bin/sh wpuser 2>/dev/null || true
-  # Distinct subuid/subgid range from root's own range (100000:65536, set
-  # earlier) so rootless container UIDs never overlap with anything else.
-  grep -q '^wpuser:' /etc/subuid 2>/dev/null || echo 'wpuser:200000:65536' >> /etc/subuid
-  grep -q '^wpuser:' /etc/subgid 2>/dev/null || echo 'wpuser:200000:65536' >> /etc/subgid
-  mkdir -p /home/wpuser/.config/containers
-  chown -R wpuser:wpuser /home/wpuser/.config 2>/dev/null || true
-  ok "wpuser ready — rootless mode (shell: /bin/sh, subuid/subgid: 200000:65536)"
-else
-  id wpuser >/dev/null 2>&1 || adduser -D -s /sbin/nologin wpuser
-  ok "wpuser ready (file layout only — not used for container UID)"
-fi
+id wpuser >/dev/null 2>&1 || adduser -D -s /sbin/nologin wpuser
+ok "wpuser ready (file layout only — not used for container UID)"
 
 ts "Generating database credentials"
 apk add --no-cache openssl >/dev/null 2>&1 || true
@@ -1371,8 +2000,6 @@ ts "Creating Podman wp-front / wp-db networks"
 #   ip saddr/daddr 10.89.20.0/24 accept   (wp-db,    in /etc/nftables.nft)
 # Without fixed subnets, netavark assigns them dynamically and the forward
 # rules could stop matching after a network recreate.
-# ROOTLESS: network state is per-user — must create networks as wpuser
-# so wpuser's containers can connect to them. PRUN dispatches to the correct user.
 #
 # wp-front: WordPress only. Has normal egress (plugin/theme installs, WP-Cron
 # remote requests, update checks) and is where the published host port lands.
@@ -1511,25 +2138,11 @@ mkdir -p /home/wpuser/wp/mysql
 mkdir -p /home/wpuser/wp/apache-conf /home/wpuser/wp/php-conf
 chown -R wpuser:wpuser /home/wpuser/wp 2>/dev/null || true
 
-# Rootless containers use subordinate UID/GID mapping (subuid/subgid).
-# wpuser's range is 200000:65536, so container UID 33 (www-data) maps to
-# host UID 200033, and container UID 999 (mysql) maps to host UID 200999.
-# A plain 'chown 33:33' as real root sets the WRONG on-disk owner for
-# rootless containers — the write would fail silently because the container
-# process (which has access to 200033, not 33) cannot write to a dir owned
-# by literal 33. 'podman unshare' enters wpuser's user namespace so chown
-# values resolve correctly through the mapping to the actual disk UIDs.
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  su -s /bin/sh wpuser -c 'podman unshare chown -R 33:33  /home/wpuser/wp/html /home/wpuser/wp/logs' 2>/dev/null \
-    && ok "html/logs owned by www-data (subordinate UID mapping via podman unshare)" || true
-  su -s /bin/sh wpuser -c 'podman unshare chown -R 999:999 /home/wpuser/wp/mysql' 2>/dev/null \
-    && ok "mysql owned by mysql (subordinate UID mapping via podman unshare)" || true
-else
-  # Rootful: container UIDs are the real host UIDs — literal chown is correct.
-  chown -R 33:33  /home/wpuser/wp/html /home/wpuser/wp/logs
-  chown -R 999:999 /home/wpuser/wp/mysql
-  ok "Volume directories owned by UID 33 (www-data) and 999 (mysql)"
-fi
+# Container UIDs map 1:1 to host UIDs under rootful Podman (no subordinate
+# UID/GID mapping is involved), so a literal chown is correct here.
+chown -R 33:33  /home/wpuser/wp/html /home/wpuser/wp/logs
+chown -R 999:999 /home/wpuser/wp/mysql
+ok "Volume directories owned by UID 33 (www-data) and 999 (mysql)"
 
 # ── Deploy Apache security config (pre-built by host script) ─────────────────
 # /root/wp-security.conf was written by create-wordpress-vm.sh via qemu-nbd
@@ -1555,6 +2168,11 @@ else
 ServerTokens Prod
 ServerSignature Off
 CustomLog /var/log/apache2/access.log combined
+# Dual-IP diagnostic log — see main wp-security.conf for rationale. Kept
+# separate from access.log so CrowdSec's apache2 collection parsing is
+# never affected.
+LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
+CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
 <Directory /var/www/html>
     Options -Indexes +FollowSymLinks
     AllowOverride All
@@ -1633,160 +2251,6 @@ ok "syslog active"
 
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# ROOTLESS MODE SETUP (only runs if ROOTLESS_MODE=1)
-#
-# Generates run-mariadb.sh / run-wordpress.sh / run-crowdsec.sh — standalone
-# POSIX sh files containing the full podman run invocation for each container.
-# WHY FILES INSTEAD OF INLINE su -c STRINGS: our podman run commands embed
-# WORDPRESS_CONFIG_EXTRA values with nested double-quotes. Flattening that
-# through `su -c "podman run ... -e VAR='...nested...' ..."` breaks the outer
-# shell's quote parsing. A file has no such problem — it's just a normal
-# script with normal quoting, invoked via `su -s /bin/sh wpuser -c '/path'`
-# where the -c argument is a single clean token (the path), so there is
-# nothing to mis-parse regardless of how complex the file's own contents are.
-# This same mechanism works correctly whether called from bash (this
-# installer) or busybox ash (OpenRC service scripts on Alpine).
-#
-# PORT 8080 RATIONALE: an unprivileged user cannot bind host ports <1024.
-# WordPress therefore publishes -p 8080:80 (container-internal Apache still
-# binds port 80 normally — NET_BIND_SERVICE is evaluated inside the
-# container's own network namespace, unaffected by the outer host-level
-# restriction). nftables (configured host-side, always as real root
-# regardless of Podman mode) redirects public port 80 to 8080 so visitors
-# never see a difference.
-#
-# SOURCE-IP PRESERVATION — read before trusting CrowdSec bans / ADMIN_CIDR:
-# Rootless bridge networks forward published ports via "rootlessport", a
-# userspace proxy that by default does NOT preserve the original client IP
-# (WordPress would see every visitor as coming from the bridge gateway).
-# This would silently blind CrowdSec banning and the wp-admin CIDR check.
-# Podman has an experimental fix (rootless_port_forwarder=pasta) which we
-# attempt below; if the installed pasta version doesn't support it, we warn
-# loudly rather than silently degrading a security feature.
-# ════════════════════════════════════════════════════════════════════════════
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  ts "Rootless mode — generating container run scripts"
-
-  # Attempt pasta-based port forwarding for source-IP preservation.
-  # Falls back gracefully (default rootlessport) with a loud warning if the
-  # installed pasta is too old for the --map-gw style source-IP behaviour.
-  apk add --no-cache passt >/dev/null 2>&1 || true
-  PASTA_OK=0
-  if command -v pasta >/dev/null 2>&1; then
-    cat >> /home/wpuser/.config/containers/containers.conf << 'PASTACONF'
-[network]
-rootless_port_forwarder = "pasta"
-PASTACONF
-    chown wpuser:wpuser /home/wpuser/.config/containers/containers.conf 2>/dev/null || true
-    PASTA_OK=1
-    ok "pasta port forwarder configured — will verify source-IP preservation after WordPress starts"
-  else
-    warn "pasta not available via apk — using default rootlessport (NO client source-IP preservation)"
-    warn "  CrowdSec IP banning and the wp-admin ADMIN_CIDR check will NOT see real visitor IPs."
-    warn "  Mitigation: rely on Layer 1 nftables (SSH_CIDR/WEB_CIDR) and CrowdSec's"
-    warn "  application-layer WordPress/Apache rules (which inspect request content,"
-    warn "  not source IP) until this is resolved, or switch to rootful mode."
-  fi
-
-  # ── run-mariadb.sh ──────────────────────────────────────────────────────────
-  cat > /home/wpuser/wp/run-mariadb.sh << RUNDB
-#!/bin/sh
-# Generated by create-wordpress-vm.sh — rootless MariaDB launcher.
-# Re-run anytime to (re)create the container if it's missing; starts it if present.
-if podman container exists mariadb 2>/dev/null; then
-  podman start mariadb
-else
-  podman run -d --name mariadb --network wp-db --ip 10.89.20.2 --restart always \\
-    --label io.containers.autoupdate=image \\
-    --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
-    --cap-add DAC_OVERRIDE --cap-add FOWNER \\
-    --security-opt no-new-privileges:true \\
-    --tmpfs /tmp:size=32M,noexec,nosuid,nodev \\
-    --pids-limit 100 --memory=512m --cpu-shares=512 \\
-    --env-file /etc/wordpress/env \\
-    -v /home/wpuser/wp/mysql:/var/lib/mysql \\
-    -v /home/wpuser/wp/mariadb-conf/wp.cnf:/etc/mysql/conf.d/wp.cnf:ro \\
-    --health-cmd "healthcheck.sh --connect --innodb_initialized" \\
-    --health-interval 5s --health-timeout 5s --health-retries 24 --health-start-period 30s \\
-    "${DB_IMAGE}"
-fi
-RUNDB
-  chmod 750 /home/wpuser/wp/run-mariadb.sh
-  chown wpuser:wpuser /home/wpuser/wp/run-mariadb.sh
-
-  # ── run-wordpress.sh (port 8080, not 80 — see rationale above) ──────────────
-  cat > /home/wpuser/wp/run-wordpress.sh << RUNWP
-#!/bin/sh
-# Generated by create-wordpress-vm.sh — rootless WordPress launcher.
-if podman container exists wordpress 2>/dev/null; then
-  podman start wordpress
-else
-  podman run -d --name wordpress --network wp-front --ip 10.89.10.3 -p 8080:80 --restart always \\
-    --label io.containers.autoupdate=image \\
-    --cap-drop ALL --cap-add NET_BIND_SERVICE \\
-    --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
-    --cap-add DAC_OVERRIDE --cap-add FOWNER \\
-    --security-opt no-new-privileges:true \\
-    --pids-limit 200 --memory=768m --cpu-shares=512 \\
-    --tmpfs /tmp:size=64M,noexec,nosuid,nodev \\
-    --env-file /etc/wordpress/env \\
-    -e WORDPRESS_DB_HOST=mariadb:3306 \\
-    -e WORDPRESS_DEBUG="" \\
-    --add-host "mariadb:10.89.20.2" \\
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
-    -v /home/wpuser/wp/html:/var/www/html \\
-    -v /home/wpuser/wp/logs:/var/log/apache2 \\
-    -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
-    -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \\
-    -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \\
-    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \\
-    "${WP_IMAGE}"
-  # Second network: wp-db (--internal) for MariaDB access only. Podman's
-  # --network flag on \`run\` only takes a static --ip for the primary network
-  # in this Podman/Alpine combination, so wp-db is attached post-create via
-  # \`network connect\` — the same pattern Podman's own docs recommend for
-  # multi-network containers, and portable across older Podman releases.
-  podman network connect --ip 10.89.20.3 wp-db wordpress
-fi
-RUNWP
-  chmod 750 /home/wpuser/wp/run-wordpress.sh
-  chown wpuser:wpuser /home/wpuser/wp/run-wordpress.sh
-
-  # ── run-crowdsec.sh ──────────────────────────────────────────────────────────
-  # --network host: shares the host's network namespace directly, so there is
-  # no rootlessport proxy stage for CrowdSec itself (its only inbound surface
-  # is LAPI on 127.0.0.1, loopback regardless of Podman mode).
-  cat > /home/wpuser/wp/run-crowdsec.sh << RUNCS
-#!/bin/sh
-# Generated by create-wordpress-vm.sh — rootless CrowdSec launcher.
-if podman container exists crowdsec 2>/dev/null; then
-  podman start crowdsec
-else
-  podman run -d --name crowdsec --restart always --network host \\
-    --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
-    --security-opt no-new-privileges:true --read-only \\
-    --tmpfs /tmp:size=32M,noexec,nosuid,nodev --tmpfs /var/run:size=16M,noexec,nosuid,nodev \\
-    --pids-limit 100 --memory=512m --label io.containers.autoupdate=image \\
-    -e COLLECTIONS="crowdsecurity/apache2 crowdsecurity/wordpress crowdsecurity/linux crowdsecurity/sshd crowdsecurity/http-cve crowdsecurity/appsec-wordpress" \\
-    -v /opt/crowdsec/config:/etc/crowdsec:rw \\
-    -v /opt/crowdsec/data:/var/lib/crowdsec/data:rw \\
-    -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \\
-    -v /home/wpuser/wp/logs:/var/log/wordpress:ro \\
-    -v /var/log/messages:/var/log/host/messages:ro \\
-    "${CROWDSEC_IMAGE}"
-fi
-RUNCS
-  chmod 750 /home/wpuser/wp/run-crowdsec.sh
-  chown wpuser:wpuser /home/wpuser/wp/run-crowdsec.sh
-  mkdir -p /opt/crowdsec/config /opt/crowdsec/data
-  chown -R wpuser:wpuser /opt/crowdsec
-  chmod 644 /var/log/messages 2>/dev/null || true
-
-  ok "run-mariadb.sh, run-wordpress.sh, run-crowdsec.sh generated (owned by wpuser)"
-  ok "WordPress will publish on host port 8080 — nftables redirects public :80 to it"
-fi
-
 ts "nftables firewall"
 apk add --no-cache nftables >/dev/null
 rc-update add nftables default 2>/dev/null || true
@@ -1838,38 +2302,33 @@ MYCNF
 chmod 644 /home/wpuser/wp/mariadb-conf/wp.cnf
 ok "MariaDB config: innodb_buffer_pool=256M, slow_query_log=on"
 
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  ok "Rootless mode: launching MariaDB as wpuser via run-mariadb.sh"
-  su -s /bin/sh wpuser -c '/home/wpuser/wp/run-mariadb.sh'
-else
-  podman rm -f mariadb 2>/dev/null || true
-  podman run -d \
-    --name    mariadb \
-    --network wp-db \
-    --ip      10.89.20.2 \
-    --restart always \
-    --label   io.containers.autoupdate=image \
-    --cap-drop ALL \
-    --cap-add  SETUID \
-    --cap-add  SETGID \
-    --cap-add  CHOWN \
-    --cap-add  DAC_OVERRIDE \
-    --cap-add  FOWNER \
-    --security-opt no-new-privileges:true \
-    --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
-    --pids-limit 100 \
-    --memory=512m \
-    --cpu-shares=512 \
-    --env-file /etc/wordpress/env \
-    -v /home/wpuser/wp/mysql:/var/lib/mysql \
-    -v /home/wpuser/wp/mariadb-conf/wp.cnf:/etc/mysql/conf.d/wp.cnf:ro \
-    --health-cmd "healthcheck.sh --connect --innodb_initialized" \
-    --health-interval 5s \
-    --health-timeout 5s \
-    --health-retries 24 \
-    --health-start-period 30s \
-    "${DB_IMAGE}"
-fi
+podman rm -f mariadb 2>/dev/null || true
+podman run -d \
+  --name    mariadb \
+  --network wp-db \
+  --ip      10.89.20.2 \
+  --restart always \
+  --label   io.containers.autoupdate=image \
+  --cap-drop ALL \
+  --cap-add  SETUID \
+  --cap-add  SETGID \
+  --cap-add  CHOWN \
+  --cap-add  DAC_OVERRIDE \
+  --cap-add  FOWNER \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
+  --pids-limit 100 \
+  --memory=512m \
+  --cpu-shares=512 \
+  --env-file /etc/wordpress/env \
+  -v /home/wpuser/wp/mysql:/var/lib/mysql \
+  -v /home/wpuser/wp/mariadb-conf/wp.cnf:/etc/mysql/conf.d/wp.cnf:ro \
+  --health-cmd "healthcheck.sh --connect --innodb_initialized" \
+  --health-interval 5s \
+  --health-timeout 5s \
+  --health-retries 24 \
+  --health-start-period 30s \
+  "${DB_IMAGE}"
 
 # FIX 2: Do NOT rely on Podman health check status.
 # On Alpine without systemd, conmon's health check timer often does not fire —
@@ -1879,11 +2338,20 @@ fi
 # The --health-cmd is still configured for 'podman ps' display purposes, but
 # we never block on its output here.
 ts "Waiting for MariaDB to accept connections (up to 3 min)"
+# PRODUCTION SAFETY FIX (v7-6k): this loop used to gate readiness on a bare
+# ping — see the mariadb-health-check.sh rationale above (installed earlier
+# in this stage) for why that's not enough. Now gated on the same real
+# query + InnoDB validation used at update time, with the old ping-only
+# check kept as a fallback only if that script is somehow missing.
 DB_READY=0
 for i in $(seq 1 36); do
+  if [ -x /usr/local/bin/mariadb-health-check.sh ]; then
+    if /usr/local/bin/mariadb-health-check.sh mariadb; then
+      DB_READY=1; break
+    fi
   # Run mariadbd ping INSIDE the container where MARIADB_ROOT_PASSWORD is set.
   # Use sh -c so the env var expands in the container's shell context, not here.
-  if PRUN exec mariadb sh -c \
+  elif PRUN exec mariadb sh -c \
        'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null'; then
     DB_READY=1; break
@@ -1891,8 +2359,8 @@ for i in $(seq 1 36); do
   sleep 5
 done
 [ "$DB_READY" = "1" ] \
-  && ok "MariaDB accepting authenticated connections on port 3306" \
-  || warn "MariaDB did not respond in 3 min — WordPress will retry. Check: PRUN logs mariadb | tail -20"
+  && ok "MariaDB healthy — ping + real query (root and wpdb) + InnoDB initialized" \
+  || warn "MariaDB did not pass full health validation in 3 min — WordPress will retry. Check: PRUN logs mariadb | tail -20"
 
 
 
@@ -1950,64 +2418,60 @@ if [ -f /home/wpuser/wp/apache-mods/remoteip.conf ]; then
 fi
 
 WEB_CHECK_PORT=80
-[ "${ROOTLESS_MODE:-0}" = "1" ] && WEB_CHECK_PORT=8080
 
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  ok "Rootless mode: launching WordPress as wpuser via run-wordpress.sh (host port 8080)"
-  su -s /bin/sh wpuser -c '/home/wpuser/wp/run-wordpress.sh'
-else
-  podman rm -f wordpress 2>/dev/null || true
-  # shellcheck disable=SC2086
-  podman run -d \
-    --name    wordpress \
-    --network wp-front \
-    --ip      10.89.10.3 \
-    -p 80:80 \
-    --restart always \
-    --label   io.containers.autoupdate=image \
-    --cap-drop ALL \
-    --cap-add  NET_BIND_SERVICE \
-    --cap-add  SETUID \
-    --cap-add  SETGID \
-    --cap-add  CHOWN \
-    --cap-add  DAC_OVERRIDE \
-    --cap-add  FOWNER \
-    --security-opt no-new-privileges:true \
-    --pids-limit 200 \
-    --memory=768m \
-    --cpu-shares=512 \
-    --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-    --env-file /etc/wordpress/env \
-    -e WORDPRESS_DB_HOST=mariadb:3306 \
-    -e WORDPRESS_DEBUG="" \
-    --add-host "mariadb:10.89.20.2" \
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
-    ${WP_VOL_ARGS} \
-    "${WP_IMAGE}"
-  # wp-db (--internal) attached second — see rootless run-wordpress.sh comment
-  # above for why this is a post-create `network connect` rather than a
-  # second --network flag on `run`.
-  podman network connect --ip 10.89.20.3 wp-db wordpress
-fi
+podman rm -f wordpress 2>/dev/null || true
+# shellcheck disable=SC2086
+podman run -d \
+  --name    wordpress \
+  --network wp-front \
+  --ip      10.89.10.3 \
+  -p 80:80 \
+  --restart always \
+  --label   io.containers.autoupdate=image \
+  --cap-drop ALL \
+  --cap-add  NET_BIND_SERVICE \
+  --cap-add  SETUID \
+  --cap-add  SETGID \
+  --cap-add  CHOWN \
+  --cap-add  DAC_OVERRIDE \
+  --cap-add  FOWNER \
+  --security-opt no-new-privileges:true \
+  --pids-limit 200 \
+  --memory=768m \
+  --cpu-shares=512 \
+  --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
+  --env-file /etc/wordpress/env \
+  -e WORDPRESS_DB_HOST=mariadb:3306 \
+  -e WORDPRESS_DEBUG="" \
+  --add-host "mariadb:10.89.20.2" \
+  -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+  ${WP_VOL_ARGS} \
+  "${WP_IMAGE}"
+# wp-db (--internal) attached second — Podman's --network flag on `run` only
+# takes a static --ip for the primary network in this Podman/Alpine
+# combination, so wp-db is attached post-create via `network connect`, the
+# same pattern Podman's own docs recommend for multi-network containers.
+podman network connect --ip 10.89.20.3 wp-db wordpress
 
-# Wait for WordPress to respond with non-500 (500 = DB not connected)
-# A 302 redirect to /wp-admin/install.php is the expected first response.
-# WEB_CHECK_PORT: 80 rootful, 8080 rootless (nftables' prerouting redirect
-# does not apply to locally-generated loopback traffic, only traffic arriving
-# on the real network interface — so the internal check must hit the real
-# published port directly).
+# Wait for WordPress to pass full health validation — NOT just a non-500
+# HTTP response. BUG FIX (v7-6g): a bare HTTP check happily passes on
+# "Error establishing a database connection", a PHP fatal-error page, or a
+# partially initialized site — every one of these can return a non-500
+# code while WordPress itself is broken. wp-health-check.sh (installed
+# earlier in this stage) additionally proves PHP actually executes, that
+# the mariadb hostname resolves, and — the check that actually matters here
+# — that a real mysqli connection using WordPress's own DB credentials can
+# run SELECT 1.
+ts "Validating WordPress health (HTTP + PHP + DB name resolution + DB auth + real query)"
 WP_READY=0
 for i in $(seq 1 24); do
-  http_code=$(wget -S -O /dev/null "http://127.0.0.1:${WEB_CHECK_PORT}/" 2>&1 \
-    | awk '/HTTP\// {print $2}' | tail -1)
-  if [ -n "$http_code" ] && [ "$http_code" != "500" ]; then
-    ok "WordPress HTTP ${http_code} — DB connected successfully"
+  if /usr/local/bin/wp-health-check.sh wordpress "${WEB_CHECK_PORT}"; then
     WP_READY=1; break
   fi
-  [ "$http_code" = "500" ] && warn "WordPress returns 500 (DB not connected yet — retry ${i}/24)"
+  warn "WordPress not fully healthy yet (retry ${i}/24) — see checks above"
   sleep 5
 done
-[ "$WP_READY" = "0" ] && warn "WordPress did not confirm DB connectivity — check: podman logs wordpress"
+[ "$WP_READY" = "0" ] && warn "WordPress did not pass full health validation after 24 attempts — check: podman logs wordpress"
 ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>/dev/null)"
 
 # Fix uploads ownership — critical for theme/plugin/media uploads.
@@ -2051,19 +2515,9 @@ done
 [ "$UPLOADS_FIXED" = "1" ] \
   || warn "uploads still not confirmed writable after 5 attempts; fix: PRUN exec wordpress chown -R www-data:www-data /var/www/html/wp-content"
 # Mirror ownership fix on the host-side bind-mount for persistence across
-# restarts. ROOTLESS NOTE: container UID 33 maps to a subordinate host UID
-# (200000+33=200033 with our wpuser:200000:65536 range), NOT literal 33 — a
-# plain `chown 33:33` as real root would set the WRONG on-disk owner.
-# `podman unshare` enters wpuser's user namespace so chown 33:33 resolves
-# correctly to the mapped subordinate UID, exactly as it appears inside the
-# container.
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  su -s /bin/sh wpuser -c 'podman unshare chown -R 33:33 /home/wpuser/wp/html/wp-content' 2>/dev/null \
-    && ok "Host-side ownership fixed via podman unshare (subordinate UID mapping)" || true
-else
-  chown -R 33:33 /home/wpuser/wp/html/wp-content 2>/dev/null \
-    && ok "Host-side /home/wpuser/wp/html/wp-content ownership fixed too" || true
-fi
+# restarts (container UID 33 maps 1:1 to host UID 33 under rootful Podman).
+chown -R 33:33 /home/wpuser/wp/html/wp-content 2>/dev/null \
+  && ok "Host-side /home/wpuser/wp/html/wp-content ownership fixed too" || true
 
 
 # ── OpenRC: mariadb-container ─────────────────────────────────────────────────
@@ -2131,13 +2585,8 @@ echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] wp-geoip-setup.sh starting ==="
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: must run as root"; exit 1; }
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
 PRUN() {
-  if [ "${ROOTLESS_MODE}" = "1" ]; then
-    su -s /bin/sh wpuser -c "podman $*"
-  else
-    podman "$@"
-  fi
+  podman "$@"
 }
 
 if [ "${GEOIP_ENABLED:-0}" != "1" ]; then
@@ -2153,21 +2602,35 @@ fi
 
 CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/null)
 [ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:6.9.4-php8.3-apache"
-# Derive a human-friendly tag for naming the local GeoIP image. Once digest
-# pinning is active, CURRENT_WP_IMAGE may be tag+digest (repo:tag@sha256:...)
-# OR digest-only (repo@sha256:..., no tag at all — used when this host's
-# Podman doesn't accept the combined form). A plain `sed 's|.*:||'` breaks
-# in the digest-only case (there's no ":tag" to find, so it would return the
-# whole "repo/path" string, which isn't a valid tag — tags can't contain
-# "/"). Detect which case applies and fall back to a short digest fragment
-# when there's genuinely no tag to extract.
-WP_BASE_NO_DIGEST=$(echo "${CURRENT_WP_IMAGE}" | sed 's|@sha256:.*||')
-case "$WP_BASE_NO_DIGEST" in
-  *:*) WP_TAG_PORTION="${WP_BASE_NO_DIGEST##*:}" ;;
-  *)   WP_TAG_PORTION=$(echo "${CURRENT_WP_IMAGE}" | grep -oE 'sha256:[0-9a-f]{12}' | sed 's|sha256:||' || true)
-       [ -z "$WP_TAG_PORTION" ] && WP_TAG_PORTION="latest"
-       ;;
-esac
+# Derive a human-friendly tag for naming the local GeoIP image.
+# BUG FIX (v7-6f): the Skopeo rewrite of digest pinning dropped the "does
+# this Podman accept a combined tag+digest reference" test — every pinned
+# reference is now digest-only (repo@sha256:..., no tag at all), ALWAYS,
+# not just on the subset of hosts where the combined form used to fail.
+# That leaves CURRENT_WP_IMAGE's own string with no tag to parse out once
+# pinning is on, so the old heuristic here (parse a tag out of the image
+# string, only falling back to a short digest fragment when none was
+# present) would now hit that fallback on every single run — every GeoIP
+# rebuild producing a digest-fragment tag (wordpress-geoip:a1b2c3d4e5f6)
+# instead of a readable one (wordpress-geoip:6.9.4-php8.3-apache).
+# /etc/wp-install/pinned.env carries the tag separately from the image
+# reference for exactly this reason (see the installer's PERSIST comment) —
+# read WP_TAG from there first. Only fall back to parsing CURRENT_WP_IMAGE
+# itself when pinned.env has no tag to offer (digest pinning disabled, or
+# the file is missing/not yet written).
+WP_TAG_FROM_PIN=""
+[ -f /etc/wp-install/pinned.env ] && WP_TAG_FROM_PIN=$(. /etc/wp-install/pinned.env; echo "$WP_TAG")
+if [ -n "$WP_TAG_FROM_PIN" ]; then
+  WP_TAG_PORTION="$WP_TAG_FROM_PIN"
+else
+  WP_BASE_NO_DIGEST=$(echo "${CURRENT_WP_IMAGE}" | sed 's|@sha256:.*||')
+  case "$WP_BASE_NO_DIGEST" in
+    *:*) WP_TAG_PORTION="${WP_BASE_NO_DIGEST##*:}" ;;
+    *)   WP_TAG_PORTION=$(echo "${CURRENT_WP_IMAGE}" | grep -oE 'sha256:[0-9a-f]{12}' | sed 's|sha256:||' || true)
+         [ -z "$WP_TAG_PORTION" ] && WP_TAG_PORTION="latest"
+         ;;
+  esac
+fi
 WP_TAG_PORTION=$(echo "$WP_TAG_PORTION" | sed 's|^geoip-||')
 GEOIP_IMG_TAG="localhost/wordpress-geoip:${WP_TAG_PORTION}"
 echo "Base image: ${CURRENT_WP_IMAGE}  ->  Target: ${GEOIP_IMG_TAG}"
@@ -2267,84 +2730,64 @@ chmod 644 /home/wpuser/wp/apache-conf/geoip.conf
 echo "geoip.conf written (${GEOIP_MODE}: ${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST})"
 
 WEB_CHECK_PORT=80
-[ "${ROOTLESS_MODE}" = "1" ] && WEB_CHECK_PORT=8080
 
 echo "Recreating WordPress container with GeoIP module + database mounted…"
-if [ "${ROOTLESS_MODE}" = "1" ]; then
-  cat > /home/wpuser/wp/run-wordpress.sh << RUNWPGEO
-#!/bin/sh
-# Generated by wp-geoip-setup.sh — rootless WordPress launcher (GeoIP active).
-if podman container exists wordpress 2>/dev/null; then
-  podman start wordpress
-else
-  podman run -d --name wordpress --network wp-front --ip 10.89.10.3 -p 8080:80 --restart always \\
-    --label io.containers.autoupdate=image \\
-    --cap-drop ALL --cap-add NET_BIND_SERVICE \\
-    --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
-    --cap-add DAC_OVERRIDE --cap-add FOWNER \\
-    --security-opt no-new-privileges:true \\
-    --pids-limit 200 --memory=768m --cpu-shares=512 \\
-    --tmpfs /tmp:size=64M,noexec,nosuid,nodev \\
-    --env-file /etc/wordpress/env \\
-    -e WORDPRESS_DB_HOST=mariadb:3306 \\
-    -e WORDPRESS_DEBUG="" \\
-    --add-host "mariadb:10.89.20.2" \\
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
-    -v /home/wpuser/wp/html:/var/www/html \\
-    -v /home/wpuser/wp/logs:/var/log/apache2 \\
-    -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
-    -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \\
-    -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \\
-    -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \\
-    -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \\
-    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \\
-    -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \\
-    "${GEOIP_IMG_TAG}"
-  podman network connect --ip 10.89.20.3 wp-db wordpress
-fi
-RUNWPGEO
-  chmod 750 /home/wpuser/wp/run-wordpress.sh
-  chown wpuser:wpuser /home/wpuser/wp/run-wordpress.sh
-  su -s /bin/sh wpuser -c 'podman rm -f wordpress' >/dev/null 2>&1 || true
-  su -s /bin/sh wpuser -c '/home/wpuser/wp/run-wordpress.sh'
-  sed -i "s|^WP_IMAGE=.*|WP_IMAGE=\"${GEOIP_IMG_TAG}\"|" /etc/init.d/wp-container 2>/dev/null || true
-else
-  podman rm -f wordpress >/dev/null 2>&1 || true
-  podman run -d \
-    --name wordpress --network wp-front --ip 10.89.10.3 -p 80:80 --restart always \
-    --label io.containers.autoupdate=image \
-    --cap-drop ALL --cap-add NET_BIND_SERVICE \
-    --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
-    --cap-add DAC_OVERRIDE --cap-add FOWNER \
-    --security-opt no-new-privileges:true \
-    --pids-limit 200 --memory=768m --cpu-shares=512 \
-    --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-    --env-file /etc/wordpress/env \
-    -e WORDPRESS_DB_HOST=mariadb:3306 \
-    -e WORDPRESS_DEBUG="" \
-    --add-host "mariadb:10.89.20.2" \
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
-    -v /home/wpuser/wp/html:/var/www/html \
-    -v /home/wpuser/wp/logs:/var/log/apache2 \
-    -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
-    -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \
-    -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
-    -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
-    -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
-    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
-    -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \
-    "${GEOIP_IMG_TAG}"
-  podman network connect --ip 10.89.20.3 wp-db wordpress
-  sed -i "s|WP_IMAGE=.*|WP_IMAGE=\"${GEOIP_IMG_TAG}\"|" /etc/init.d/wp-container 2>/dev/null || true
-fi
+podman rm -f wordpress >/dev/null 2>&1 || true
+podman run -d \
+  --name wordpress --network wp-front --ip 10.89.10.3 -p 80:80 --restart always \
+  --label io.containers.autoupdate=image \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE \
+  --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE --cap-add FOWNER \
+  --security-opt no-new-privileges:true \
+  --pids-limit 200 --memory=768m --cpu-shares=512 \
+  --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
+  --env-file /etc/wordpress/env \
+  -e WORDPRESS_DB_HOST=mariadb:3306 \
+  -e WORDPRESS_DEBUG="" \
+  --add-host "mariadb:10.89.20.2" \
+  -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+  -v /home/wpuser/wp/html:/var/www/html \
+  -v /home/wpuser/wp/logs:/var/log/apache2 \
+  -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
+  -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \
+  -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
+  -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
+  -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
+  -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
+  -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \
+  "${GEOIP_IMG_TAG}"
+podman network connect --ip 10.89.20.3 wp-db wordpress
+sed -i "s|WP_IMAGE=.*|WP_IMAGE=\"${GEOIP_IMG_TAG}\"|" /etc/init.d/wp-container 2>/dev/null || true
 sed -i "s|^PINNED_WP_VER=.*|PINNED_WP_VER=\"geoip-$(echo "${GEOIP_IMG_TAG}" | sed 's|.*:||')\"|" /usr/local/bin/update.sh 2>/dev/null || true
 
 sleep 5
 PRUN exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
+# BUG FIX (v7-6g): this used to be a bare `wget -qO-` check, which passes on
+# a DB-connection-error page or a PHP fatal-error page just as readily as on
+# a working site — meaningless right after swapping to a newly-built GeoIP
+# image, exactly the moment a broken mod_maxminddb build or a bad mount is
+# most likely to surface. Use the same full health check (HTTP + PHP + DB
+# name resolution + DB auth + a real SELECT 1) as the rest of the script,
+# falling back to the old bare check only if wp-health-check.sh is somehow
+# missing (e.g. this script run standalone on a VM provisioned before v7-6g).
+echo "Validating GeoIP-enabled WordPress health (HTTP + PHP + DB name resolution + DB auth + real query)…"
+GEOIP_WP_READY=0
 for i in $(seq 1 12); do
-  wget -qO- "http://127.0.0.1:${WEB_CHECK_PORT}/" >/dev/null 2>&1 && { echo "WordPress responding with GeoIP active"; break; }
+  if [ -x /usr/local/bin/wp-health-check.sh ]; then
+    if /usr/local/bin/wp-health-check.sh wordpress "${WEB_CHECK_PORT}"; then
+      GEOIP_WP_READY=1; break
+    fi
+  else
+    wget -qO- "http://127.0.0.1:${WEB_CHECK_PORT}/" >/dev/null 2>&1 && { GEOIP_WP_READY=1; break; }
+  fi
   sleep 5
 done
+if [ "$GEOIP_WP_READY" = "1" ]; then
+  echo "WordPress responding and healthy with GeoIP active"
+else
+  echo "WARNING: WordPress did not pass full health validation with GeoIP active — check: podman logs wordpress"
+fi
 
 grep -q "GeoLite2-Country database refresh" /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root << GEOCRON
 # Weekly GeoLite2-Country database refresh (Wednesday 06:00 UTC)
@@ -2377,6 +2820,9 @@ cat > /etc/init.d/mariadb-container << ORCSVC_DB
 #!/sbin/openrc-run
 name="mariadb-container"
 description="MariaDB for WordPress (rootful Podman, internal wp-db)"
+# Install-time snapshot — used only as a fallback if /etc/wp-install/
+# pinned.env can't be read when this service needs to recreate the
+# container from scratch (see start(), below).
 DB_IMAGE="${DB_IMAGE}"
 
 depend() {
@@ -2395,25 +2841,20 @@ start() {
     mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
   fi
   mount --make-shared / 2>/dev/null || true
-  # Rootless dispatch: this OpenRC script runs independently at boot and has
-  # no access to the installer's shell variables, so it reads vars.sh itself.
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-  if [ "\${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c '/home/wpuser/wp/run-mariadb.sh' >/dev/null 2>&1
-    eend \$?
-    return
-  fi
-  # Network must exist in the correct user namespace (rootless: wpuser, rootful: root)
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh 2>/dev/null || true
-  if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c 'podman network exists wp-db 2>/dev/null || podman network create --internal --subnet 10.89.20.0/24 --gateway 10.89.20.1 wp-db' 2>/dev/null || true
-  else
-    podman network exists wp-db 2>/dev/null || podman network create --internal --subnet 10.89.20.0/24 --gateway 10.89.20.1 wp-db 2>/dev/null || true
-  fi
+  podman network exists wp-db 2>/dev/null || podman network create --internal --subnet 10.89.20.0/24 --gateway 10.89.20.1 wp-db 2>/dev/null || true
   if podman container exists mariadb 2>/dev/null; then
     podman start mariadb >/dev/null 2>&1
   else
     podman rm -f mariadb 2>/dev/null || true
+    # Prefer the live pin over the install-time DB_IMAGE snapshot above:
+    # update.sh keeps /etc/wp-install/pinned.env current after every update
+    # but (by design, under the new pinned.env model) no longer rewrites
+    # this file's baked-in DB_IMAGE the way older versions did.
+    _DB_RUN_IMAGE="\$DB_IMAGE"
+    if [ -f /etc/wp-install/pinned.env ]; then
+      . /etc/wp-install/pinned.env
+      [ -n "\$DB_DIGEST" ] && _DB_RUN_IMAGE="docker.io/mariadb@\${DB_DIGEST}"
+    fi
     podman run -d --name mariadb --network wp-db --ip 10.89.20.2 --restart always \\
       --label io.containers.autoupdate=image \\
       --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
@@ -2427,19 +2868,14 @@ start() {
       --health-cmd "healthcheck.sh --connect --innodb_initialized" \\
       --health-interval 5s --health-timeout 5s --health-retries 24 \\
       --health-start-period 30s \\
-      "\${DB_IMAGE}" >/dev/null 2>&1
+      "\$_DB_RUN_IMAGE" >/dev/null 2>&1
   fi
   eend \$?
 }
 
 stop() {
   ebegin "Stopping MariaDB"
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-  if [ "\${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c 'podman stop mariadb' >/dev/null 2>&1
-  else
-    podman stop mariadb >/dev/null 2>&1
-  fi
+  podman stop mariadb >/dev/null 2>&1
   eend \$?
 }
 ORCSVC_DB
@@ -2464,6 +2900,9 @@ cat > /etc/init.d/wp-container << ORCSVC_WP
 #!/sbin/openrc-run
 name="wp-container"
 description="WordPress Apache (rootful Podman, wp-front, port 80)"
+# Install-time snapshot — used only as a fallback if /etc/wp-install/
+# pinned.env can't be read when this service needs to recreate the
+# container from scratch (see start(), below).
 WP_IMAGE="${WP_IMAGE}"
 
 depend() {
@@ -2482,20 +2921,30 @@ start() {
     mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
   fi
   mount --make-shared / 2>/dev/null || true
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-  if [ "\${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c '/home/wpuser/wp/run-wordpress.sh' >/dev/null 2>&1
-    sleep 3
-    su -s /bin/sh wpuser -c 'podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content' >/dev/null 2>&1 || true
-    eend \$?
-    return
-  fi
   if podman container exists wordpress 2>/dev/null; then
     podman start wordpress >/dev/null 2>&1
     # Fix uploads ownership after every start (entrypoint creates dirs as root)
     sleep 3 && podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
   else
     podman rm -f wordpress 2>/dev/null || true
+    # Prefer the live pin over the install-time WP_IMAGE snapshot above —
+    # same rationale as mariadb-container — but ONLY when WP_IMAGE isn't
+    # already a locally-built GeoIP image (localhost/wordpress-geoip:...):
+    # a GeoIP layer has no upstream registry digest of its own to
+    # reconstruct from pinned.env (WP_DIGEST there is always the upstream
+    # wordpress image, not the local GeoIP build). Recreating from the
+    # existing GeoIP tag as-is is still correct here; re-run
+    # wp-geoip-setup.sh afterwards if you want it rebuilt on a newer base.
+    _WP_RUN_IMAGE="\$WP_IMAGE"
+    case "\$WP_IMAGE" in
+      localhost/wordpress-geoip:*) : ;;
+      *)
+        if [ -f /etc/wp-install/pinned.env ]; then
+          . /etc/wp-install/pinned.env
+          [ -n "\$WP_DIGEST" ] && _WP_RUN_IMAGE="docker.io/wordpress@\${WP_DIGEST}"
+        fi
+        ;;
+    esac
     podman run -d --name wordpress --network wp-front --ip 10.89.10.3 -p 80:80 --restart always \\
       --label io.containers.autoupdate=image \\
       --cap-drop ALL --cap-add NET_BIND_SERVICE \\
@@ -2514,7 +2963,7 @@ start() {
       -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\
       -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \\
       ${SVC_HEADERS_VOL}${SVC_REMOTEIP_VOLS} \\
-      "\${WP_IMAGE}" >/dev/null 2>&1
+      "\$_WP_RUN_IMAGE" >/dev/null 2>&1
     podman network connect --ip 10.89.20.3 wp-db wordpress >/dev/null 2>&1 || true
   fi
   eend \$?
@@ -2522,12 +2971,7 @@ start() {
 
 stop() {
   ebegin "Stopping WordPress"
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-  if [ "\${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c 'podman stop wordpress' >/dev/null 2>&1
-  else
-    podman stop wordpress >/dev/null 2>&1
-  fi
+  podman stop wordpress >/dev/null 2>&1
   eend \$?
 }
 ORCSVC_WP
@@ -2535,34 +2979,97 @@ chmod +x /etc/init.d/wp-container
 rc-update add wp-container default 2>/dev/null || true
 ok "wp-container service registered"
 
-# ── WP-Cron runner (rootful/rootless-aware) ───────────────────────────────────
+# ── WP-Cron runner ─────────────────────────────────────────────────────────────
 cat > /usr/local/bin/wp-cron-run.sh << 'WPCRON'
 #!/bin/sh
 # WordPress system cron — runs wp-cron.php inside the WordPress container.
-# Uses the correct Podman user context depending on deployment mode.
-[ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  su -s /bin/sh wpuser -c 'podman exec wordpress php /var/www/html/wp-cron.php'
-else
-  podman exec wordpress php /var/www/html/wp-cron.php
-fi
+podman exec wordpress php /var/www/html/wp-cron.php
 WPCRON
 chmod +x /usr/local/bin/wp-cron-run.sh
-ok "wp-cron-run.sh installed (rootful/rootless-aware)"
+ok "wp-cron-run.sh installed"
 
 # ── Update script ─────────────────────────────────────────────────────────────
 ts "Installing update script"
 cat > /usr/local/bin/update.sh << 'UPDSCRIPT'
 #!/bin/sh
 # =============================================================================
-# Update Utility — WordPress VM
-# Usage: update.sh [check|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all]
+# update.sh — WordPress VM update utility
+# Usage: update.sh [check|status|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all|trivy]
+#
+# INTEGRATION NOTES (read before dropping this in):
+#  - Rootful only. No ROOTLESS_MODE, no PRUN dispatch wrapper — every call is
+#    a plain `podman ...`. If your install script still writes ROOTLESS_MODE
+#    into /etc/wp-install/vars.sh that's harmless; it's just never read here.
+#  - Assumes container names wordpress / mariadb / crowdsec, and the
+#    network-segmented layout from the v7-6/v7-6c line: wp-front (public,
+#    WordPress's egress + published port) and wp-db (--internal,
+#    WordPress+MariaDB only, static MariaDB address 10.89.20.2). If your
+#    main script still uses a single flat wp-net, the two spots that
+#    reference wp-front/wp-db/10.89.20.2 (marked below) are the only ones
+#    that need adjusting to match.
+#  - Reads /etc/wp-install/vars.sh for USE_DIGEST_PINNING and GEOIP_ENABLED
+#    (same file your installer already writes) and reads/writes a new
+#    /etc/wp-install/pinned.env for per-component pinned tag+digest — see
+#    the PINNED STATE note below. Pair this file with the companion
+#    installer-side snippet (digest-pinning + Skopeo block) so pinned.env
+#    exists from first boot; if it doesn't exist yet, this script bootstraps
+#    it from whatever's currently running the first time it's invoked.
+#  - Container-recreation commands (the actual `podman run ...` blocks in
+#    do_wp_update/do_db_update/do_cs_update) mirror the flags your install
+#    script should already be using to create these containers the first
+#    time (caps, mounts, env-file, etc.). If your install script customizes
+#    any of that, mirror the same customization here or the recreated
+#    container will drift from the original.
+#  - `update.sh wp` validates a freshly pulled WordPress image on a
+#    throwaway "wordpress-candidate" container bound to 127.0.0.1:18080
+#    (WP_CANDIDATE_PORT, defined below) — using the same wp-health-check.sh
+#    depth as every other health-check site in this script — before it
+#    ever touches the production container on :80. Production is only
+#    renamed and stopped once that candidate passes. Needs 127.0.0.1:18080
+#    free on the VM; change WP_CANDIDATE_PORT if that's already in use for
+#    something else.
+#
+# WHAT CHANGED FROM THE PRE-SKOPEO VERSION OF THIS SCRIPT:
+#  - `digest-check` (and therefore a bare `update.sh`/`update.sh check`)
+#    used to `podman pull` WordPress, MariaDB, AND CrowdSec on every single
+#    invocation just to see whether the registry had republished anything
+#    under the same tag — 500 MB-1 GB+ downloaded to answer "did anything
+#    change?", every time, even when the answer was no. Skopeo's
+#    `inspect docker://ref` asks the registry's manifest endpoint directly
+#    (a few KB, no layer data) and reports the digest currently published
+#    for a tag without pulling anything. Every digest check below tries
+#    Skopeo first; a `podman pull` only happens once a digest is actually
+#    going to be used — because it's new, or because Skopeo itself failed,
+#    in which case this falls back to pulling by tag and asking Podman what
+#    it resolved (the old method — still correct, just back to the old
+#    bandwidth cost for that one check).
+#  - The old version derived "what tag/digest is currently pinned" by
+#    sed-parsing it back out of the running container's own
+#    `{{.Config.Image}}` string, which only worked because a pinned
+#    reference still had a visible tag in it (`repo:tag@sha256:digest`) —
+#    itself dependent on a runtime test of whether this Podman accepted a
+#    combined tag+digest reference at all. Every pull below is now a plain
+#    `repo@sha256:digest` (no tag, no ambiguity, no version-dependent
+#    combined-reference test needed), and the tag is tracked explicitly in
+#    /etc/wp-install/pinned.env instead of being re-derived from a string
+#    that may no longer contain it.
+#  - A bare `update.sh` / `update.sh check` / `update.sh status` is now
+#    READ-ONLY: it reports what's running, what's pinned, and whether the
+#    registry has anything newer (Skopeo only — no pulls, no prompts).
+#    `update.sh all` is the explicit "update everything" command (unchanged
+#    otherwise — each component still asks before touching anything).
+#    `update.sh digest-check` still exists as a shortcut for "refresh
+#    wp/db/crowdsec if the registry has anything newer, skip the OS package
+#    prompt" — it now shares the same Skopeo-first check the wp/db/crowdsec
+#    update paths use directly, instead of a separate implementation that
+#    used to re-pull everything just to compare.
 # =============================================================================
 set -e
 
-# BUG FIX: 11.4-lts does not exist on Docker Hub — use 11.4
-# WordPress 6.8-php8.3-apache: current stable minor branch (7.0 too new for MSP)
-# CrowdSec v1.7.4: latest stable; v1.7.0+ requires /var/lib/crowdsec/data volume
+# Fallback target tags — used only if /etc/wp-install/pinned.env doesn't
+# exist yet, or is missing an entry for a component (fresh VM never
+# updated through this script, or the file was lost). Once pinned.env has
+# a value for a component, THAT value is authoritative, not this constant.
 PINNED_WP_VER="6.9.4-php8.3-apache"
 PINNED_DB_VER="11.4"
 PINNED_CS_VER="v1.7.8"
@@ -2570,122 +3077,206 @@ WP_REGISTRY="docker.io/wordpress"
 DB_REGISTRY="docker.io/mariadb"
 CS_REGISTRY="docker.io/crowdsecurity/crowdsec"
 
+# Loopback-only port do_wp_update() uses to validate a freshly pulled
+# WordPress image BEFORE the production container on host port 80 is ever
+# touched — see the main script's WORDPRESS UPDATE CUTOVER header note
+# (item 40) for the full rationale. Change this only if something else on
+# the VM already binds it.
+WP_CANDIDATE_PORT="18080"
+
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: Must run as root"; exit 1; }
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
-PRUN() {
-  if [ "${ROOTLESS_MODE}" = "1" ]; then
-    su -s /bin/sh wpuser -c "podman $*"
-  else
-    podman "$@"
+USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
+
+# ── Image reference validation (v7-6d, carried forward) ────────────────────
+# validate_image_tag: closes a gap flagged in review — the VER argument to
+# `update.sh wp|db|crowdsec [VER]` used to flow straight into an image
+# reference with no validation of its own, relying entirely on podman's own
+# parser to reject anything malformed. Grammar matches Docker/OCI tag rules:
+# starts with [A-Za-z0-9_], then up to 127 more of [A-Za-z0-9_.-].
+validate_image_tag() {
+  _vit_tag="$1"
+  if [ -z "$_vit_tag" ]; then
+    echo "ERROR: empty version/tag supplied" >&2
+    return 1
   fi
+  if [ "${#_vit_tag}" -gt 128 ]; then
+    echo "ERROR: '${_vit_tag}' exceeds the 128-character tag limit" >&2
+    return 1
+  fi
+  case "$_vit_tag" in
+    [A-Za-z0-9_]*) ;;
+    *) echo "ERROR: '${_vit_tag}' must start with a letter, digit, or underscore" >&2; return 1 ;;
+  esac
+  case "$_vit_tag" in
+    *[!A-Za-z0-9._-]*)
+      echo "ERROR: '${_vit_tag}' contains characters other than A-Z a-z 0-9 . _ -" >&2
+      return 1 ;;
+  esac
+  return 0
 }
+
+# validate_digest_ref: sanity-checks a "sha256:<64 lowercase hex>" digest, or
+# a full "repo[:tag]@sha256:<64 hex>" reference, before anything trusts it.
+validate_digest_ref() {
+  _vdr_ref="$1"
+  case "$_vdr_ref" in
+    *@sha256:*) _vdr_digest="${_vdr_ref##*@sha256:}" ;;
+    sha256:*)   _vdr_digest="${_vdr_ref#sha256:}" ;;
+    *) echo "ERROR: '${_vdr_ref}' has no sha256: digest" >&2; return 1 ;;
+  esac
+  if [ "${#_vdr_digest}" -ne 64 ]; then
+    echo "ERROR: '${_vdr_ref}' digest is not 64 characters" >&2
+    return 1
+  fi
+  case "$_vdr_digest" in
+    *[!0-9a-f]*)
+      echo "ERROR: '${_vdr_ref}' digest is not lowercase hex" >&2
+      return 1 ;;
+  esac
+  return 0
+}
+
 cd /tmp
 
-# BUG FIX (v7-5): the previous `... | sed ... || echo "not running"` never
-# actually fired that fallback — when a container doesn't exist, `podman
-# inspect` exits non-zero and prints nothing, but sed then runs on EMPTY
-# stdin, itself exits 0, and a pipeline's exit status in POSIX sh is the
-# LAST command's — so the `||` never triggered and RUNNING_WP/DB/CS silently
-# became an empty string instead of "not running". Fixed by checking
-# emptiness explicitly. Also strips any @sha256:digest suffix for the plain
-# comparison variables (RUNNING_WP/DB/CS) — once digest pinning is active
-# those would otherwise never equal a bare PINNED_*_VER and update.sh would
-# think an update was needed on every single run. The _RAW variants keep the
-# digest intact for the new digest-check feature below.
-RUNNING_WP_RAW=$(PRUN inspect wordpress --format "{{.Config.Image}}" 2>/dev/null || true)
-RUNNING_DB_RAW=$(PRUN inspect mariadb   --format "{{.Config.Image}}" 2>/dev/null || true)
-RUNNING_CS_RAW=$(PRUN inspect crowdsec  --format "{{.Config.Image}}" 2>/dev/null || true)
-# once GeoIP is active, the running image is tagged localhost/wordpress-geoip:
-# <ver>, not ${WP_REGISTRY}:<ver> — strip whichever prefix is actually
-# present so "already on target" comparisons work either way, instead of
-# perpetually thinking an update is needed and re-triggering a pointless
-# rebuild on every `update.sh check`.
-if [ -z "$RUNNING_WP_RAW" ]; then
-  RUNNING_WP="not running"
-else
-  RUNNING_WP=$(echo "$RUNNING_WP_RAW" | sed -e 's|@sha256:[0-9a-f]*$||' -e "s|^${WP_REGISTRY}:||" -e 's|^localhost/wordpress-geoip:||')
-fi
+DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
+
+# ── PINNED STATE ────────────────────────────────────────────────────────────
+# /etc/wp-install/pinned.env is the single source of truth for "what tag and
+# digest are we currently pinned to" per component — written by the
+# installer-side Skopeo/digest-pinning snippet at install time, and kept
+# current here after every successful update. Deliberately NOT re-derived
+# from the running container's image string on every run (see header note).
+WP_TAG="" WP_DIGEST="" DB_TAG="" DB_DIGEST="" CS_TAG="" CS_DIGEST=""
+# shellcheck disable=SC1091
+[ -f /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
+
+_save_pinned() {
+  mkdir -p /etc/wp-install
+  cat > /etc/wp-install/pinned.env << PINNEDENV
+# WordPress VM — pinned image tag + digest per component.
+# Written by the installer's digest-pinning snippet; kept current by
+# update.sh after every successful update. Do not edit by hand while
+# update.sh might be running.
+WP_TAG="${WP_TAG}"
+WP_DIGEST="${WP_DIGEST}"
+DB_TAG="${DB_TAG}"
+DB_DIGEST="${DB_DIGEST}"
+CS_TAG="${CS_TAG}"
+CS_DIGEST="${CS_DIGEST}"
+PINNEDENV
+  chmod 600 /etc/wp-install/pinned.env 2>/dev/null || true
+}
+
+# Running-container inspection — status display and GeoIP detection only.
+# NOT used for version comparisons (see PINNED STATE above).
+RUNNING_WP_RAW=$(podman inspect wordpress --format "{{.Config.Image}}" 2>/dev/null || true)
+RUNNING_DB_RAW=$(podman inspect mariadb   --format "{{.Config.Image}}" 2>/dev/null || true)
+RUNNING_CS_RAW=$(podman inspect crowdsec  --format "{{.Config.Image}}" 2>/dev/null || true)
 WP_IS_GEOIP=0
 case "$RUNNING_WP_RAW" in localhost/wordpress-geoip:*) WP_IS_GEOIP=1 ;; esac
-if [ -z "$RUNNING_DB_RAW" ]; then
-  RUNNING_DB="not running"
-else
-  RUNNING_DB=$(echo "$RUNNING_DB_RAW" | sed -e 's|@sha256:[0-9a-f]*$||' -e "s|^${DB_REGISTRY}:||")
+
+# Bootstrap pinned.env the first time this script runs on a VM that doesn't
+# have one yet (upgraded from an older update.sh, or the file was lost):
+# best-effort reconstruct tag/digest from whatever's actually running right
+# now, then persist it so every run after this one uses the fast path.
+_bootstrap_one() {
+  local raw="$1" registry="$2"
+  echo "$raw" | sed -e 's|^localhost/wordpress-geoip:||' -e "s|^${registry}:||" -e 's|@sha256:.*||'
+}
+_BOOTSTRAPPED=0
+if [ -z "$WP_TAG" ] && [ -z "$WP_DIGEST" ] && [ -n "$RUNNING_WP_RAW" ]; then
+  WP_TAG=$(_bootstrap_one "$RUNNING_WP_RAW" "$WP_REGISTRY")
+  WP_DIGEST=$(echo "$RUNNING_WP_RAW" | grep -oE 'sha256:[0-9a-f]{64}' || true)
+  [ -n "$WP_TAG" ] && _BOOTSTRAPPED=1
 fi
-if [ -z "$RUNNING_CS_RAW" ]; then
-  RUNNING_CS="not running"
-else
-  RUNNING_CS=$(echo "$RUNNING_CS_RAW" | sed -e 's|@sha256:[0-9a-f]*$||' -e "s|^${CS_REGISTRY}:||")
+if [ -z "$DB_TAG" ] && [ -z "$DB_DIGEST" ] && [ -n "$RUNNING_DB_RAW" ]; then
+  DB_TAG=$(_bootstrap_one "$RUNNING_DB_RAW" "$DB_REGISTRY")
+  DB_DIGEST=$(echo "$RUNNING_DB_RAW" | grep -oE 'sha256:[0-9a-f]{64}' || true)
+  [ -n "$DB_TAG" ] && _BOOTSTRAPPED=1
 fi
+if [ -z "$CS_TAG" ] && [ -z "$CS_DIGEST" ] && [ -n "$RUNNING_CS_RAW" ]; then
+  CS_TAG=$(_bootstrap_one "$RUNNING_CS_RAW" "$CS_REGISTRY")
+  CS_DIGEST=$(echo "$RUNNING_CS_RAW" | grep -oE 'sha256:[0-9a-f]{64}' || true)
+  [ -n "$CS_TAG" ] && _BOOTSTRAPPED=1
+fi
+[ "$_BOOTSTRAPPED" = "1" ] && _save_pinned
 
 ask_yn() { printf "%s [y/N]: " "$1"; read ans; case "$ans" in [Yy]*) return 0;; *) return 1;; esac; }
 
-# ── Digest pinning helper (shared by do_wp_update/do_db_update/do_cs_update
-# and do_digest_check) ─────────────────────────────────────────────────────
-# BUG FIX (v7-5): update.sh previously had no concept of digest pinning at
-# all — every update pulled a bare tag and left the container unpinned, so
-# pinning applied only at initial install and was lost on the very first
-# update. USE_DIGEST_PINNING is read from /etc/wp-install/vars.sh (already
-# sourced above). Tests the combined tag+digest form against the local
-# Podman before using it (see the longer explanation in install-wordpress.sh)
-# rather than assuming this Podman build accepts it.
+# ── Container-state preflight — stop suppressing critical Podman errors ────
+# PRODUCTION SAFETY FIX (v7-6k): every "swap in a replacement container"
+# path in this script hid its `podman rename <live> <live>-old` behind
+# `2>/dev/null || true` (WordPress's forward swap), and every rollback swap
+# (`podman rename <live>-old <live>` for WordPress, MariaDB, AND CrowdSec)
+# discarded its result the same way. That meant a rename failure — source
+# container missing, a stale *-old container left over from a previous
+# crashed/interrupted update, or Podman itself in an inconsistent state —
+# was silently swallowed and the script carried on as if nothing had
+# happened.
 #
-# RETRY + DIAGNOSTICS (v7-5c): digest resolution retries up to 3 times before
-# falling back to an unpinned reference, and any final failure writes the
-# actual podman error text to the same /var/log/wp-digest-pinning.log the
-# installer uses, rather than just discarding it and printing "failed". The
-# pull itself isn't retried here — do_wp_update/do_db_update/do_cs_update
-# already pull before calling this, and abort the whole update loudly if
-# that fails, which is the right behavior for an explicit update (you can't
-# proceed at all without the new image, pinning aside).
-DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
-_pin_digest() {
-  local ref="$1" label="$2" digest repo_only candidate
-  local attempt inspect_ok inspect_output
-  # BUG FIX (v7-5b): CRITICAL — this function is called as
-  # target_img_pinned=$(_pin_digest ...), which captures EVERYTHING written
-  # to stdout, not just the final `echo "$candidate"`. The status lines below
-  # must go to stderr (>&2) or they end up prepended to the image reference
-  # itself, producing a two-line string that fails podman run with "invalid
-  # reference format" — confirmed in the field (this exact bug broke every
-  # digest-pinned install). See the longer note in install-wordpress.sh.
-  [ "${USE_DIGEST_PINNING:-1}" = "1" ] || { echo "$ref"; return 0; }
-
-  digest="" inspect_ok=0
-  for attempt in 1 2 3; do
-    if inspect_output=$(podman inspect "$ref" --format '{{index .RepoDigests 0}}' 2>&1); then
-      digest=$(echo "$inspect_output" | grep -oE 'sha256:[0-9a-f]{64}' || true)
-      if [ -n "$digest" ]; then inspect_ok=1; break; fi
-    fi
-    [ "$attempt" -lt 3 ] && sleep 3
-  done
-  if [ "$inspect_ok" != "1" ]; then
-    echo "  ⚠  ${label}: could not resolve a digest after 3 attempts — continuing with tag-only reference. Detail: ${DIGEST_PIN_LOG}" >&2
-    {
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: DIGEST RESOLUTION FAILED after 3 attempts (update.sh) — ref=${ref}"
-      echo "    Last 'podman inspect --format {{index .RepoDigests 0}}' output: ${inspect_output:-<empty — image has no RepoDigests>}"
-    } >> "$DIGEST_PIN_LOG" 2>/dev/null || true
-    echo "$ref"; return 0
+# The concrete failure this caused in do_wp_update(): if
+# `podman rename wordpress wordpress-old` silently failed, "wordpress" kept
+# its original name, so the following `podman run -d --name wordpress ...`
+# then failed too (a name collision) — a failure that WAS checked, so
+# control fell into the "container start failed — rolled back" branch.
+# That branch's first line was `podman rm -f wordpress`, deleting the
+# still-good, still-running ORIGINAL WordPress container in the mistaken
+# belief it was cleaning up a failed new attempt. One suppressed error
+# cascaded into deleting a healthy production container.
+#
+# require_clean_container_state() closes the forward half of this by
+# verifying the rename's own preconditions up front instead of discovering
+# them via a cascading failure two steps later. Every rename call site below
+# — forward swap and rollback swap, across WordPress, MariaDB, and CrowdSec
+# — now also checks the rename/start result directly instead of discarding
+# it, and prints exactly what needs manual attention when a rollback itself
+# fails, since that's the one moment silence is most dangerous: it means the
+# site (or the database, or CrowdSec) is down right now and nobody has been
+# told.
+require_clean_container_state() {
+  local current="$1" old_name="$2"
+  podman container exists "$current" || {
+    echo "✗  Required container '${current}' does not exist — nothing to update. Aborting; nothing was changed." >&2
+    return 1
+  }
+  if podman container exists "$old_name"; then
+    echo "✗  Stale container '${old_name}' already exists, left over from a previous" >&2
+    echo "   update that didn't finish cleanly (crashed, interrupted, or aborted mid-way)." >&2
+    echo "   Refusing to rename over it. Inspect it first, then either restore from it" >&2
+    echo "   or remove it once you're sure it's not needed:" >&2
+    echo "     podman inspect ${old_name}" >&2
+    echo "     podman rm -f ${old_name}" >&2
+    return 1
   fi
-  repo_only="${ref%:*}"
-  candidate="${ref}@${digest}"
-  if podman inspect "$candidate" >/dev/null 2>&1; then
-    echo "  ✔  ${label}: pinned to ${digest} (tag+digest)" >&2
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (tag+digest, update.sh) — ${candidate}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
-    echo "$candidate"
-  else
-    echo "  ✔  ${label}: pinned to ${digest} (digest-only — this Podman doesn't accept tag+digest together)" >&2
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${label}: PINNED (digest-only, update.sh) — ${repo_only}@${digest}" >> "$DIGEST_PIN_LOG" 2>/dev/null || true
-    echo "${repo_only}@${digest}"
-  fi
+  return 0
 }
 
+# ── Skopeo: remote digest lookup, no image pull ────────────────────────────
+# $1 = full tag reference, e.g. docker.io/wordpress:6.9.4-php8.3-apache
+# stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
+# missing, network error, unparseable output) — every caller treats that as
+# "fall back to the old method", never as fatal.
+_skopeo_digest() {
+  local ref="$1" out digest
+  command -v skopeo >/dev/null 2>&1 || return 1
+  out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
+  digest=$(printf '%s' "$out" \
+    | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+    | grep -oE 'sha256:[0-9a-f]{64}')
+  [ -n "$digest" ] || return 1
+  printf '%s\n' "$digest"
+}
+_resolve_digest() {
+  local ref="$1" attempt digest
+  for attempt in 1 2 3; do
+    digest=$(_skopeo_digest "$ref") && [ -n "$digest" ] && { printf '%s\n' "$digest"; return 0; }
+    [ "$attempt" -lt 3 ] && sleep 2
+  done
+  return 1
+}
 
-# ── Trivy: container vulnerability scanner ────────────────────────────────────
-# Scans images BEFORE pulling to gate updates on security posture.
-# Cache at /var/cache/trivy persists across reboots (faster repeated scans).
-# First scan downloads the DB (~100 MB, 30-90s). Subsequent scans: <15s.
+# ── Trivy: container vulnerability scanner ────────────────────────────────
 TRIVY_CACHE_DIR="/var/cache/trivy"
 
 setup_trivy() {
@@ -2695,7 +3286,6 @@ setup_trivy() {
   fi
   echo "  → Installing Trivy (vulnerability scanner)..."
   mkdir -p "${TRIVY_CACHE_DIR}"
-  # Try Alpine edge/testing first, then official install script
   if apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \
        trivy >/dev/null 2>&1; then
     echo "  ✔  Trivy installed (apk)"
@@ -2745,40 +3335,192 @@ do_os_update() {
     || echo "   Skipped."
 }
 
+# ── Shared digest-aware check ───────────────────────────────────────────────
+# Resolves the target's current digest via Skopeo BEFORE deciding whether
+# there's anything to do. Sets three variables the caller reads immediately
+# after: _UPD_ACTION (skip|refresh|bump), _UPD_PULL_REF (what to pull),
+# _UPD_DIGEST (resolved digest, or empty if Skopeo couldn't resolve one —
+# in which case the caller falls back to comparing tags only).
+_check_component() {
+  local registry="$1" running_tag="$2" running_digest="$3" target_ver="$4"
+  local target_img="${registry}:${target_ver}"
+  _UPD_PULL_REF="$target_img"
+  _UPD_DIGEST=""
+  if [ "${USE_DIGEST_PINNING}" = "1" ]; then
+    echo "  → Checking ${target_img} against the registry (Skopeo, no download)…"
+    _UPD_DIGEST=$(_resolve_digest "$target_img") || _UPD_DIGEST=""
+    if [ -n "$_UPD_DIGEST" ]; then
+      _UPD_PULL_REF="${registry}@${_UPD_DIGEST}"
+      if [ "$target_ver" = "$running_tag" ] && [ "$_UPD_DIGEST" = "$running_digest" ]; then
+        _UPD_ACTION="skip"; return 0
+      fi
+      if [ "$target_ver" = "$running_tag" ]; then _UPD_ACTION="refresh"; else _UPD_ACTION="bump"; fi
+      return 0
+    fi
+    echo "  ⚠  Skopeo digest lookup failed — comparing by tag only this run."
+  fi
+  if [ "$target_ver" = "$running_tag" ]; then _UPD_ACTION="skip"; else _UPD_ACTION="bump"; fi
+}
+
 do_wp_update() {
-  local target_ver="${1:-$PINNED_WP_VER}" target_img="${WP_REGISTRY}:${1:-$PINNED_WP_VER}"
+  local target_ver="${1:-${WP_TAG:-$PINNED_WP_VER}}"
   echo "── WordPress ──────────────────────────────────────────────────"
-  echo "  Running : ${RUNNING_WP}  →  Target: ${target_ver}"
+  [ -n "$1" ] && { validate_image_tag "$1" || return 1; }
+  echo "  Pinned  : tag=${WP_TAG:-none}  digest=${WP_DIGEST:-none}"
+  echo "  Target  : ${WP_REGISTRY}:${target_ver}"
   echo "  Data    : /home/wpuser/wp/html (bind-mount — never removed)"
-  [ "${RUNNING_WP}" = "${target_ver}" ] && { echo "  ✔  Already on target."; return 0; }
-  ask_yn "Update WordPress?" || { echo "   Skipped."; return 0; }
+
+  _check_component "$WP_REGISTRY" "$WP_TAG" "$WP_DIGEST" "$target_ver"
+  case "$_UPD_ACTION" in
+    skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
+    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it?" || { echo "   Skipped."; return 0; } ;;
+    bump) ask_yn "Update WordPress to ${target_ver}?" || { echo "   Skipped."; return 0; } ;;
+  esac
 
   setup_trivy
-  scan_image "${target_img}" || return 1
+  scan_image "${_UPD_PULL_REF}" || return 1
 
-  echo "  → Pulling ${target_img}…"
-  podman pull "${target_img}" || { echo "✗  Pull failed."; return 1; }
-  target_img_pinned=$(_pin_digest "${target_img}" "WordPress")
+  # v7-7 (item 40): fail fast, before the pull + candidate-boot +
+  # candidate-validate sequence below even begins, if wordpress-old already
+  # exists (a stale leftover from an update that crashed/was interrupted
+  # before cleanup) or wordpress itself is missing. Same rationale item 39
+  # gives for MariaDB/CrowdSec: this used not to apply here (nothing
+  # substantial happened before do_wp_update()'s one rename point), but the
+  # candidate step below now means a full image pull plus a candidate
+  # container boot/validate cycle happens first — worth not wasting if the
+  # rename was always going to be refused. The check immediately before the
+  # actual cutover rename, further down, stays in place too, catching state
+  # that changed during the pull/candidate window — an operator manually
+  # intervening mid-update, for instance.
+  require_clean_container_state wordpress wordpress-old || return 1
 
-  PRUN rename wordpress wordpress-old 2>/dev/null || true
+  echo "  → Pulling ${_UPD_PULL_REF}…"
+  podman pull "${_UPD_PULL_REF}" || { echo "✗  Pull failed."; return 1; }
+  if [ -z "${_UPD_DIGEST}" ] && [ "${USE_DIGEST_PINNING}" = "1" ]; then
+    _UPD_DIGEST=$(podman inspect "${_UPD_PULL_REF}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+      | grep -oE 'sha256:[0-9a-f]{64}' || true)
+    [ -n "${_UPD_DIGEST}" ] && _UPD_PULL_REF="${WP_REGISTRY}@${_UPD_DIGEST}"
+  fi
 
-  # Determine remoteip mounts
   RI_VOLS=""
-  # remoteip.load not mounted (mod_remoteip pre-enabled in WP image)
-  # Only mount remoteip.conf if configured (sets RemoteIPTrustedProxy)
   [ -f /home/wpuser/wp/apache-mods/remoteip.conf ] && \
     RI_VOLS="-v /home/wpuser/wp/apache-mods/remoteip.conf:/etc/apache2/mods-enabled/remoteip.conf:ro"
 
+  # ── CANDIDATE: prove the pulled image works BEFORE production is touched
+  # (item 40 — merged in from a third parallel line off v7-6f). See the
+  # WORDPRESS UPDATE CUTOVER header note for the full history: starting the
+  # new "wordpress" straight on -p 80:80 while the old one was merely
+  # renamed (still running, still holding port 80) was a structural
+  # guarantee of failure, not an occasional race. The pulled image is
+  # proven out here instead, on a throwaway container bound ONLY to
+  # loopback:WP_CANDIDATE_PORT, with production left completely alone.
+  local WP_CANDIDATE="wordpress-candidate"
+  local candidate_ok=0 i
+  podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
+
+  echo "  → Starting a validation candidate on 127.0.0.1:${WP_CANDIDATE_PORT} (production stays up on :80)…"
+  # No --ip on wp-front (or on the wp-db connect below): production's own
+  # wordpress container is still fully up and may hold a fixed address on
+  # either network — the candidate must not contend for it. netavark
+  # assigns the candidate a free address on both instead.
   # shellcheck disable=SC2086
-  WP_PORT="$( [ "${ROOTLESS_MODE:-0}" = "1" ] && echo 8080 || echo 80 )"
-  # No --ip on wp-front: wordpress-old (renamed above) is still RUNNING and
-  # still holds 10.89.10.3 until it's removed after the health check below
-  # passes, so requesting that same address now would fail with an
-  # IP-already-allocated error. (This exact conflict already existed here
-  # against the old single-network 10.89.1.3 before the wp-front/wp-db
-  # split — carrying a fixed IP into the new second interface too would
-  # have doubled it instead of fixing it, so both are left to netavark.)
-  if PRUN run -d --name wordpress --network wp-front -p "${WP_PORT}:80" --restart always \
+  if podman run -d --name "$WP_CANDIDATE" --network wp-front \
+    -p "127.0.0.1:${WP_CANDIDATE_PORT}:80" --restart no \
+    --cap-drop ALL --cap-add NET_BIND_SERVICE \
+    --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    --security-opt no-new-privileges:true \
+    --pids-limit 200 --memory=768m --cpu-shares=512 \
+    --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
+    --env-file /etc/wordpress/env \
+    -e WORDPRESS_DB_HOST=mariadb:3306 \
+    -e WORDPRESS_DEBUG="" \
+    --add-host "mariadb:10.89.20.2" \
+    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -v /home/wpuser/wp/html:/var/www/html \
+    -v /home/wpuser/wp/logs:/var/log/apache2 \
+    -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
+    -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
+    -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
+    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
+    ${RI_VOLS} \
+    "${_UPD_PULL_REF}"; then
+    podman network connect wp-db "$WP_CANDIDATE" >/dev/null 2>&1 || true
+  else
+    echo "✗  Candidate failed to start — production WordPress was never touched."
+    podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # PRODUCTION SAFETY (item 40): the candidate is validated with the same
+  # wp-health-check.sh depth (HTTP + PHP execution + mariadb DNS + a real
+  # WordPress-credential SELECT 1) used at the final cutover check below and
+  # every other health-check call site in this script, instead of a bare
+  # HTTP-plus-raw-mysqli check — a candidate that merely answers HTTP but
+  # can't actually run PHP or reach the database would otherwise be waved
+  # through here. Falls back to the older bare check only if
+  # wp-health-check.sh is somehow missing.
+  echo "  → Validating candidate (HTTP + PHP + DB name resolution + DB auth + real query)…"
+  for i in $(seq 1 12); do
+    if [ -x /usr/local/bin/wp-health-check.sh ]; then
+      if /usr/local/bin/wp-health-check.sh "$WP_CANDIDATE" "${WP_CANDIDATE_PORT}"; then
+        candidate_ok=1; break
+      fi
+    else
+      if wget -qO- "http://127.0.0.1:${WP_CANDIDATE_PORT}/" >/dev/null 2>&1; then
+        podman exec --user www-data "$WP_CANDIDATE" php -r \
+          '$c=@mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"));exit($c?0:1);' \
+          >/dev/null 2>&1 && { candidate_ok=1; break; }
+      fi
+    fi
+    sleep 5
+  done
+
+  if [ "$candidate_ok" != "1" ]; then
+    echo "✗  Candidate failed validation — production WordPress was never touched."
+    echo "   Left running for inspection: podman logs ${WP_CANDIDATE}   (remove with: podman rm -f ${WP_CANDIDATE})"
+    return 1
+  fi
+  podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
+  echo "  ✔  Candidate healthy (HTTP + PHP + DB confirmed) — swapping production to the new image now (brief downtime)…"
+
+  # ── CUTOVER: production is only ever touched from this point on ────────
+  # Merges the production-safety line's checked rename/rollback (item 36)
+  # with the candidate/cutover line's actual STOP of wordpress-old (item
+  # 40) — the piece that was missing before this merge. Renaming alone only
+  # frees the NAME "wordpress"; it does not stop the container or release
+  # its published port, which is what let the pre-merge code try to start a
+  # second container on -p 80:80 while the first was still holding that
+  # port, guaranteeing every update attempt would fail (see the WORDPRESS
+  # UPDATE CUTOVER header note above for the full history).
+  require_clean_container_state wordpress wordpress-old || return 1
+  if ! podman rename wordpress wordpress-old; then
+    echo "✗  Unable to rename wordpress → wordpress-old — Podman error above. Aborting; production is untouched." >&2
+    return 1
+  fi
+  if ! podman stop --time 15 wordpress-old; then
+    echo "✗  wordpress-old would not stop — attempting to restore the 'wordpress' name…" >&2
+    if podman rename wordpress-old wordpress; then
+      echo "   Restored. The site is NOT down — it's still running as 'wordpress', just" >&2
+      echo "   on the previous image. The update did not proceed; investigate why the" >&2
+      echo "   container wouldn't stop, then retry." >&2
+    else
+      echo "✗✗ Could not restore the 'wordpress' name either. The production container" >&2
+      echo "   is still running and still serving traffic, but currently named" >&2
+      echo "   'wordpress-old'. The site is NOT down, but fix the name before the next" >&2
+      echo "   update attempt:" >&2
+      echo "     podman rename wordpress-old wordpress" >&2
+    fi
+    return 1
+  fi
+  sleep 2
+
+  # No --ip on wp-front: wordpress-old (stopped above, but not yet removed)
+  # still holds that address until it's removed below (after the health
+  # check passes) — Podman ties an IP reservation to the container's
+  # existence, not whether it's currently running. netavark assigns the
+  # new container a free address instead.
+  # shellcheck disable=SC2086
+  if podman run -d --name wordpress --network wp-front -p 80:80 --restart always \
     --label io.containers.autoupdate=image \
     --cap-drop ALL --cap-add NET_BIND_SERVICE \
     --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
@@ -2797,29 +3539,50 @@ do_wp_update() {
     -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
     -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
     ${RI_VOLS} \
-    "${target_img_pinned}"; then
+    "${_UPD_PULL_REF}"; then
 
-    PRUN network connect wp-db wordpress 2>/dev/null || true
+    podman network connect wp-db wordpress 2>/dev/null || true
+    # BUG FIX (v7-6g): this was a bare `wget -qO-` check — the single most
+    # dangerous place in the whole script for that, since HEALTHY directly
+    # gates whether do_wp_update() keeps the new container or rolls back to
+    # wordpress-old. A DB-connection-error page or a PHP fatal-error page
+    # returns a perfectly normal HTTP response, so the old check could mark
+    # a broken update "healthy" and delete the last-known-good container
+    # right after. Use the same wp-health-check.sh (HTTP + PHP execution +
+    # mariadb DNS + MariaDB auth + a real SELECT 1 through WordPress's own
+    # DB env vars) installed by the main provisioning script, with the old
+    # bare check only as a last-resort fallback if it's somehow missing.
     HEALTHY=0
-    for i in $(seq 1 6); do WEB_CHECK=$([ "${ROOTLESS_MODE:-0}" = "1" ] && echo 8080 || echo 80)
-      wget -qO- "http://127.0.0.1:${WEB_CHECK}/" >/dev/null 2>&1 && { HEALTHY=1; break; }; sleep 5; done
+    echo "  → Validating new WordPress container health (HTTP + PHP + DB name resolution + DB auth + real query)…"
+    for i in $(seq 1 6); do
+      if [ -x /usr/local/bin/wp-health-check.sh ]; then
+        if /usr/local/bin/wp-health-check.sh wordpress 80; then
+          HEALTHY=1; break
+        fi
+      else
+        wget -qO- "http://127.0.0.1:80/" >/dev/null 2>&1 && { HEALTHY=1; break; }
+      fi
+      sleep 5
+    done
     if [ "$HEALTHY" = "1" ]; then
-      PRUN stop wordpress-old 2>/dev/null; PRUN rm -f wordpress-old 2>/dev/null
-      sed -i "s|^PINNED_WP_VER=.*|PINNED_WP_VER=\"${target_ver}\"|" /usr/local/bin/update.sh
-      sed -i "s|WP_IMAGE=.*|WP_IMAGE=\"${target_img_pinned}\"|" /etc/init.d/wp-container 2>/dev/null || true
-      # Re-apply uploads ownership after update (entrypoint re-creates dirs as root)
+      podman stop wordpress-old 2>/dev/null; podman rm -f wordpress-old 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): a leftover wordpress-old here isn't
+      # fatal to THIS update (it already succeeded above), but it now
+      # blocks the NEXT one — require_clean_container_state() refuses to
+      # rename over a stale *-old container. Surface that now instead of
+      # letting the next admin discover it as a confusing abort.
+      podman container exists wordpress-old 2>/dev/null \
+        && echo "  ⚠  wordpress-old could not be fully removed — clean it up before the next update: podman rm -f wordpress-old" >&2
       sleep 3
-      PRUN exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
+      podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
       echo "✔  WordPress base image updated to ${target_ver}"
-      # BUG FIX (v7-5): GeoIP used to be silently destroyed here. This function
-      # was pulling the bare upstream image and recreating the container with
-      # NO knowledge of the localhost/wordpress-geoip custom image or its two
-      # extra mounts (geoip.conf, maxminddb.load) — so any site with GeoIP
-      # active lost country filtering on every single `update.sh wp`, with no
-      # warning. WP_IS_GEOIP reflects whether GeoIP was actually active on the
-      # container BEFORE this update started; GEOIP_ENABLED covers the case
-      # where it's configured but not yet applied. Either way, rebuild the
-      # GeoIP image on the new base and restore the mounts.
+      WP_TAG="$target_ver"; WP_DIGEST="${_UPD_DIGEST}"
+      _save_pinned
+      # GeoIP is a locally-built image layered on top of whatever WordPress
+      # base is currently running — it has no registry digest of its own to
+      # check, so it just gets rebuilt on the new base whenever that base
+      # changes. WP_IS_GEOIP reflects whether GeoIP was active BEFORE this
+      # update started; GEOIP_ENABLED covers "configured but not yet applied".
       if [ "${WP_IS_GEOIP:-0}" = "1" ] || [ "${GEOIP_ENABLED:-0}" = "1" ]; then
         if [ -x /usr/local/bin/wp-geoip-setup.sh ]; then
           echo "  → GeoIP was active — rebuilding the GeoIP image on the new base…"
@@ -2835,33 +3598,69 @@ do_wp_update() {
       fi
     else
       echo "✗  Health check failed — rolling back…"
-      PRUN stop wordpress 2>/dev/null; PRUN rm -f wordpress 2>/dev/null
-      PRUN rename wordpress-old wordpress 2>/dev/null; PRUN start wordpress 2>/dev/null
-      echo "✗  Rolled back to ${RUNNING_WP}."; return 1
+      podman stop wordpress 2>/dev/null; podman rm -f wordpress 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): was `2>/dev/null` on both the rename
+      # and the start, discarding the one result that matters most here —
+      # this IS the rollback; if it silently fails the site is down with no
+      # indication why. Check it and say so loudly.
+      if podman rename wordpress-old wordpress && podman start wordpress >/dev/null 2>&1; then
+        echo "✗  Rolled back to ${WP_TAG:-previous}."
+      else
+        echo "✗✗ ROLLBACK FAILED — wordpress-old could not be restored to 'wordpress'" >&2
+        echo "   and/or started. The site is DOWN. Manual recovery needed now:" >&2
+        echo "     podman ps -a --filter name=wordpress" >&2
+        echo "     podman rename wordpress-old wordpress && podman start wordpress" >&2
+      fi
+      return 1
     fi
   else
-    PRUN rm -f wordpress 2>/dev/null
-    PRUN rename wordpress-old wordpress 2>/dev/null; PRUN start wordpress 2>/dev/null
-    echo "✗  Container start failed — rolled back."; return 1
+    echo "✗  Production container failed to start on :80 — rolling back…"
+    podman rm -f wordpress 2>/dev/null
+    if podman rename wordpress-old wordpress && podman start wordpress >/dev/null 2>&1; then
+      echo "✗  Container start failed — rolled back."
+    else
+      echo "✗✗ ROLLBACK FAILED — wordpress-old could not be restored to 'wordpress'" >&2
+      echo "   and/or started. The site is DOWN. Manual recovery needed now:" >&2
+      echo "     podman ps -a --filter name=wordpress" >&2
+      echo "     podman rename wordpress-old wordpress && podman start wordpress" >&2
+    fi
+    return 1
   fi
 }
 
 do_db_update() {
-  local target_ver="${1:-$PINNED_DB_VER}" target_img="${DB_REGISTRY}:${1:-$PINNED_DB_VER}"
+  local target_ver="${1:-${DB_TAG:-$PINNED_DB_VER}}"
   echo "── MariaDB ────────────────────────────────────────────────────"
-  echo "  Running : ${RUNNING_DB}  →  Target: ${target_ver}"
+  [ -n "$1" ] && { validate_image_tag "$1" || return 1; }
+  echo "  Pinned  : tag=${DB_TAG:-none}  digest=${DB_DIGEST:-none}"
+  echo "  Target  : ${DB_REGISTRY}:${target_ver}"
   echo "  Data    : /home/wpuser/wp/mysql (bind-mount — never removed)"
-  [ "${RUNNING_DB}" = "${target_ver}" ] && { echo "  ✔  Already on target."; return 0; }
-  ask_yn "Update MariaDB? (backup taken first)" || { echo "   Skipped."; return 0; }
+
+  _check_component "$DB_REGISTRY" "$DB_TAG" "$DB_DIGEST" "$target_ver"
+  case "$_UPD_ACTION" in
+    skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
+    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it? (backup taken first)" || { echo "   Skipped."; return 0; } ;;
+    bump) ask_yn "Update MariaDB to ${target_ver}? (backup taken first)" || { echo "   Skipped."; return 0; } ;;
+  esac
 
   setup_trivy
-  scan_image "${target_img}" || return 1
+  scan_image "${_UPD_PULL_REF}" || return 1
+
+  # v7-7 (item 39): fail fast, before the backup/pull/stop sequence below
+  # even begins, if mariadb-old already exists (a stale leftover from an
+  # update that was interrupted before cleanup) or mariadb itself is
+  # missing. Without this, that problem is only discovered much further
+  # down, right at the actual rename — by which point a full backup has
+  # been taken, the new image pulled, and WordPress AND MariaDB have both
+  # already been stopped for nothing. The require_clean_container_state()
+  # call right before the rename further down stays in place too, as a
+  # second, belt-and-suspenders guard against state changing in the window
+  # between this early check and the actual rename attempt.
+  require_clean_container_state mariadb mariadb-old || return 1
 
   BACKUP_FILE="/root/wp-db-backup-$(date +%Y%m%d-%H%M%S).sql.gz"
   echo "  → Backing up to ${BACKUP_FILE}…"
-  # BUG FIX: use sh -c so $MARIADB_ROOT_PASSWORD expands inside the container
-  # where it is set (from --env-file), not on the host where it is not set.
-  if PRUN exec mariadb sh -c \
+  if podman exec mariadb sh -c \
        'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
        | gzip > "${BACKUP_FILE}"; then
     echo "  ✔  Backup: ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
@@ -2869,22 +3668,68 @@ do_db_update() {
     echo "✗  Backup failed — aborting. Fix the database before retrying."; return 1
   fi
 
-  echo "  → Pulling ${target_img}…"
-  podman pull "${target_img}" || { echo "✗  Pull failed."; return 1; }
-  target_img_pinned=$(_pin_digest "${target_img}" "MariaDB")
+  echo "  → Pulling ${_UPD_PULL_REF}…"
+  podman pull "${_UPD_PULL_REF}" || { echo "✗  Pull failed."; return 1; }
+  if [ -z "${_UPD_DIGEST}" ] && [ "${USE_DIGEST_PINNING}" = "1" ]; then
+    _UPD_DIGEST=$(podman inspect "${_UPD_PULL_REF}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+      | grep -oE 'sha256:[0-9a-f]{64}' || true)
+    [ -n "${_UPD_DIGEST}" ] && _UPD_PULL_REF="${DB_REGISTRY}@${_UPD_DIGEST}"
+  fi
 
   echo "  → Stopping WordPress (brief downtime)…"
-  PRUN stop wordpress 2>/dev/null || true
-  PRUN rename mariadb mariadb-old 2>/dev/null || true
+  if ! podman stop --time 30 wordpress; then
+    echo "✗  Unable to stop WordPress — aborting before touching MariaDB."
+    return 1
+  fi
 
-  # No --ip here: mariadb-old (renamed above) is still RUNNING and still
-  # holds 10.89.20.2 on wp-db until it's removed further below, so claiming
-  # that same address now would fail with an IP-already-allocated error.
-  # netavark auto-assigns a free wp-db address instead — WordPress still
-  # finds it via aardvark-dns (the --add-host static entry is a fallback
-  # only; a stale IP there after an update is a pre-existing, accepted
-  # limitation of that fallback, not something this change affects).
-  if PRUN run -d --name mariadb --network wp-db --restart always \
+  # BUG FIX (missing-item #2 — MariaDB old container remains running during
+  # replacement): this used to rename mariadb -> mariadb-old WITHOUT
+  # stopping it first. `podman rename` does not stop a container, so the
+  # old mariadbd process stayed live against /home/wpuser/wp/mysql at the
+  # same moment the replacement container below mounts that same directory
+  # — two InnoDB instances against one data directory, risking redo-log
+  # corruption, data-dictionary corruption, and unrecoverable damage.
+  # MariaDB is now stopped cleanly (a longer timeout than WordPress, since
+  # InnoDB needs time to flush the buffer pool) before the rename, and the
+  # old container's stopped state is verified explicitly afterward rather
+  # than assumed.
+  echo "  → Stopping MariaDB cleanly before replacement…"
+  if ! podman stop --time 60 mariadb; then
+    echo "✗  MariaDB did not stop cleanly — aborting update."
+    podman start wordpress >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # PRODUCTION SAFETY FIX (v7-6k): preflight the rename's own preconditions
+  # (see require_clean_container_state() above) before attempting it, so a
+  # stale mariadb-old from a previous crashed update is reported clearly
+  # instead of surfacing as a generic rename failure below.
+  require_clean_container_state mariadb mariadb-old || {
+    podman start mariadb   >/dev/null 2>&1 || true
+    podman start wordpress >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! podman rename mariadb mariadb-old; then
+    echo "✗  Unable to prepare MariaDB rollback container — aborting."
+    podman start mariadb   >/dev/null 2>&1 || true
+    podman start wordpress >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  DB_OLD_RUNNING="$(podman inspect mariadb-old --format '{{.State.Running}}' 2>/dev/null)"
+  if [ "$DB_OLD_RUNNING" != "false" ]; then
+    echo "✗  mariadb-old is still running — refusing to start a second MariaDB"
+    echo "   instance against the same data directory. Update aborted."
+    podman start wordpress >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # No --ip here either — mariadb-old still holds its wp-db address until
+  # removed below. netavark auto-assigns a free wp-db address; WordPress
+  # still finds it via aardvark-dns (the --add-host static entry above is a
+  # fallback only, and can go stale after this — pre-existing limitation,
+  # unrelated to Skopeo/pinning).
+  if podman run -d --name mariadb --network wp-db --restart always \
     --label io.containers.autoupdate=image \
     --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
     --cap-add DAC_OVERRIDE --cap-add FOWNER \
@@ -2897,56 +3742,157 @@ do_db_update() {
     --health-cmd "healthcheck.sh --connect --innodb_initialized" \
     --health-interval 5s --health-timeout 5s --health-retries 24 \
     --health-start-period 30s \
-    "${target_img_pinned}"; then
+    "${_UPD_PULL_REF}"; then
 
+    # PRODUCTION SAFETY FIX (v7-6k): DB_READY used to gate this rollback
+    # decision on a bare ping. This is the highest-stakes place a shallow
+    # check could bite — DB_READY directly decides whether do_db_update()
+    # keeps the new MariaDB container or rolls back to mariadb-old, and a
+    # ping can report healthy while the wpdb user/database or InnoDB itself
+    # are still broken. WordPress is also stopped at this point in the
+    # update, so wp-health-check.sh (which needs a running WordPress
+    # container to test through) can't be used here — mariadb-health-check.sh
+    # (installed by the main provisioning script; see its rationale there)
+    # is the real equivalent for MariaDB itself. The old ping-only check is
+    # kept as a fallback only if that script is somehow missing (e.g. a VM
+    # provisioned before v7-6k).
     DB_READY=0
     for i in $(seq 1 24); do
-      PRUN exec mariadb sh -c \
+      if [ -x /usr/local/bin/mariadb-health-check.sh ]; then
+        /usr/local/bin/mariadb-health-check.sh mariadb && { DB_READY=1; break; }
+      elif podman exec mariadb sh -c \
         'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
-         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null' \
-        && { DB_READY=1; break; }
+         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null'; then
+        DB_READY=1; break
+      fi
       sleep 5
     done
 
     if [ "$DB_READY" = "1" ]; then
       echo "  → mariadb-upgrade (no-op if not needed)…"
-      PRUN exec mariadb sh -c \
+      podman exec mariadb sh -c \
         'mariadb-upgrade -uroot -p"$MARIADB_ROOT_PASSWORD"' >/dev/null 2>&1 || true
-      PRUN start wordpress >/dev/null 2>&1 || true
-      PRUN stop mariadb-old 2>/dev/null; PRUN rm -f mariadb-old 2>/dev/null
-      sed -i "s|^PINNED_DB_VER=.*|PINNED_DB_VER=\"${target_ver}\"|" /usr/local/bin/update.sh
-      sed -i "s|DB_IMAGE=.*|DB_IMAGE=\"${target_img_pinned}\"|" /etc/init.d/mariadb-container 2>/dev/null || true
+      podman start wordpress >/dev/null 2>&1 || true
+      podman stop mariadb-old 2>/dev/null; podman rm -f mariadb-old 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): flag a leftover mariadb-old now — it
+      # will otherwise silently block the next update's preflight check.
+      podman container exists mariadb-old 2>/dev/null \
+        && echo "  ⚠  mariadb-old could not be fully removed — clean it up before the next update: podman rm -f mariadb-old" >&2
       echo "✔  MariaDB updated to ${target_ver}. Backup: ${BACKUP_FILE}"
+      DB_TAG="$target_ver"; DB_DIGEST="${_UPD_DIGEST}"
+      _save_pinned
     else
       echo "✗  New MariaDB not ready — rolling back…"
-      PRUN stop mariadb 2>/dev/null; PRUN rm -f mariadb 2>/dev/null
-      PRUN rename mariadb-old mariadb 2>/dev/null; PRUN start mariadb 2>/dev/null
-      PRUN start wordpress 2>/dev/null
-      echo "✗  Rolled back. Backup: ${BACKUP_FILE}"; return 1
+      podman stop mariadb 2>/dev/null; podman rm -f mariadb 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): was `2>/dev/null` on the rename and
+      # start, discarding the one result that matters most — this IS the
+      # rollback. Check it and say so loudly if it doesn't work.
+      if podman rename mariadb-old mariadb && podman start mariadb >/dev/null 2>&1; then
+        podman start wordpress >/dev/null 2>&1 \
+          || echo "  ⚠  MariaDB rolled back but WordPress did not restart — start it manually: podman start wordpress" >&2
+        echo "✗  Rolled back. Backup: ${BACKUP_FILE}"
+      else
+        echo "✗✗ ROLLBACK FAILED — mariadb-old could not be restored to 'mariadb'" >&2
+        echo "   and/or started. The database is DOWN. Manual recovery needed now:" >&2
+        echo "     podman ps -a --filter name=mariadb" >&2
+        echo "     podman rename mariadb-old mariadb && podman start mariadb && podman start wordpress" >&2
+        echo "   Backup taken before this update is still available: ${BACKUP_FILE}" >&2
+      fi
+      return 1
     fi
   else
-    PRUN rm -f mariadb 2>/dev/null
-    PRUN rename mariadb-old mariadb 2>/dev/null; PRUN start mariadb 2>/dev/null
-    PRUN start wordpress 2>/dev/null
-    echo "✗  Container start failed — rolled back. Backup: ${BACKUP_FILE}"; return 1
+    podman rm -f mariadb 2>/dev/null
+    if podman rename mariadb-old mariadb && podman start mariadb >/dev/null 2>&1; then
+      podman start wordpress >/dev/null 2>&1 \
+        || echo "  ⚠  MariaDB rolled back but WordPress did not restart — start it manually: podman start wordpress" >&2
+      echo "✗  Container start failed — rolled back. Backup: ${BACKUP_FILE}"
+    else
+      echo "✗✗ ROLLBACK FAILED — mariadb-old could not be restored to 'mariadb'" >&2
+      echo "   and/or started. The database is DOWN. Manual recovery needed now:" >&2
+      echo "     podman ps -a --filter name=mariadb" >&2
+      echo "     podman rename mariadb-old mariadb && podman start mariadb && podman start wordpress" >&2
+      echo "   Backup taken before this update is still available: ${BACKUP_FILE}" >&2
+    fi
+    return 1
   fi
 }
 
 do_cs_update() {
-  local target_ver="${1:-$PINNED_CS_VER}" target_img="${CS_REGISTRY}:${1:-$PINNED_CS_VER}"
+  local target_ver="${1:-${CS_TAG:-$PINNED_CS_VER}}"
   echo "── CrowdSec ───────────────────────────────────────────────────"
-  echo "  Running : ${RUNNING_CS}  →  Target: ${target_ver}"
-  [ "${RUNNING_CS}" = "${target_ver}" ] && { echo "  ✔  Already on target."; return 0; }
-  ask_yn "Update CrowdSec?" || { echo "   Skipped."; return 0; }
+  [ -n "$1" ] && { validate_image_tag "$1" || return 1; }
+  echo "  Pinned  : tag=${CS_TAG:-none}  digest=${CS_DIGEST:-none}"
+  echo "  Target  : ${CS_REGISTRY}:${target_ver}"
+
+  _check_component "$CS_REGISTRY" "$CS_TAG" "$CS_DIGEST" "$target_ver"
+  case "$_UPD_ACTION" in
+    skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
+    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it?" || { echo "   Skipped."; return 0; } ;;
+    bump) ask_yn "Update CrowdSec to ${target_ver}?" || { echo "   Skipped."; return 0; } ;;
+  esac
 
   setup_trivy
-  scan_image "${target_img}" || return 1
+  scan_image "${_UPD_PULL_REF}" || return 1
 
-  podman pull "${target_img}" || { echo "✗  Pull failed."; return 1; }
-  target_img_pinned=$(_pin_digest "${target_img}" "CrowdSec")
-  PRUN rename crowdsec crowdsec-old 2>/dev/null || true
+  # v7-7 (item 39): fail fast, before the pull/stop sequence below, if
+  # crowdsec-old already exists (a stale leftover from an update that was
+  # interrupted before cleanup) or crowdsec itself is missing. Without
+  # this, that problem is only discovered much further down, right at the
+  # actual rename. The require_clean_container_state() call right before
+  # the rename further down stays in place too, as a second,
+  # belt-and-suspenders guard — same rationale as do_db_update() above.
+  require_clean_container_state crowdsec crowdsec-old || return 1
 
-  if PRUN run -d --name crowdsec --restart always --network host \
+  echo "  → Pulling ${_UPD_PULL_REF}…"
+  podman pull "${_UPD_PULL_REF}" || { echo "✗  Pull failed."; return 1; }
+  if [ -z "${_UPD_DIGEST}" ] && [ "${USE_DIGEST_PINNING}" = "1" ]; then
+    _UPD_DIGEST=$(podman inspect "${_UPD_PULL_REF}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+      | grep -oE 'sha256:[0-9a-f]{64}' || true)
+    [ -n "${_UPD_DIGEST}" ] && _UPD_PULL_REF="${CS_REGISTRY}@${_UPD_DIGEST}"
+  fi
+
+  # BUG FIX (missing-item #7 — CrowdSec old and new containers may compete
+  # on host networking): this used to rename crowdsec -> crowdsec-old
+  # WITHOUT stopping it first. `podman rename` does not stop a container,
+  # and CrowdSec runs --network host (the host's own network namespace,
+  # not an isolated Podman network like wp-front/wp-db) — so the still-
+  # running renamed engine and the new container started below would both
+  # be live on the HOST network at once, competing for the same LAPI port
+  # (127.0.0.1:8080, locked down earlier in the installer), any AppSec
+  # listener, and the same bind-mounted /opt/crowdsec/config and
+  # /opt/crowdsec/data. Same class of bug already fixed for MariaDB above
+  # (two engines against one set of persistent state/ports) — same fix:
+  # stop cleanly first, verify the old container actually stopped, THEN
+  # rename, so there is never a moment with two CrowdSec engines both
+  # live on the host network.
+  echo "  → Stopping CrowdSec cleanly before replacement…"
+  if ! podman stop --time 30 crowdsec; then
+    echo "✗  CrowdSec did not stop cleanly — aborting update."
+    return 1
+  fi
+
+  # PRODUCTION SAFETY FIX (v7-6k): preflight the rename's own preconditions
+  # (see require_clean_container_state() above) before attempting it, so a
+  # stale crowdsec-old from a previous crashed update is reported clearly
+  # instead of surfacing as a generic rename failure below.
+  require_clean_container_state crowdsec crowdsec-old || {
+    podman start crowdsec >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! podman rename crowdsec crowdsec-old; then
+    echo "✗  Unable to prepare CrowdSec rollback container — aborting."
+    podman start crowdsec >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  CS_OLD_RUNNING="$(podman inspect crowdsec-old --format '{{.State.Running}}' 2>/dev/null)"
+  if [ "$CS_OLD_RUNNING" != "false" ]; then
+    echo "✗  crowdsec-old is still running — refusing to start a second CrowdSec"
+    echo "   engine against the same host-network ports and data. Update aborted."
+    return 1
+  fi
+
+  if podman run -d --name crowdsec --restart always --network host \
     --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
     --security-opt no-new-privileges:true --read-only \
     --tmpfs /tmp:size=32M,noexec,nosuid,nodev --tmpfs /var/run:size=16M,noexec,nosuid,nodev \
@@ -2956,135 +3902,207 @@ do_cs_update() {
     -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \
     -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
     -v /var/log/messages:/var/log/host/messages:ro \
-    "${target_img_pinned}"; then
+    "${_UPD_PULL_REF}"; then
 
     LAPI_UP=0
     for i in $(seq 1 6); do
-      PRUN exec crowdsec cscli lapi status >/dev/null 2>&1 && { LAPI_UP=1; break; }; sleep 5
+      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && { LAPI_UP=1; break; }; sleep 5
     done
     if [ "$LAPI_UP" = "1" ]; then
       rc-service cs-firewall-bouncer restart 2>/dev/null || true
-      PRUN stop crowdsec-old 2>/dev/null; PRUN rm -f crowdsec-old 2>/dev/null
-      sed -i "s|^PINNED_CS_VER=.*|PINNED_CS_VER=\"${target_ver}\"|" /usr/local/bin/update.sh
+      podman stop crowdsec-old 2>/dev/null; podman rm -f crowdsec-old 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): flag a leftover crowdsec-old now — it
+      # will otherwise silently block the next update's preflight check.
+      podman container exists crowdsec-old 2>/dev/null \
+        && echo "  ⚠  crowdsec-old could not be fully removed — clean it up before the next update: podman rm -f crowdsec-old" >&2
       echo "✔  CrowdSec updated to ${target_ver}"
+      CS_TAG="$target_ver"; CS_DIGEST="${_UPD_DIGEST}"
+      _save_pinned
     else
       echo "✗  LAPI not responding — rolling back…"
-      PRUN stop crowdsec 2>/dev/null; PRUN rm -f crowdsec 2>/dev/null
-      PRUN rename crowdsec-old crowdsec 2>/dev/null; PRUN start crowdsec 2>/dev/null
-      rc-service cs-firewall-bouncer restart 2>/dev/null; return 1
+      podman stop crowdsec 2>/dev/null; podman rm -f crowdsec 2>/dev/null
+      # PRODUCTION SAFETY FIX (v7-6k): was `2>/dev/null` on the rename and
+      # start, discarding the one result that matters most — this IS the
+      # rollback. Check it and say so loudly if it doesn't work.
+      if podman rename crowdsec-old crowdsec && podman start crowdsec >/dev/null 2>&1; then
+        rc-service cs-firewall-bouncer restart 2>/dev/null || true
+      else
+        echo "✗✗ ROLLBACK FAILED — crowdsec-old could not be restored to 'crowdsec'" >&2
+        echo "   and/or started. Intrusion protection is DOWN. Manual recovery needed now:" >&2
+        echo "     podman ps -a --filter name=crowdsec" >&2
+        echo "     podman rename crowdsec-old crowdsec && podman start crowdsec" >&2
+      fi
+      return 1
     fi
   else
-    PRUN rm -f crowdsec 2>/dev/null
-    PRUN rename crowdsec-old crowdsec 2>/dev/null; PRUN start crowdsec 2>/dev/null
-    rc-service cs-firewall-bouncer restart 2>/dev/null; return 1
+    podman rm -f crowdsec 2>/dev/null
+    if podman rename crowdsec-old crowdsec && podman start crowdsec >/dev/null 2>&1; then
+      rc-service cs-firewall-bouncer restart 2>/dev/null || true
+    else
+      echo "✗✗ ROLLBACK FAILED — crowdsec-old could not be restored to 'crowdsec'" >&2
+      echo "   and/or started. Intrusion protection is DOWN. Manual recovery needed now:" >&2
+      echo "     podman ps -a --filter name=crowdsec" >&2
+      echo "     podman rename crowdsec-old crowdsec && podman start crowdsec" >&2
+    fi
+    return 1
   fi
 }
 
 show_status() {
   echo ""; echo "── Status ─────────────────────────────────────────────────────"
-  PRUN ps --format "  {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | column -t || true
+  podman ps --format "  {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | column -t || true
   echo ""
   echo "  Firewall : $(nft list tables 2>/dev/null | grep -c table) nft tables"
   echo "  Bouncer  : $(rc-service cs-firewall-bouncer status 2>/dev/null | head -1)"
   echo ""
 }
 
-# ── Digest check: same tag, newer published digest ────────────────────────────
-# Answers a different question than do_wp_update/do_db_update/do_cs_update:
-# those check "is there a newer VERSION TAG available" (you supply VER, or it
-# compares against PINNED_*_VER). This checks "has the registry republished
-# a NEW IMAGE under the SAME tag" — which happens routinely for security
-# rebuilds (base-OS CVE patches, etc.) without the version number changing at
-# all. Without this, a digest-pinned deployment could sit on a known-bad
-# image indefinitely because "already on target" only ever compared tags.
+# ── Digest-only refresh (no OS, no version bump — just "is the currently
+# pinned tag's digest still current everywhere?") ─────────────────────────
 do_digest_check() {
-  echo "── Digest Check (same tag, newer published digest) ───────────────"
-  if [ "${USE_DIGEST_PINNING:-1}" != "1" ]; then
+  echo "── Digest Check (Skopeo manifest query only — pulls happen only if something actually changed) ──"
+  if [ "${USE_DIGEST_PINNING}" != "1" ]; then
     echo "  Digest pinning is disabled (USE_DIGEST_PINNING=0 in vars.sh) — nothing to check."
     return 0
   fi
-  _check_one() {
-    local label="$1" running_raw="$2" registry="$3" bare_tag="$4" updater="$5"
-    local running_digest fresh_digest fresh_ref
-    running_digest=$(echo "$running_raw" | grep -oE 'sha256:[0-9a-f]{64}' || true)
-    if [ -z "$running_digest" ]; then
-      echo "  ${label}: not currently digest-pinned — run its update.sh command once to pin it."
-      return 0
-    fi
-    fresh_ref="${registry}:${bare_tag}"
-    echo "  → ${label}: checking ${fresh_ref} for a newer digest than currently pinned…"
-    if ! podman pull "${fresh_ref}" >/dev/null 2>&1; then
-      echo "  ${label}: pull failed — skipping digest check"
-      return 0
-    fi
-    fresh_digest=$(podman inspect "${fresh_ref}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
-      | grep -oE 'sha256:[0-9a-f]{64}' || true)
-    if [ -z "$fresh_digest" ]; then
-      echo "  ${label}: could not resolve the current digest — skipping"
-      return 0
-    fi
-    if [ "$fresh_digest" = "$running_digest" ]; then
-      echo "  ✔  ${label}: already on the latest published digest for ${bare_tag}"
+  do_wp_update "${WP_TAG:-$PINNED_WP_VER}"
+  do_db_update "${DB_TAG:-$PINNED_DB_VER}"
+  do_cs_update "${CS_TAG:-$PINNED_CS_VER}"
+}
+
+# ── Read-only summary (default action) ─────────────────────────────────────
+# Reports; changes nothing. Every remote lookup here is a Skopeo manifest
+# query (a few KB) — no `podman pull` happens in this code path at all.
+show_check_summary() {
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║  WordPress VM — Status (read-only, no downloads)          ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  Alpine   : $(cat /etc/alpine-release 2>/dev/null)"
+  _report_one() {
+    local label="$1" registry="$2" tag="$3" digest="$4" note remote
+    if [ "${USE_DIGEST_PINNING}" = "1" ]; then
+      remote=$(_resolve_digest "${registry}:${tag}") || remote=""
+      if [ -z "$remote" ]; then
+        note="tag=${tag}  (couldn't reach registry to check digest)"
+      elif [ -z "$digest" ]; then
+        note="tag=${tag}  not pinned yet — current registry digest: ${remote}"
+      elif [ "$remote" = "$digest" ]; then
+        note="tag=${tag}  digest up to date"
+      else
+        note="tag=${tag}  NEWER DIGEST AVAILABLE under this tag"
+      fi
     else
-      echo "  ⚠  ${label}: ${fresh_ref} has a NEWER digest than what's pinned"
-      echo "     Pinned : ${running_digest}"
-      echo "     Latest : ${fresh_digest}"
-      ask_yn "  Move ${label} to the new digest now (same version ${bare_tag}, rebuilt image)?" \
-        && "$updater" "${bare_tag}"
+      note="tag=${tag}  (digest pinning disabled)"
     fi
+    printf "║  %-9s %s\n" "${label}:" "$note"
   }
-  _check_one "WordPress" "${RUNNING_WP_RAW}" "${WP_REGISTRY}" "$(echo "${PINNED_WP_VER}" | sed 's|^geoip-||')" do_wp_update
-  _check_one "MariaDB"   "${RUNNING_DB_RAW}" "${DB_REGISTRY}" "${PINNED_DB_VER}" do_db_update
-  _check_one "CrowdSec"  "${RUNNING_CS_RAW}" "${CS_REGISTRY}" "${PINNED_CS_VER}" do_cs_update
+  _report_one "WordPress" "$WP_REGISTRY" "${WP_TAG:-$PINNED_WP_VER}" "$WP_DIGEST"
+  _report_one "MariaDB"   "$DB_REGISTRY" "${DB_TAG:-$PINNED_DB_VER}" "$DB_DIGEST"
+  _report_one "CrowdSec"  "$CS_REGISTRY" "${CS_TAG:-$PINNED_CS_VER}" "$CS_DIGEST"
+  if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
+    _PIN_COUNT=0
+    [ -n "$WP_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
+    [ -n "$DB_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
+    [ -n "$CS_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
+    echo "║  Digest pinning: enabled — ${_PIN_COUNT}/3 currently pinned"
+  else
+    echo "║  Digest pinning: disabled"
+  fi
+  echo "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "  update.sh all                  — update everything (asks before each change)"
+  echo "  update.sh wp|db|crowdsec [VER] — update one component (asks first)"
+  echo "  update.sh digest-check         — refresh any component whose tag got rebuilt"
+  echo "  update.sh os                   — Alpine package updates"
+  echo "  update.sh trivy                — CVE scan of the images actually running"
+  show_status
+}
+
+# ── Update lock — prevents concurrent update.sh invocations from stepping
+# on each other ─────────────────────────────────────────────────────────
+# PRODUCTION SAFETY FIX (v7-6j): nothing previously stopped two update.sh
+# invocations from running at the same time — e.g. an admin running
+# `update.sh wp` while a cron-triggered `update.sh digest-check` is already
+# mid-run, or two admins each updating a different component. Concrete
+# failure modes this allowed: two processes racing to rename the same
+# container to *-old (the loser's rename fails, or worse, a second update
+# removes/renames a rollback container the first update still depends on);
+# two processes writing /etc/wp-install/pinned.env around the same time;
+# overlapping MariaDB dumps against the same data directory; one process
+# restarting a service while another process's health check is mid-poll
+# against it.
+#
+# A plain mkdir-based lock closes this: mkdir is atomic on every storage
+# backend this script runs on (overlay/vfs/fuse-overlayfs), so exactly one
+# invocation can ever hold the lock directory at a time — no flock/
+# lockfile binary dependency required. The holder's PID is recorded inside
+# the lock so a stale lock left behind by a crashed update (OOM-killed, VM
+# rebooted mid-update, etc.) is detected via `kill -0` and cleared
+# automatically instead of wedging every future update permanently.
+#
+# Only the state-changing subcommands below (os/wp/db/crowdsec/all/
+# digest-check) take the lock — check/status/trivy stay lock-free since
+# they're read-only (no container renames, no pinned.env writes) and are
+# meant to stay safe to run anytime, including while an update is already
+# in progress (see "bare update.sh is read-only" under WHAT CHANGED above).
+LOCK_DIR="/run/lock/wordpress-update.lock"
+acquire_lock() {
+  local lock_pid
+  mkdir -p /run/lock
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
+    return 0
+  fi
+  # Lock dir already exists: either a live update holds it, or a previous
+  # run crashed without cleaning up. Only trust the recorded PID if that
+  # process is actually still alive.
+  if [ -f "${LOCK_DIR}/pid" ]; then
+    lock_pid=$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      echo "  ⚠  Clearing a stale update lock left by dead process ${lock_pid}…" >&2
+      rm -rf "$LOCK_DIR"
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null
+        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
+        return 0
+      fi
+    fi
+  fi
+  echo "✗  Another update.sh is already running (PID ${lock_pid:-unknown})." >&2
+  echo "   Lock: ${LOCK_DIR} — wait for it to finish, or if you're certain" >&2
+  echo "   nothing is actually running, clear it with: rm -rf ${LOCK_DIR}" >&2
+  return 1
 }
 
 case "${1:-check}" in
-  os)          do_os_update ;;
-  wp)          do_wp_update "${2:-}" ;;
-  db)          do_db_update "${2:-}" ;;
-  crowdsec|cs) do_cs_update "${2:-}" ;;
-  all)         do_os_update; do_wp_update; do_db_update; do_cs_update ;;
-  digest-check|digest|pin) do_digest_check ;;
+  os)          acquire_lock || exit 1; do_os_update ;;
+  wp)          acquire_lock || exit 1; do_wp_update "${2:-}" ;;
+  db)          acquire_lock || exit 1; do_db_update "${2:-}" ;;
+  crowdsec|cs) acquire_lock || exit 1; do_cs_update "${2:-}" ;;
+  all)         acquire_lock || exit 1; do_os_update; do_wp_update; do_db_update; do_cs_update ;;
+  digest-check|digest|pin) acquire_lock || exit 1; do_digest_check ;;
   trivy|scan)
     setup_trivy
     for img in wordpress mariadb crowdsec; do
-      running=$(PRUN inspect $img --format "{{.Config.Image}}" 2>/dev/null || echo "")
+      running=$(podman inspect "$img" --format "{{.Config.Image}}" 2>/dev/null || echo "")
       [ -n "$running" ] && scan_image "$running"
     done ;;
-  check|"")
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║  Update Check                                            ║"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  Alpine   : $(cat /etc/alpine-release 2>/dev/null)"
-    echo "║  WordPress: running=${RUNNING_WP}  pinned=${PINNED_WP_VER}"
-    echo "║  MariaDB  : running=${RUNNING_DB}  pinned=${PINNED_DB_VER}"
-    echo "║  CrowdSec : running=${RUNNING_CS}  pinned=${PINNED_CS_VER}"
-    if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
-      _CHK_PIN_COUNT=0
-      case "$RUNNING_WP_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
-      case "$RUNNING_DB_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
-      case "$RUNNING_CS_RAW" in *@sha256:*) _CHK_PIN_COUNT=$((_CHK_PIN_COUNT+1)) ;; esac
-      echo "║  Digest pinning: enabled — ${_CHK_PIN_COUNT}/3 currently pinned$([ "$_CHK_PIN_COUNT" != "3" ] && echo "  (see ${DIGEST_PIN_LOG})")"
-    else
-      echo "║  Digest pinning: disabled"
-    fi
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo ""
-    do_os_update; do_wp_update; do_db_update; do_cs_update; do_digest_check; show_status ;;
-  *) echo "Usage: update.sh [check|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all]"; exit 1 ;;
+  check|status|"") show_check_summary ;;
+  *) echo "Usage: update.sh [check|status|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all|trivy]"; exit 1 ;;
 esac
 UPDSCRIPT
 chmod +x /usr/local/bin/update.sh
 ok "update.sh installed (wp / db / crowdsec / os / digest-check / all)"
+ok "  Concurrent runs are now blocked by an exclusive lock at /run/lock/wordpress-update.lock"
+ok "  Container swaps (wp/db/crowdsec) now check every rename/start instead of discarding the result — a silent failure here used to be able to delete a still-healthy container"
+ok "  WordPress updates now validate the pulled image on a loopback candidate (127.0.0.1:18080) before cutting production over on :80"
 
 # ════════════════════════════════════════════════════════════════════════════
 # CROWDSEC
 # ════════════════════════════════════════════════════════════════════════════
 ts "CrowdSec — engine"
 mkdir -p /opt/crowdsec/config /opt/crowdsec/data
-# In rootless mode, wpuser owns /opt/crowdsec (containers write to it as root
-# inside the container, which maps to wpuser on the host via user namespace).
-[ "${ROOTLESS_MODE:-0}" = "1" ] && chown -R wpuser:wpuser /opt/crowdsec 2>/dev/null || true
 mkdir -p /home/wpuser/wp/logs; chown 33:33 /home/wpuser/wp/logs 2>/dev/null || true
 # Ensure /var/log/messages exists before CrowdSec bind-mounts it.
 touch /var/log/messages 2>/dev/null || true
@@ -3102,12 +4120,8 @@ labels:
 ACQUIS
 ok "acquis.yaml: Apache logs + syslog"
 
-if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-  ok "Rootless mode: launching CrowdSec as wpuser via run-crowdsec.sh"
-  su -s /bin/sh wpuser -c '/home/wpuser/wp/run-crowdsec.sh'
-else
-  podman rm -f crowdsec 2>/dev/null || true
-  podman run -d \
+podman rm -f crowdsec 2>/dev/null || true
+podman run -d \
   --name    crowdsec \
   --restart always \
   --network host \
@@ -3130,7 +4144,6 @@ else
   -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
   -v /var/log/messages:/var/log/host/messages:ro \
   "${CROWDSEC_IMAGE}"
-fi  # end rootless/rootful dispatch
 
 ts "Waiting for CrowdSec LAPI"
 LAPI_READY=0
@@ -3233,7 +4246,6 @@ start() {
     mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
   fi
   mount --make-shared / 2>/dev/null || true
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
   # BUG FIX (v7-5d): cs-firewall-bouncer is a SEPARATE OpenRC service that
   # starts independently and can lose a race against CrowdSec's LAPI still
   # coming up — confirmed in the field to recur on every reboot, not just
@@ -3241,19 +4253,6 @@ start() {
   # script, so it never helped subsequent boots). Waiting here for LAPI to
   # actually respond, then restarting the bouncer, runs on EVERY boot that
   # brings this service up, not just the first one.
-  if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c '/home/wpuser/wp/run-crowdsec.sh' >/dev/null 2>&1
-    CS_START_STATUS=$?
-    if [ "$CS_START_STATUS" = "0" ]; then
-      for _i in 1 2 3 4 5 6; do
-        su -s /bin/sh wpuser -c 'podman exec crowdsec cscli lapi status' >/dev/null 2>&1 && break
-        sleep 5
-      done
-      rc-service cs-firewall-bouncer restart >/dev/null 2>&1 || true
-    fi
-    eend "$CS_START_STATUS"
-    return
-  fi
   podman container exists crowdsec 2>/dev/null && podman start crowdsec >/dev/null 2>&1
   CS_START_STATUS=$?
   if [ "$CS_START_STATUS" = "0" ]; then
@@ -3267,12 +4266,7 @@ start() {
 }
 stop() {
   ebegin "Stopping CrowdSec"
-  [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-  if [ "${ROOTLESS_MODE:-0}" = "1" ]; then
-    su -s /bin/sh wpuser -c 'podman stop crowdsec' >/dev/null 2>&1
-  else
-    podman stop crowdsec >/dev/null 2>&1
-  fi
+  podman stop crowdsec >/dev/null 2>&1
   eend $?
 }
 CSSVC
@@ -3431,13 +4425,8 @@ cat > /usr/local/bin/wp-hardening.sh << 'HARDEN'
 set -e
 [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
 PRUN() {
-  if [ "${ROOTLESS_MODE}" = "1" ]; then
-    su -s /bin/sh wpuser -c "podman $*"
-  else
-    podman "$@"
-  fi
+  podman "$@"
 }
 
 HTACCESS="/home/wpuser/wp/htaccess/.htaccess"
@@ -3597,6 +4586,22 @@ check "MariaDB reachable (exec ping)" "$_DB_PING_CHECK"
 DB_CHECK=$(podman exec --user www-data wordpress php -r   'echo @mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"))?"ok":"fail";'   2>/dev/null || echo "error")
 check "WordPress DB connection (www-data)" "$DB_CHECK"
 
+# PRODUCTION SAFETY FIX (v7-6k): the two checks above are narrow (root-only
+# ping; a bare mysqli_connect proves a socket opens, not that a query
+# succeeds). These two additional checks call the same strengthened
+# health-check scripts that gate update.sh's rollback decisions
+# (wp-health-check.sh / mariadb-health-check.sh, installed earlier in this
+# stage), so install-time validation is exactly as rigorous as update-time
+# validation — HTTP + PHP execution + DB name resolution + a real
+# WordPress-credential query for WordPress, and root + wpdb-credential
+# queries + InnoDB-initialized for MariaDB itself. Added alongside, not
+# instead of, the checks above.
+_MARIADB_FULL_CHECK=$([ -x /usr/local/bin/mariadb-health-check.sh ] && /usr/local/bin/mariadb-health-check.sh mariadb >/dev/null 2>&1 && echo ok || echo fail)
+check "MariaDB full health (query + InnoDB)" "$_MARIADB_FULL_CHECK"
+
+_WP_FULL_CHECK=$([ -x /usr/local/bin/wp-health-check.sh ] && /usr/local/bin/wp-health-check.sh wordpress 80 >/dev/null 2>&1 && echo ok || echo fail)
+check "WordPress full health (HTTP+PHP+DB)" "$_WP_FULL_CHECK"
+
 # Port 80 listening — ss (iproute2) isn't installed on stock Alpine and this
 # script never adds it, so this always read "0" regardless of real state.
 # Busybox's netstat ships by default and is a drop-in replacement here.
@@ -3647,13 +4652,8 @@ cat > /usr/local/bin/validate-wordpress.sh << 'VALSCRIPT'
 QUIET="${1:-}"
 PASS=0; FAIL=0
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
 PRUN() {
-  if [ "${ROOTLESS_MODE}" = "1" ]; then
-    su -s /bin/sh wpuser -c "podman $*"
-  else
-    podman "$@"
-  fi
+  podman "$@"
 }
 
 chk() {
@@ -3683,6 +4683,18 @@ chk "CrowdSec running"  "$(PRUN inspect crowdsec --format '{{.State.Status}}' 2>
 
 DB=$(PRUN exec --user www-data wordpress php -r   'echo @mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"))?"ok":"fail";' 2>/dev/null || echo error)
 chk "DB connectivity (www-data)" "$DB"
+
+# PRODUCTION SAFETY FIX (v7-6k): same strengthened checks used at install
+# and update time — see the matching comment in the post-install
+# validation suite (create-wordpress-vm.sh) for the full rationale. Added
+# alongside, not instead of, the ping/mysqli_connect checks above, so an
+# admin running this script gets the same depth of validation update.sh
+# relies on for its own rollback decisions.
+_MARIADB_FULL=$([ -x /usr/local/bin/mariadb-health-check.sh ] && /usr/local/bin/mariadb-health-check.sh mariadb >/dev/null 2>&1 && echo ok || echo fail)
+chk "MariaDB full health (query + InnoDB)" "${_MARIADB_FULL}"
+
+_WP_FULL=$([ -x /usr/local/bin/wp-health-check.sh ] && /usr/local/bin/wp-health-check.sh wordpress 80 >/dev/null 2>&1 && echo ok || echo fail)
+chk "WordPress full health (HTTP+PHP+DB)" "${_WP_FULL}"
 
 PRUN exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
 UPL=$(PRUN exec --user www-data wordpress sh -c   'touch /var/www/html/wp-content/uploads/.wt && rm /var/www/html/wp-content/uploads/.wt && echo ok || echo fail' 2>/dev/null || echo fail)
@@ -3755,6 +4767,9 @@ echo "║  Digest pin : ${DIGEST_PIN_SUMMARY:-disabled}$([ "${DIGEST_PIN_COUNT:-
 echo "║  Kernel     : $(uname -r)"
 echo "╠════════════════════════════════════════════════════════════╣"
 echo "║  Credentials  : /root/.wp-credentials (chmod 600)        ║"
+if [ "${ADMIN_USER_CREATED:-0}" = "1" ]; then
+echo "║  Admin login  : /root/.wp-admin-credentials (chmod 600)  ║"
+fi
 echo "║  Env file     : /etc/wordpress/env    (chmod 600)        ║"
 echo "║  DB backups   : /root/wp-db-backups/ (daily, 7-day keep)║"
 echo "╠════════════════════════════════════════════════════════════╣"
@@ -3764,7 +4779,14 @@ echo "║   L2  Apache         ADMIN_CIDR + custom slug + 8G WAF   ║"
 echo "║   L3  CrowdSec       apache2 + wordpress + appsec-wp     ║"
 echo "║   L4  Podman         cap-drop ALL, static IPs, DB=internal║"
 echo "║   L5  Kernel         rp_filter=2, syncookies, ip_forward ║"
-echo "║   L6  SSH            modern ciphers, key-only (if key set)║"
+if [ "${ADMIN_USER_CREATED:-0}" = "1" ]; then
+echo "║   L6  SSH            root login disabled — admin: ${ADMIN_USER} (doas for root)"
+else
+echo "║   L6  SSH            FALLBACK: admin account creation failed —"
+echo "║                      root SSH is active instead. Create one by"
+echo "║                      hand: adduser, addgroup <user> wheel,"
+echo "║                      apk add doas, permit persist :wheel"
+fi
 echo "╠════════════════════════════════════════════════════════════╣"
 echo "║  Tooling:                                                 ║"
 echo "║   update.sh status    — check + update all components    ║"
@@ -3813,11 +4835,86 @@ mount "$ROOT_PART" "$MNT" || msg_error "Could not mount $ROOT_PART"
 _MNT="$MNT"
 
 # ─ Root password ──────────────────────────────────────────────────────────────
+# Kept unconditionally — root SSH login is disabled below regardless of what
+# the operator chose, but this password still matters for local console
+# access (Proxmox `qm terminal` / serial0), which is unrelated to SSH.
 HASHED=$(openssl passwd -6 "$ROOT_PASS")
 if [[ -f "$MNT/etc/shadow" ]]; then
   sed -i "s|^root:[^:]*:|root:${HASHED}:|" "$MNT/etc/shadow"
 else
   printf "root:%s:0:0:99999:7:::\n" "$HASHED" > "$MNT/etc/shadow"; chmod 640 "$MNT/etc/shadow"
+fi
+
+# ─ Admin account + doas + QEMU Guest Agent (needs a live chroot w/ network) ───
+# BUG FIX (v7-6k): root SSH login is now disabled unconditionally (see the
+# SSH hardening block below) — per remaining_tasks.txt item 5 ("no dedicated
+# non-root admin account is created either way"), a real admin account
+# replaces it: wheel group + doas, so root is only ever reached deliberately
+# (doas), never as the SSH identity itself.
+# Creating that account means `adduser`/`addgroup` writing into the target
+# filesystem's own passwd/group/shadow — and installing doas needs apk +
+# network — both requiring a live chroot, exactly like the QEMU Guest Agent
+# pre-install already did on its own. Rather than mount and unmount /proc and
+# /dev twice for two separate chroot calls, this single chroot now does all
+# three (admin account, doas, guest agent); the mounts are left in place
+# afterward and torn down once, at the very end of injection, right before
+# the disk is unmounted — nothing else written between here and there cares
+# whether /proc or /dev happen to be bind-mounted under $MNT.
+# Each step below is independent (no `&&` chaining across concerns, nothing
+# feeds set -e a bare failing command) so a doas/network hiccup can't stop
+# the admin account or the guest agent from being set up, and vice versa —
+# each is verified separately afterward rather than inferred from one
+# shared exit code.
+# ADMIN_USER is interpolated into this otherwise-single-quoted chroot string
+# via close-quote/expand/reopen-quote — safe only because ADMIN_USER was
+# already constrained to ^[a-z][a-z0-9_-]{0,31}$ above; no shell metachar is
+# possible in it. SSH_KEYS and ADMIN_PASS are deliberately NOT interpolated
+# here at all (operator-supplied content, unvalidated) — both are written
+# host-side via plain redirection/sed after the chroot exits, the same way
+# root's own password and key already are, never passed through `sh -c`.
+cp /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
+mount --bind /proc "$MNT/proc" 2>/dev/null || true
+mount --bind /dev  "$MNT/dev"  2>/dev/null || true
+if chroot "$MNT" /bin/sh -c '
+  VER=$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || echo "3.23")
+  grep -q community /etc/apk/repositories 2>/dev/null \
+    || printf "\nhttps://dl-cdn.alpinelinux.org/alpine/v%s/community\n" \
+         "$VER" >> /etc/apk/repositories
+  apk update --quiet --no-progress 2>/dev/null
+
+  addgroup wheel 2>/dev/null || true
+  id "'"$ADMIN_USER"'" >/dev/null 2>&1 || adduser -D -s /bin/sh "'"$ADMIN_USER"'" 2>/dev/null
+  addgroup "'"$ADMIN_USER"'" wheel 2>/dev/null || true
+
+  apk add --quiet --no-progress --no-cache doas 2>/dev/null
+  mkdir -p /etc/doas.d
+  echo "permit persist :wheel" > /etc/doas.d/doas.conf
+  chown root:root /etc/doas.d/doas.conf
+  chmod 0400 /etc/doas.d/doas.conf
+
+  apk add --quiet --no-progress --no-cache qemu-guest-agent 2>/dev/null
+  ln -sf /etc/init.d/qemu-guest-agent /etc/runlevels/default/qemu-guest-agent 2>/dev/null
+' 2>/dev/null; then
+  msg_ok "QEMU Guest Agent pre-installed"
+else
+  msg_warn "Guest agent pre-install skipped (will install on first boot)"
+fi
+
+# Verify the admin account independently of the chroot's own exit status
+# (that status reflects the LAST command in the script above, i.e. the
+# guest-agent symlink — a doas/network failure earlier must not be read as
+# "admin account missing" or vice versa). grep's non-match is a real
+# possible outcome here, not a bug, so this is an explicit if — under
+# set -e a bare failing grep outside a conditional would abort the script.
+ADMIN_USER_CREATED=0
+ADMIN_UID="" ADMIN_GID=""
+if grep -q "^${ADMIN_USER}:" "$MNT/etc/passwd" 2>/dev/null; then
+  ADMIN_USER_CREATED=1
+  ADMIN_UID=$(grep "^${ADMIN_USER}:" "$MNT/etc/passwd" | cut -d: -f3)
+  ADMIN_GID=$(grep "^${ADMIN_USER}:" "$MNT/etc/passwd" | cut -d: -f4)
+  msg_ok "Admin account: ${ADMIN_USER} (uid ${ADMIN_UID}), wheel + doas configured"
+else
+  msg_warn "Admin account creation failed — root SSH will be used as a fallback (see summary)"
 fi
 
 # ─ Hostname ───────────────────────────────────────────────────────────────────
@@ -3826,8 +4923,32 @@ grep -q "$HN" "$MNT/etc/hosts" 2>/dev/null || echo "127.0.1.1  $HN" >> "$MNT/etc
 
 # ─ SSH hardening ──────────────────────────────────────────────────────────────
 SSHCFG="$MNT/etc/ssh/sshd_config"; mkdir -p "$MNT/etc/ssh"
-[[ $DISABLE_PW_AUTH -eq 1 ]] && { _PWAUTH="no"; _ROOTLOGIN="prohibit-password"; } \
-                              || { _PWAUTH="yes"; _ROOTLOGIN="yes"; }
+[[ $DISABLE_PW_AUTH -eq 1 ]] && _PWAUTH="no" || _PWAUTH="yes"
+
+if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
+  # Normal path: root SSH is fully disabled — the admin account (wheel +
+  # doas, created in the chroot above) is the only way in.
+  _ROOTLOGIN="no"
+  ADMIN_HASHED=$(openssl passwd -6 "$ADMIN_PASS")
+  sed -i "s|^${ADMIN_USER}:[^:]*:|${ADMIN_USER}:${ADMIN_HASHED}:|" "$MNT/etc/shadow"
+  if [[ -n "$SSH_KEYS" ]]; then
+    mkdir -p "$MNT/home/${ADMIN_USER}/.ssh"
+    echo "$SSH_KEYS" > "$MNT/home/${ADMIN_USER}/.ssh/authorized_keys"
+    chmod 700 "$MNT/home/${ADMIN_USER}/.ssh"
+    chmod 600 "$MNT/home/${ADMIN_USER}/.ssh/authorized_keys"
+    chown -R "${ADMIN_UID}:${ADMIN_GID}" "$MNT/home/${ADMIN_USER}"
+  fi
+else
+  # FALLBACK — should be rare, adduser is a simple local-filesystem
+  # operation with no network dependency. If the admin account genuinely
+  # couldn't be created, root SSH is re-enabled as a safety net rather than
+  # leaving the VM completely unreachable over SSH after first boot. This
+  # is a degraded state, not a final one — flagged loudly here and again in
+  # the closing summary; fix by hand after boot: adduser, addgroup <user>
+  # wheel, apk add doas, echo 'permit persist :wheel' > /etc/doas.d/doas.conf.
+  [[ $DISABLE_PW_AUTH -eq 1 ]] && _ROOTLOGIN="prohibit-password" || _ROOTLOGIN="yes"
+fi
+
 cat > "$SSHCFG" << SSHEOF
 PermitRootLogin ${_ROOTLOGIN}
 PasswordAuthentication ${_PWAUTH}
@@ -3847,10 +4968,58 @@ KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sh
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 SSHEOF
 chmod 600 "$SSHCFG"
-if [[ -n "$SSH_KEYS" ]]; then
+
+if [[ "$ADMIN_USER_CREATED" -ne 1 && -n "$SSH_KEYS" ]]; then
+  # Only reached in the fallback branch above — normal path puts the key on
+  # the admin account instead (see the ADMIN_USER_CREATED block above).
   mkdir -p "$MNT/root/.ssh"
   echo "$SSH_KEYS" > "$MNT/root/.ssh/authorized_keys"
   chmod 700 "$MNT/root/.ssh"; chmod 600 "$MNT/root/.ssh/authorized_keys"
+fi
+
+if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
+  msg_ok "SSH: ${ADMIN_USER} ($([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')), root login disabled"
+else
+  msg_warn "SSH: FALLBACK — root login (${_ROOTLOGIN}), admin account unavailable"
+fi
+
+# ─ Admin credentials note (only what the operator doesn't already know) ──────
+# ROOT_PASS is never written to disk in plaintext (the operator typed it, no
+# need to also leave a copy lying around) — same treatment here. The
+# operator-chosen admin password (no-key path) is likewise never written.
+# The AUTO-GENERATED admin password (key-provided path, used only by doas —
+# see the SSH access prompt) is the one exception: nobody typed it, so
+# without writing it down it would be permanently unusable, exactly like the
+# openssl-rand DB passwords already documented in /root/.wp-credentials.
+if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
+  if [[ -n "$SSH_KEYS" ]]; then
+    cat > "$MNT/root/.wp-admin-credentials" << ADMINCREDS
+# ============================================================
+# Admin account — generated by create-wordpress-vm.sh
+# chmod 600 /root/.wp-admin-credentials
+# ============================================================
+# Username : ${ADMIN_USER}
+# SSH      : key-only (the public key supplied during provisioning)
+# Password : ${ADMIN_PASS}
+#   Not used for SSH (password login is disabled) — only for 'doas'
+#   once logged in, or as a local-console recovery password.
+# doas     : any command as root, e.g.  doas -s   (interactive root shell)
+# ============================================================
+ADMINCREDS
+  else
+    cat > "$MNT/root/.wp-admin-credentials" << ADMINCREDS
+# ============================================================
+# Admin account — generated by create-wordpress-vm.sh
+# chmod 600 /root/.wp-admin-credentials
+# ============================================================
+# Username : ${ADMIN_USER}
+# SSH      : password (the one set during provisioning)
+# doas     : any command as root, e.g.  doas -s   (interactive root shell)
+# ============================================================
+ADMINCREDS
+  fi
+  chmod 600 "$MNT/root/.wp-admin-credentials"
+  msg_ok "/root/.wp-admin-credentials written (chmod 600)"
 fi
 
 # ─ nftables ───────────────────────────────────────────────────────────────────
@@ -3904,11 +5073,12 @@ GEOIP_WHITELIST="${GEOIP_WHITELIST:-}"
 GEOIP_BLOCKLIST="${GEOIP_BLOCKLIST:-}"
 MAXMIND_ACCOUNT_ID="${MAXMIND_ACCOUNT_ID:-}"
 MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
-ROOTLESS_MODE="${ROOTLESS_MODE:-0}"
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
+ADMIN_USER="${ADMIN_USER}"
+ADMIN_USER_CREATED="${ADMIN_USER_CREATED:-0}"
 INSTALLERENV
 chmod 600 "$MNT/etc/wp-install/vars.sh"
-msg_ok "Installer vars injected (slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE}, geoip=${GEOIP_ENABLED:-0}, rootless=${ROOTLESS_MODE:-0}, digest-pin=${USE_DIGEST_PINNING:-1})"
+msg_ok "Installer vars injected (slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE}, geoip=${GEOIP_ENABLED:-0}, digest-pin=${USE_DIGEST_PINNING:-1}, admin=${ADMIN_USER})"
 
 # ─ Apache security config (host-built, CIDRs/IPs already substituted) ─────────
 # The installer reads this from /root/wp-security.conf and copies it to the
@@ -3960,22 +5130,11 @@ for s in cloud-init-local cloud-init cloud-config cloud-final; do
   rm -f "$MNT/etc/runlevels/"{default,boot,sysinit}"/$s" 2>/dev/null || true
 done
 
-# ─ Pre-install QEMU Guest Agent ───────────────────────────────────────────────
-cp /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
-mount --bind /proc "$MNT/proc" 2>/dev/null || true
-mount --bind /dev  "$MNT/dev"  2>/dev/null || true
-chroot "$MNT" /bin/sh -c '
-  VER=$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || echo "3.23")
-  grep -q community /etc/apk/repositories 2>/dev/null \
-    || printf "\nhttps://dl-cdn.alpinelinux.org/alpine/v%s/community\n" \
-         "$VER" >> /etc/apk/repositories
-  apk update --quiet --no-progress 2>/dev/null
-  apk add   --quiet --no-progress --no-cache qemu-guest-agent 2>/dev/null
-  ln -sf /etc/init.d/qemu-guest-agent /etc/runlevels/default/qemu-guest-agent 2>/dev/null
-' 2>/dev/null \
-  && msg_ok "QEMU Guest Agent pre-installed" \
-  || msg_warn "Guest agent pre-install skipped (will install on first boot)"
-
+# ─ Unmount ────────────────────────────────────────────────────────────────────
+# /proc and /dev were bind-mounted much earlier (right after the root
+# password block) for the combined admin-account/doas/QEMU-agent chroot —
+# see the comment there for why the mounts were left in place since then
+# instead of being torn down and remounted a second time.
 umount "$MNT/dev"  2>/dev/null || true
 umount "$MNT/proc" 2>/dev/null || true
 umount "$MNT" && _MNT=""
@@ -4073,19 +5232,19 @@ printf "  ║  Alpine   :  %-47s║\n"  "$ALPINE_VER"
 printf "  ║  Resources:  %-47s║\n"  "${CORES} CPU · ${RAM} MB · ${DISK}"
 printf "  ║  MAC      :  %-47s║\n"  "${VM_MAC:-see: qm config $VMID}"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"
-printf "  ║  SSH      :  %-47s║\n" "$([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only (password disabled)' || echo 'password enabled (no key)')"
+if [[ "${ADMIN_USER_CREATED:-0}" -eq 1 ]]; then
+  _SSH_DESC="${ADMIN_USER} — $([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password'), root SSH disabled"
+else
+  _SSH_DESC="FALLBACK: root SSH ($([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')) — admin account failed"
+fi
+printf "  ║  SSH      :  %-47s║\n" "$_SSH_DESC"
+[[ "${ADMIN_USER_CREATED:-0}" -eq 0 ]] && printf "  ║  ${RD}⚠ Admin account was NOT created — see install log, create by hand${CL}  ║\n"
 printf "  ║  L1 nftables   SSH=%-12s  Web=%-21s║\n" "${SSH_CIDR:-any}" "${WEB_CIDR:-any}"
 printf "  ║  L2 wp-admin   cidr=%-11s  extra-ip=%-16s║\n" "${ADMIN_CIDR:-open}" "${ALLOWED_ADMIN_IP:-none}"
 printf "  ║  mod_remoteip  proxy=%-40s║\n"  "${PROXY_IP:-not configured (direct)}"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"
-  # Pre-compute summary values using if/else (avoids quote-in-subshell issues)
-  if [[ "${ROOTLESS_MODE:-0}" == "1" ]]; then
-    _WP_PORT_DESC="6.9.4-php8.3-apache → port 8080 (rootless)"
-    _MODE_DESC="rootless (wpuser, nftables 80→8080)"
-  else
-    _WP_PORT_DESC="6.9.4-php8.3-apache → port 80 (rootful)"
-    _MODE_DESC="rootful (default)"
-  fi
+  # Pre-compute summary values (avoids quote-in-subshell issues)
+  _WP_PORT_DESC="6.9.4-php8.3-apache → port 80"
   if [[ -n "${VM_STATIC_IP}" ]]; then
     _NET_DESC="${NET_MODE:-dhcp} → ${VM_STATIC_IP}/${VM_PREFIX} via ${VM_GATEWAY}"
   else
@@ -4105,7 +5264,6 @@ echo   "  ╠══════════════════════�
   echo   "  ║  Networking: netavark firewall_driver=nftables (no iptables)║"
   echo   "  ║  nftables forward: wp-front 10.89.10.0/24 + wp-db 10.89.20.0/24,║"
   echo   "  ║  all else DROP. wp-db is --internal (MariaDB has no egress) ║"
-  printf "  ║  Podman mode:   %-44s║\n" "${_MODE_DESC}"
   printf "  ║  Network:       %-44s║\n" "${_NET_DESC}"
   printf "  ║  GeoIP:         %-44s║\n" "${_GEO_DESC}"
   [[ -n "${WP_ADMIN_SLUG}" ]] && printf "  ║  Custom slug:   %-44s║\n" "/${WP_ADMIN_SLUG}-login"
