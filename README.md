@@ -1,6 +1,6 @@
 # WordPress VM Provisioner for Proxmox VE
 
-A single Bash script (`create-wordpress-vm-v7-8.sh`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec, with layered firewalling, SHA256 image pinning, optional GeoIP filtering, and a full day-2 update/rollback toolchain baked in.
+A single Bash script (`wpinstall.sh`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec, with layered firewalling, SHA256 image pinning, optional GeoIP filtering, and a full day-2 update/rollback toolchain baked in.
 
 No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer a dozen interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and automated backups.
 
