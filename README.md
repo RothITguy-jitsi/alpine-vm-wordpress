@@ -392,7 +392,3 @@ None of this is exotic to fix, and it's called out here rather than left implici
 - [Alpine Linux](https://alpinelinux.org/)
 
 ---
-
-## License
-
-No license has been chosen for this repository yet — add one (MIT, Apache-2.0, GPL, etc.) before treating this as open source. Note that the 8G Firewall ruleset embedded in the generated `.htaccess` carries its own "free for all use, keep credit intact" terms from Perishable Press, independent of whatever license you pick for the script itself.
