@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
+# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT
 # =============================================================================
 #
 # v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
