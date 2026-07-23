@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT
+# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
 # v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
@@ -455,6 +455,101 @@
 #      stopped. Needs 127.0.0.1:18080 free on the VM; change
 #      WP_CANDIDATE_PORT in update.sh if that port is already in use for
 #      something else.
+#
+# v7-9 PATCH NOTES (on top of the v7-8 baseline) — MARIADB UPDATE PATH
+# HARDENED (do_db_update() only; MariaDB's own recreate-if-missing OpenRC
+# fallback and the daily backup cron are untouched by this entry):
+#  41. [CRITICAL] Three related gaps in do_db_update() — a backup step that
+#      could report success on a failed dump, a container-only rollback
+#      that left the actual data directory unprotected, and no check that
+#      WordPress could really use the new database before the rollback
+#      path was deleted — are fixed together, since all three share one
+#      root cause: nothing in this function actually verified the state it
+#      was trusting before discarding the only way back.
+#        (a) BACKUP VERIFICATION. The pre-update dump used to be
+#            `podman exec mariadb ... mariadb-dump ... | gzip > file`
+#            inside an `if ...; then`. In a pipeline, a shell's exit status
+#            is the LAST command's (gzip) — gzip happily exits 0
+#            compressing whatever bytes it received, including zero bytes
+#            from a mariadb-dump that failed outright (bad auth, dropped
+#            connection, disk full on the container side). The `if` could
+#            therefore report a successful backup for a truncated or
+#            entirely empty one. Fixed by never piping straight into gzip:
+#            mariadb-dump now writes to a plain .sql file first (so its
+#            OWN exit code, not gzip's, is what gets checked, with stderr
+#            captured separately for diagnostics), the result is checked
+#            for non-zero size AND mariadb-dump's own trailing
+#            "-- Dump completed on ..." marker — the same structural
+#            signal most production mysqldump/mariadb-dump backup scripts
+#            use to detect a truncated run — and only THEN is it
+#            compressed, with the resulting .gz verified via `gzip -t`
+#            before the backup is considered good. Any failure at any
+#            stage aborts the update before anything is stopped, with the
+#            raw dump's stderr printed for diagnosis.
+#        (b) DATA-DIRECTORY SNAPSHOT. The replacement MariaDB container
+#            always mounted the exact same bind-mount
+#            (/home/wpuser/wp/mysql) as the one being replaced, with no
+#            volume-level rollback point — only the logical dump from (a)
+#            existed, which is slow to restore under pressure, and if a
+#            new engine version mutates on-disk structures on startup (an
+#            InnoDB redo-log/system-table upgrade, for instance) even
+#            while ultimately failing to become healthy, "renaming the
+#            container back" does NOT undo whatever it already wrote to
+#            that directory. Fixed with a real filesystem-level snapshot:
+#            once MariaDB is confirmed stopped (and after a disk-space
+#            preflight sized off the live data directory, so a too-full
+#            disk aborts loudly with zero downtime instead of leaving
+#            services stopped), /home/wpuser/wp/mysql is copied wholesale
+#            to /home/wpuser/wp/mysql-preupdate-snapshot BEFORE the new
+#            image ever touches the real data directory. Every rollback
+#            path now restores from this snapshot (via same-filesystem
+#            `mv`, not a second slow copy) before the old container is
+#            ever restarted against that directory — and refuses to start
+#            it at all if the restored directory doesn't look like a real
+#            MariaDB data directory afterward (guarding against the
+#            official image's own behavior of silently initializing a
+#            brand-new EMPTY database against a missing/empty
+#            /var/lib/mysql, which would make catastrophic data loss look
+#            exactly like a clean, healthy rollback). The failed update's
+#            own data is kept alongside (timestamped) rather than deleted,
+#            in case it's ever needed for forensics. The snapshot itself
+#            is only removed once an update is confirmed fully healthy —
+#            see (c).
+#        (c) WORDPRESS-LEVEL HEALTH GATE. mariadb-health-check.sh passing
+#            used to be the ONLY gate before mariadb-old was deleted —
+#            proving MariaDB itself is healthy, but not that WordPress,
+#            the actual application, can use it (a schema-level
+#            incompatibility a generic SELECT 1 wouldn't catch, for
+#            instance). The old code also restarted WordPress with
+#            `|| true`, silently swallowing its own failure. WordPress is
+#            now validated with the same wp-health-check.sh depth (HTTP +
+#            PHP execution + DB name resolution + a real WordPress-
+#            credential query) used at every other health-check site in
+#            this script, and mariadb-old plus the pre-update snapshot are
+#            ONLY removed once that passes. If WordPress fails to restart,
+#            or restarts but can't actually use the new database, this now
+#            triggers the exact same full rollback as an unhealthy
+#            MariaDB — restoring the data-directory snapshot from (b) and
+#            restoring the old container from mariadb-old — instead of
+#            silently leaving a broken combination in place with the
+#            rollback container already gone.
+#      All three failure paths (MariaDB itself unhealthy, the new
+#      container failing to start at all, and WordPress failing to
+#      reconnect) now share one _db_rollback() helper instead of three
+#      separately-maintained copies, closing off the kind of drift between
+#      near-identical call sites that item 7/36 already had to fix once
+#      for this same function's rename/start error handling. Empirically
+#      confirmed (not assumed) that every bare call into this helper needs
+#      an explicit `|| true` guard: update.sh runs under `set -e`, and a
+#      function returning non-zero as a plain statement aborts the whole
+#      script immediately — which would have skipped the rest of
+#      do_db_update() AND, from do_digest_check()/`update.sh all`,
+#      prevented CrowdSec from ever being checked after a MariaDB failure.
+#      NOT changed by this entry (tracked separately): mariadb-upgrade's
+#      own exit status is still unchecked (open finding #5); the daily
+#      backup cron job has the identical pipe-to-gzip pattern as (a) above
+#      and was intentionally left as-is, since this entry is scoped to
+#      do_db_update() only.
 #
 # ROOTFUL DEPLOYMENT (fixed design — not a dated note):
 #   MariaDB   — rootful, --cap-drop ALL + 5 caps, isolated to wp-db
@@ -3084,6 +3179,14 @@ CS_REGISTRY="docker.io/crowdsecurity/crowdsec"
 # the VM already binds it.
 WP_CANDIDATE_PORT="18080"
 
+# MariaDB's bind-mounted data directory, and where do_db_update() keeps a
+# pre-update filesystem snapshot of it before the new image ever touches
+# the real thing — see the v7-9 header notes (item 41b) for the full
+# rationale. Both live on the VM's single root filesystem, same as
+# everything else this script writes.
+DB_DATA_DIR="/home/wpuser/wp/mysql"
+DB_SNAPSHOT_DIR="/home/wpuser/wp/mysql-preupdate-snapshot"
+
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: Must run as root"; exit 1; }
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
@@ -3628,19 +3731,154 @@ do_wp_update() {
   fi
 }
 
+# ── v7-9: MariaDB data-directory snapshot helpers (items 41a/41b/41c) ──────
+# Shared by do_db_update() so its normal-failure and rollback paths all use
+# the exact same restore logic instead of three near-identical copies — the
+# kind of drift item 7/36 already had to clean up once for this same
+# function's rename/start error handling.
+
+# _snapshot_space_ok: true if there's enough free space on the filesystem
+# backing DB_DATA_DIR to hold a full copy of it. Sized off a live `du` of
+# the current data directory, plus 10% and a fixed ~350MB floor that covers
+# both copy overhead and the MariaDB image this same update is about to
+# pull — both draw on the same VM disk. Checked BEFORE anything is stopped,
+# so a too-full disk aborts loudly with zero downtime instead of leaving
+# WordPress/MariaDB stopped partway through an update.
+_snapshot_space_ok() {
+  local data_kb avail_kb need_kb
+  data_kb=$(du -sk "$DB_DATA_DIR" 2>/dev/null | awk '{print $1}' || true)
+  avail_kb=$(df -Pk "$DB_DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
+  [ -n "$data_kb" ] && [ -n "$avail_kb" ] || return 1
+  need_kb=$(( data_kb + data_kb / 10 + 358400 ))
+  [ "$avail_kb" -ge "$need_kb" ]
+}
+
+# _data_dir_looks_valid: true if DB_DATA_DIR looks like a real, non-empty
+# MariaDB data directory. Exists purely so _db_rollback() never starts
+# mariadb-old against a directory that's missing or empty — the official
+# MariaDB image auto-initializes a brand-new EMPTY database the instant it
+# sees an empty /var/lib/mysql, which would make catastrophic data loss
+# look exactly like a clean, healthy rollback.
+_data_dir_looks_valid() {
+  [ -d "$DB_DATA_DIR" ] || return 1
+  [ -d "${DB_DATA_DIR}/mysql" ] || return 1
+  [ -n "$(ls -A "$DB_DATA_DIR" 2>/dev/null)" ]
+}
+
+# _restore_snapshot: restores DB_DATA_DIR from DB_SNAPSHOT_DIR. Must only be
+# called with no container mounting DB_DATA_DIR — do_db_update() always
+# stops+removes the failed new "mariadb" before calling this. Uses `mv` (a
+# same-filesystem rename), not a copy, so this is fast regardless of
+# database size. The failed update's own data is kept alongside
+# (timestamped), not deleted, in case it's ever needed for forensics.
+_restore_snapshot() {
+  if [ ! -d "$DB_SNAPSHOT_DIR" ]; then
+    echo "✗✗ No pre-update snapshot found at ${DB_SNAPSHOT_DIR} — nothing to" >&2
+    echo "   restore from. ${DB_DATA_DIR} is left exactly as the failed" >&2
+    echo "   update left it." >&2
+    return 1
+  fi
+  local failed_dir="${DB_DATA_DIR}.failed-$(date +%Y%m%d-%H%M%S)"
+  if ! mv "$DB_DATA_DIR" "$failed_dir" 2>/dev/null; then
+    echo "✗✗ Could not move ${DB_DATA_DIR} aside — restore aborted, left untouched." >&2
+    return 1
+  fi
+  if mv "$DB_SNAPSHOT_DIR" "$DB_DATA_DIR" 2>/dev/null; then
+    echo "  ✔  Data directory restored from the pre-update snapshot." >&2
+    echo "     The failed update's own data was kept for inspection at:" >&2
+    echo "       ${failed_dir}" >&2
+    echo "     Remove it once you're satisfied it's not needed: rm -rf ${failed_dir}" >&2
+    return 0
+  fi
+  echo "✗✗ Could not move the snapshot into place. Restoring the pre-restore" >&2
+  echo "   directory instead so there's SOMETHING there, but this is the" >&2
+  echo "   UN-rolled-back state — investigate by hand:" >&2
+  echo "     ${DB_DATA_DIR} (put back)  /  snapshot still at ${DB_SNAPSHOT_DIR}  /  also see ${failed_dir}" >&2
+  mv "$failed_dir" "$DB_DATA_DIR" 2>/dev/null || true
+  return 1
+}
+
+# _db_rollback: shared rollback path for do_db_update(), used whether the
+# new MariaDB never started, started but failed its own health check, or
+# looked healthy but WordPress couldn't actually use it. Tears down the
+# failed new "mariadb" (if any), restores the data directory from the
+# pre-update snapshot — the new engine may have mutated on-disk state even
+# without ever reporting healthy — then restores and restarts mariadb-old
+# under the original name, restarts WordPress, and reports the outcome.
+# $1 = human-readable reason, used in the opening status line.
+#
+# Every bare call into this function elsewhere in do_db_update() MUST be
+# guarded with `|| true` (e.g. `_db_rollback "reason" || true`) — this
+# function always returns 1, and update.sh runs under `set -e`, under which
+# an unguarded function call returning non-zero aborts the ENTIRE script
+# immediately (confirmed empirically, not assumed), which would skip the
+# `return 1` that follows and, from do_digest_check()/`update.sh all`,
+# would prevent CrowdSec from ever being checked after a MariaDB failure.
+_db_rollback() {
+  local reason="$1"
+  echo "✗  ${reason} — rolling back…" >&2
+  podman stop wordpress >/dev/null 2>&1 || true
+  podman stop mariadb   >/dev/null 2>&1 || true
+  podman rm -f mariadb  >/dev/null 2>&1 || true
+  _restore_snapshot || true
+  if ! _data_dir_looks_valid; then
+    echo "✗✗ CRITICAL: ${DB_DATA_DIR} does not look like a valid MariaDB data" >&2
+    echo "   directory after the restore attempt — refusing to start MariaDB" >&2
+    echo "   against it (an empty/missing directory would make the container" >&2
+    echo "   silently initialize a brand-new EMPTY database instead of failing" >&2
+    echo "   loudly). Manual recovery needed now — inspect before doing anything:" >&2
+    echo "     ls -la ${DB_DATA_DIR}" >&2
+    echo "     ls -la ${DB_SNAPSHOT_DIR} 2>/dev/null   (pre-update snapshot, if still present)" >&2
+    echo "   Logical backup: ${BACKUP_FILE}" >&2
+    return 1
+  fi
+  if podman rename mariadb-old mariadb && podman start mariadb >/dev/null 2>&1; then
+    local rb_db_ok=0
+    for i in $(seq 1 12); do
+      if [ -x /usr/local/bin/mariadb-health-check.sh ]; then
+        /usr/local/bin/mariadb-health-check.sh mariadb >/dev/null 2>&1 && { rb_db_ok=1; break; }
+      elif podman exec mariadb sh -c \
+        'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null ||
+         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null'; then
+        rb_db_ok=1; break
+      fi
+      sleep 5
+    done
+    if podman start wordpress >/dev/null 2>&1; then
+      if [ "$rb_db_ok" = "1" ]; then
+        echo "✗  Rolled back to ${DB_TAG:-previous} — data directory restored from the pre-update snapshot." >&2
+      else
+        echo "✗  Rolled back to ${DB_TAG:-previous}, but the restored MariaDB failed its" >&2
+        echo "   own health check — investigate now: mariadb-health-check.sh mariadb" >&2
+      fi
+    else
+      echo "  ⚠  Rolled back to ${DB_TAG:-previous} but WordPress did not restart — start it manually: podman start wordpress" >&2
+    fi
+    echo "✗  Logical backup: ${BACKUP_FILE}" >&2
+    return 1
+  fi
+  echo "✗✗ ROLLBACK FAILED — mariadb-old could not be restored to 'mariadb'" >&2
+  echo "   and/or started. The database is DOWN. Manual recovery needed now:" >&2
+  echo "     podman ps -a --filter name=mariadb" >&2
+  echo "     podman rename mariadb-old mariadb && podman start mariadb && podman start wordpress" >&2
+  echo "   Logical backup: ${BACKUP_FILE}" >&2
+  return 1
+}
+
 do_db_update() {
   local target_ver="${1:-${DB_TAG:-$PINNED_DB_VER}}"
   echo "── MariaDB ────────────────────────────────────────────────────"
   [ -n "$1" ] && { validate_image_tag "$1" || return 1; }
   echo "  Pinned  : tag=${DB_TAG:-none}  digest=${DB_DIGEST:-none}"
   echo "  Target  : ${DB_REGISTRY}:${target_ver}"
-  echo "  Data    : /home/wpuser/wp/mysql (bind-mount — never removed)"
+  echo "  Data    : ${DB_DATA_DIR} (bind-mount — never removed)"
+  echo "  Rollback: snapshotted to ${DB_SNAPSHOT_DIR} before the swap, removed after a verified success"
 
   _check_component "$DB_REGISTRY" "$DB_TAG" "$DB_DIGEST" "$target_ver"
   case "$_UPD_ACTION" in
     skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
-    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it? (backup taken first)" || { echo "   Skipped."; return 0; } ;;
-    bump) ask_yn "Update MariaDB to ${target_ver}? (backup taken first)" || { echo "   Skipped."; return 0; } ;;
+    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it? (backup + data-directory snapshot taken first)" || { echo "   Skipped."; return 0; } ;;
+    bump) ask_yn "Update MariaDB to ${target_ver}? (backup + data-directory snapshot taken first)" || { echo "   Skipped."; return 0; } ;;
   esac
 
   setup_trivy
@@ -3658,14 +3896,56 @@ do_db_update() {
   # between this early check and the actual rename attempt.
   require_clean_container_state mariadb mariadb-old || return 1
 
+  # v7-9 (item 41a): mariadb-dump no longer pipes straight into gzip — see
+  # the header note for the full rationale. It writes to a plain .sql file
+  # first (so its OWN exit status, not gzip's, is what gets checked), the
+  # result is checked for size and mariadb-dump's own trailing completion
+  # marker, and only THEN is it compressed and the archive integrity-
+  # checked with gzip -t.
   BACKUP_FILE="/root/wp-db-backup-$(date +%Y%m%d-%H%M%S).sql.gz"
+  BACKUP_RAW="${BACKUP_FILE%.gz}"
   echo "  → Backing up to ${BACKUP_FILE}…"
-  if podman exec mariadb sh -c \
+  BACKUP_OK=0
+  if ( umask 077; podman exec mariadb sh -c \
        'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
-       | gzip > "${BACKUP_FILE}"; then
-    echo "  ✔  Backup: ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
+       > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err" ); then
+    if [ -s "${BACKUP_RAW}" ] && tail -c 200 "${BACKUP_RAW}" | grep -q "Dump completed"; then
+      if gzip -f "${BACKUP_RAW}" && gzip -t "${BACKUP_FILE}" 2>/dev/null; then
+        chmod 600 "${BACKUP_FILE}" 2>/dev/null || true
+        BACKUP_OK=1
+      else
+        echo "✗  Compressing or verifying the backup archive failed." >&2
+      fi
+    else
+      echo "✗  mariadb-dump's output looks incomplete (empty, or missing its own" >&2
+      echo "   trailing completion marker) — treating this as a failed backup even" >&2
+      echo "   though the command itself exited 0." >&2
+    fi
   else
-    echo "✗  Backup failed — aborting. Fix the database before retrying."; return 1
+    echo "✗  mariadb-dump exited with an error." >&2
+  fi
+  if [ "$BACKUP_OK" != "1" ]; then
+    if [ -s "${BACKUP_RAW}.err" ]; then
+      echo "   mariadb-dump stderr:" >&2
+      sed 's/^/     /' "${BACKUP_RAW}.err" >&2 || true
+    fi
+    rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" "${BACKUP_FILE}" 2>/dev/null || true
+    echo "✗  Backup failed — aborting. Fix the database before retrying."
+    return 1
+  fi
+  rm -f "${BACKUP_RAW}.err" 2>/dev/null || true
+  echo "  ✔  Backup verified (dump completed + archive integrity OK): ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
+
+  # v7-9 (item 41b): fail fast — before anything is stopped — if there
+  # isn't room for the pre-update data-directory snapshot taken further
+  # below. See _snapshot_space_ok()'s own comment for the headroom math.
+  echo "  → Checking free disk space for a pre-update data-directory snapshot…"
+  if ! _snapshot_space_ok; then
+    echo "✗  Not enough free disk space to safely snapshot ${DB_DATA_DIR} before" >&2
+    echo "   this update — aborting before touching any running container. Free" >&2
+    echo "   up space (or grow the VM disk) and retry. The logical backup above" >&2
+    echo "   is still on disk and valid: ${BACKUP_FILE}" >&2
+    return 1
   fi
 
   echo "  → Pulling ${_UPD_PULL_REF}…"
@@ -3709,8 +3989,27 @@ do_db_update() {
     podman start wordpress >/dev/null 2>&1 || true
     return 1
   }
+
+  # v7-9 (item 41b): the actual pre-update snapshot — taken only once
+  # MariaDB is confirmed stopped (so it's crash-consistent) and BEFORE the
+  # new image is ever started against the real data directory. Every
+  # rollback path (_db_rollback(), via _restore_snapshot()) restores from
+  # this with a same-filesystem `mv`, not a second slow copy.
+  echo "  → Snapshotting the data directory (rollback safety net)…"
+  rm -rf "$DB_SNAPSHOT_DIR" 2>/dev/null || true
+  if ! cp -a "$DB_DATA_DIR" "$DB_SNAPSHOT_DIR"; then
+    echo "✗  Could not snapshot ${DB_DATA_DIR} — aborting before the new MariaDB" >&2
+    echo "   image ever touches it. Restarting the existing database untouched." >&2
+    rm -rf "$DB_SNAPSHOT_DIR" 2>/dev/null || true
+    podman start mariadb   >/dev/null 2>&1 || true
+    podman start wordpress >/dev/null 2>&1 || true
+    return 1
+  fi
+  echo "  ✔  Snapshot ready: ${DB_SNAPSHOT_DIR} ($(du -sh "$DB_SNAPSHOT_DIR" 2>/dev/null | cut -f1))"
+
   if ! podman rename mariadb mariadb-old; then
     echo "✗  Unable to prepare MariaDB rollback container — aborting."
+    rm -rf "$DB_SNAPSHOT_DIR" 2>/dev/null || true
     podman start mariadb   >/dev/null 2>&1 || true
     podman start wordpress >/dev/null 2>&1 || true
     return 1
@@ -3720,6 +4019,7 @@ do_db_update() {
   if [ "$DB_OLD_RUNNING" != "false" ]; then
     echo "✗  mariadb-old is still running — refusing to start a second MariaDB"
     echo "   instance against the same data directory. Update aborted."
+    rm -rf "$DB_SNAPSHOT_DIR" 2>/dev/null || true
     podman start wordpress >/dev/null 2>&1 || true
     return 1
   fi
@@ -3770,49 +4070,62 @@ do_db_update() {
 
     if [ "$DB_READY" = "1" ]; then
       echo "  → mariadb-upgrade (no-op if not needed)…"
+      # mariadb-upgrade's own exit status is still not checked here — open
+      # finding #5, intentionally out of scope for this patch (see
+      # Remaining_todo.docx). The WordPress-reconnect gate immediately below
+      # at least catches the case where an upgrade problem breaks
+      # WordPress's own queries.
       podman exec mariadb sh -c \
         'mariadb-upgrade -uroot -p"$MARIADB_ROOT_PASSWORD"' >/dev/null 2>&1 || true
-      podman start wordpress >/dev/null 2>&1 || true
-      podman stop mariadb-old 2>/dev/null; podman rm -f mariadb-old 2>/dev/null
-      # PRODUCTION SAFETY FIX (v7-6k): flag a leftover mariadb-old now — it
-      # will otherwise silently block the next update's preflight check.
-      podman container exists mariadb-old 2>/dev/null \
-        && echo "  ⚠  mariadb-old could not be fully removed — clean it up before the next update: podman rm -f mariadb-old" >&2
-      echo "✔  MariaDB updated to ${target_ver}. Backup: ${BACKUP_FILE}"
-      DB_TAG="$target_ver"; DB_DIGEST="${_UPD_DIGEST}"
-      _save_pinned
-    else
-      echo "✗  New MariaDB not ready — rolling back…"
-      podman stop mariadb 2>/dev/null; podman rm -f mariadb 2>/dev/null
-      # PRODUCTION SAFETY FIX (v7-6k): was `2>/dev/null` on the rename and
-      # start, discarding the one result that matters most — this IS the
-      # rollback. Check it and say so loudly if it doesn't work.
-      if podman rename mariadb-old mariadb && podman start mariadb >/dev/null 2>&1; then
-        podman start wordpress >/dev/null 2>&1 \
-          || echo "  ⚠  MariaDB rolled back but WordPress did not restart — start it manually: podman start wordpress" >&2
-        echo "✗  Rolled back. Backup: ${BACKUP_FILE}"
+
+      # v7-9 (item 41c): mariadb-old and the pre-update snapshot used to be
+      # deleted right after `podman start wordpress ... || true` — WordPress's
+      # own restart failure was swallowed, and nothing confirmed WordPress
+      # could actually USE the new database before the only way back was
+      # removed. WordPress is now validated with the same wp-health-check.sh
+      # depth (HTTP + PHP + DB name resolution + a real WordPress-credential
+      # query) used at every other health-check site in this script.
+      WP_RECONNECT_OK=0
+      if podman start wordpress >/dev/null 2>&1; then
+        echo "  → Confirming WordPress can actually use the updated database before removing the rollback container…"
+        for i in $(seq 1 6); do
+          if [ -x /usr/local/bin/wp-health-check.sh ]; then
+            if /usr/local/bin/wp-health-check.sh wordpress 80; then
+              WP_RECONNECT_OK=1; break
+            fi
+          else
+            if wget -qO- "http://127.0.0.1:80/" >/dev/null 2>&1; then
+              podman exec --user www-data wordpress php -r \
+                '$c=@mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"));exit($c?0:1);' \
+                >/dev/null 2>&1 && { WP_RECONNECT_OK=1; break; }
+            fi
+          fi
+          sleep 5
+        done
       else
-        echo "✗✗ ROLLBACK FAILED — mariadb-old could not be restored to 'mariadb'" >&2
-        echo "   and/or started. The database is DOWN. Manual recovery needed now:" >&2
-        echo "     podman ps -a --filter name=mariadb" >&2
-        echo "     podman rename mariadb-old mariadb && podman start mariadb && podman start wordpress" >&2
-        echo "   Backup taken before this update is still available: ${BACKUP_FILE}" >&2
+        echo "✗  WordPress failed to restart after the MariaDB swap." >&2
       fi
+
+      if [ "$WP_RECONNECT_OK" = "1" ]; then
+        podman stop mariadb-old 2>/dev/null; podman rm -f mariadb-old 2>/dev/null
+        # PRODUCTION SAFETY FIX (v7-6k): flag a leftover mariadb-old now — it
+        # will otherwise silently block the next update's preflight check.
+        podman container exists mariadb-old 2>/dev/null \
+          && echo "  ⚠  mariadb-old could not be fully removed — clean it up before the next update: podman rm -f mariadb-old" >&2
+        rm -rf "$DB_SNAPSHOT_DIR" 2>/dev/null || true
+        echo "✔  MariaDB updated to ${target_ver} — WordPress confirmed healthy against it. Backup: ${BACKUP_FILE}"
+        DB_TAG="$target_ver"; DB_DIGEST="${_UPD_DIGEST}"
+        _save_pinned
+      else
+        _db_rollback "WordPress did not come back healthy against the updated database" || true
+        return 1
+      fi
+    else
+      _db_rollback "New MariaDB did not pass health validation" || true
       return 1
     fi
   else
-    podman rm -f mariadb 2>/dev/null
-    if podman rename mariadb-old mariadb && podman start mariadb >/dev/null 2>&1; then
-      podman start wordpress >/dev/null 2>&1 \
-        || echo "  ⚠  MariaDB rolled back but WordPress did not restart — start it manually: podman start wordpress" >&2
-      echo "✗  Container start failed — rolled back. Backup: ${BACKUP_FILE}"
-    else
-      echo "✗✗ ROLLBACK FAILED — mariadb-old could not be restored to 'mariadb'" >&2
-      echo "   and/or started. The database is DOWN. Manual recovery needed now:" >&2
-      echo "     podman ps -a --filter name=mariadb" >&2
-      echo "     podman rename mariadb-old mariadb && podman start mariadb && podman start wordpress" >&2
-      echo "   Backup taken before this update is still available: ${BACKUP_FILE}" >&2
-    fi
+    _db_rollback "MariaDB container failed to start" || true
     return 1
   fi
 }
@@ -4097,6 +4410,7 @@ ok "update.sh installed (wp / db / crowdsec / os / digest-check / all)"
 ok "  Concurrent runs are now blocked by an exclusive lock at /run/lock/wordpress-update.lock"
 ok "  Container swaps (wp/db/crowdsec) now check every rename/start instead of discarding the result — a silent failure here used to be able to delete a still-healthy container"
 ok "  WordPress updates now validate the pulled image on a loopback candidate (127.0.0.1:18080) before cutting production over on :80"
+ok "  MariaDB updates now verify the backup dump itself, snapshot the data directory before the swap, and confirm WordPress can use the new database before mariadb-old is ever deleted"
 
 # ════════════════════════════════════════════════════════════════════════════
 # CROWDSEC
