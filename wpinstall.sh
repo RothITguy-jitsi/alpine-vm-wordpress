@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT
+# WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
 # v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
@@ -551,6 +551,400 @@
 #      and was intentionally left as-is, since this entry is scoped to
 #      do_db_update() only.
 #
+# v7-10 PATCH NOTES (on top of the v7-9 baseline) — MARIADB-UPGRADE EXIT
+# STATUS CHECKED (closes open finding #5, the last remaining gap v7-9 left
+# in do_db_update() itself):
+#  42. [HIGH] mariadb-upgrade's own exit status used to be discarded with a
+#      bare `|| true` — the one step in do_db_update() v7-9 explicitly left
+#      unhardened (see that entry's own closing note, just above). DB_READY
+#      passing right before this step only proves the new server accepts
+#      connections and InnoDB is initialized (mariadb-health-check.sh); it
+#      says nothing about mariadb-upgrade's own result, since that command
+#      hasn't run yet at that point. A non-zero exit means mariadb-upgrade
+#      hit something it couldn't reconcile on its own — an unrepairable
+#      table, a permission problem, a dropped connection mid-run — and
+#      continuing past that silently risked handing WordPress a database
+#      that only LOOKED ready. FIX: the exit status is now checked
+#      directly. Combined stdout+stderr is captured to a variable rather
+#      than a temp file (mariadb-upgrade prints even on a clean run —
+#      "already upgraded"-style lines — so this is captured purely for
+#      diagnostics on failure, never used as the pass/fail signal itself)
+#      and printed only if the command actually failed. That failure now
+#      routes through the same _db_rollback() helper item 41 built for
+#      this function's other failure paths, instead of being swallowed.
+#      The WordPress-reconnect health gate immediately after this step
+#      (item 41c) is unchanged and still runs either way: mariadb-upgrade's
+#      own exit code isn't necessarily exhaustive, so a schema issue that
+#      slips past it but goes on to break a real WordPress query is still
+#      caught there, same safety net as before this patch.
+#      Still open (unchanged by this entry — see Remaining_todo.docx): #3
+#      (stale mariadb hosts mapping), #8-#10 (state-file integrity), #11
+#      (MaxMind credentials in process args), #12-#15 (Alpine/digest/Trivy
+#      verification fail open), #16 (permissive WP HTTP check), #17
+#      (nftables egress policy still accept), and the daily backup cron's
+#      pipe-to-gzip pattern noted above.
+#      Related, but NOT fixed by this entry — spotted while empirically
+#      verifying (not assuming) that item 42's new failure path behaves
+#      the same as do_db_update()'s existing ones once it returns: both
+#      do_digest_check() and the `all` dispatch call do_wp_update /
+#      do_db_update / do_cs_update as unguarded bare statements, no `||
+#      true`, no surrounding if. Confirmed directly (a minimal repro under
+#      both dash and bash) that update.sh's own `set -e` aborts the entire
+#      process the moment any one of those returns non-zero, before the
+#      next call in the sequence ever runs — so a MariaDB failure (this
+#      entry's new check included, but equally every do_db_update()/
+#      do_wp_update() failure path that already existed before this patch)
+#      can still silently skip the CrowdSec check in `digest-check`/`all`,
+#      the exact outcome item 41's own comment says guarding _db_rollback()
+#      was meant to prevent. Guarding _db_rollback() only gets do_db_update()
+#      itself to its own `return 1` cleanly — it does not, by itself, stop
+#      that `return 1` from aborting the *caller's* sequence in turn. Not
+#      folded into item 42 because it isn't specific to mariadb-upgrade or
+#      to do_db_update() — it's a dispatch-level gap that would need
+#      do_digest_check()/`all` to track and continue past a per-component
+#      failure (e.g. `do_db_update ... || _fail=1`) and report the
+#      aggregate result at the end, which is a distinct piece of work.
+#
+# v7-11 PATCH NOTES (on top of the v7-10 baseline) — STALE MARIADB /etc/hosts
+# ENTRY REMOVED, DISCOVERY MADE EXPLICIT (closes open finding #3, the item
+# Remaining_todo.docx named as the next, cheapest, most contained step):
+#  43. [HIGH] `--add-host "mariadb:10.89.20.2"` is removed from every place
+#      this script creates a WordPress container — initial install, the
+#      GeoIP rebuild in wp-geoip-setup.sh, wp-container's OpenRC recreate-
+#      if-missing fallback, and both the throwaway validation candidate and
+#      the real cutover container inside do_wp_update() (five call sites,
+#      matching the audit's own count). It was never doing the job its own
+#      comment claimed: WORDPRESS_DB_HOST=mariadb:3306 already resolves
+#      "mariadb" via aardvark-dns on wp-db, which — unlike a static
+#      /etc/hosts line — always reflects whichever address a container
+#      named "mariadb" currently holds. The static entry was redundant
+#      with that at best; at worst, actively wrong, because glibc's
+#      default /etc/nsswitch.conf order is `hosts: files dns` — /etc/hosts
+#      is checked FIRST, and a match there is used outright, with DNS never
+#      consulted at all for that name once one exists there.
+#      CONCRETE FAILURE THIS CAUSED: do_db_update()'s replacement MariaDB
+#      deliberately gets no fixed --ip — its own comment explains why:
+#      "mariadb-old still holds its wp-db address until removed". Since
+#      mariadb-old isn't removed until the very end of a SUCCESSFUL update,
+#      the new "mariadb" container is not free to reuse .2 for the entire
+#      window that matters, and lands on some other address on essentially
+#      every real run. WordPress itself is never recreated by a database
+#      update (do_db_update() only stops/starts it), so the /etc/hosts
+#      baked into WordPress at its own last creation kept saying
+#      mariadb=10.89.20.2 — which by then pointed at nothing, since the OLD
+#      MariaDB at .2 had already been cleanly stopped earlier in the same
+#      update. Because `files` pre-empts `dns`, the exact WordPress-level
+#      health gate item 41c added specifically to decide whether to keep
+#      an update or roll it back (wp-health-check.sh's real mysqli SELECT 1
+#      against WORDPRESS_DB_HOST) would try .2, fail to connect, and report
+#      unhealthy — meaning that gate would fail and trigger a full
+#      rollback on what should have been a healthy update, essentially
+#      every time, not just in some rare edge case.
+#  44. [MEDIUM] `--network-alias mariadb` is added to all three places this
+#      script ever creates a MariaDB container — initial install, the
+#      mariadb-container OpenRC recreate-if-missing fallback, and (most
+#      importantly) do_db_update()'s replacement container, the one place
+#      that deliberately has no fixed --ip. This directly closes the
+#      audit's separate observation that "no --network-alias was added."
+#      Functionally this is close to a no-op — Podman/aardvark-dns already
+#      registers a container's own --name as a resolvable record for other
+#      containers on the same network, which is the exact mechanism item
+#      43 above now relies on exclusively — but making it an explicit,
+#      visible flag on every MariaDB creation is worth doing anyway: it's
+#      self-documenting (a reader doesn't need to know Podman's implicit
+#      name-registration behavior to see that this container is meant to
+#      be discoverable as "mariadb" regardless of its address), and it's
+#      cheap insurance against any future Podman/netavark change to that
+#      implicit behavior.
+#      WHAT THIS DOES NOT CHANGE: neither item above touches the network
+#      segmentation itself in any way. wp-db is still created with
+#      --internal (netavark configures no route out of it, full stop,
+#      independent of nftables state); MariaDB still has no published host
+#      port; the nftables forward chain still only allow-lists the
+#      wp-front (10.89.10.0/24) and wp-db (10.89.20.0/24) subnets with a
+#      default-drop policy otherwise. aardvark-dns for wp-db runs scoped to
+#      that network's own gateway (10.89.20.1) and only answers queries
+#      from containers already attached to wp-db — it cannot be reached
+#      from wp-front, from the host's external interface, or from the
+#      internet, so relying on it exclusively for "mariadb" resolution
+#      introduces no new path across the wp-front/wp-db boundary and no
+#      new attack surface. The only thing that changed is HOW WordPress
+#      looks up MariaDB's current address inside a boundary that was
+#      already closed — never whether that boundary itself holds.
+#      Two comments that referenced the removed --add-host entry are
+#      updated to match: do_db_update()'s "No --ip here either" note, and
+#      update.sh's own opening INTEGRATION NOTES block.
+#      Still open (unchanged by this entry — see Remaining_todo.docx):
+#      #8-#10 (state-file integrity), #11 (MaxMind credentials in process
+#      args), #12-#15 (Alpine/digest/Trivy verification fail open), #16
+#      (permissive WP HTTP check), #17 (nftables egress policy still
+#      accept), the daily backup cron's pipe-to-gzip pattern, and the
+#      do_digest_check()/`all` dispatch gap noted in the v7-10 entry above
+#      (still not folded in here either — it isn't specific to this
+#      finding any more than it was specific to mariadb-upgrade).
+#
+# v7-12 PATCH NOTES (on top of the v7-11 baseline) — STATE-FILE INTEGRITY +
+# CREDENTIAL EXPOSURE CLOSED (closes open findings #8, #9, #10, #11 — the
+# grouping Remaining_todo.docx named as the next, cheapest, most contained
+# step once v7-11 closed #3):
+#  45. [MED/HIGH] #8 — pinned.env written non-atomically. Both places this
+#      script writes /etc/wp-install/pinned.env — the installer's own
+#      first write, and update.sh's _save_pinned(), called after every
+#      successful wp/db/crowdsec update — used a direct
+#      `cat > pinned.env << EOF`, which truncates the target the instant
+#      the shell opens it, before a single byte of the heredoc body is
+#      written. Anything reading pinned.env in that window (a crash
+#      mid-write; wp-geoip-setup.sh reads this file independently of
+#      update.sh's own update-lock, which only guards state-changing
+#      update.sh subcommands against each other, not an unrelated reader)
+#      could see a truncated or empty file — not the old value and not the
+#      new one. FIX: both call sites now write to pinned.env.tmp.$$ in the
+#      same directory, chmod it, then `mv -f` it into place — mv within
+#      one directory is a single rename(2), POSIX-atomic, so a reader
+#      always sees either the complete old file or the complete new one.
+#  46. [MED/HIGH] #9 — pinned.env sourced without validating loaded
+#      values. The operator-supplied [VER] argument to
+#      `update.sh wp|db|crowdsec [VER]` has gone through
+#      validate_image_tag()/validate_digest_ref() since v7-6d (item 24)
+#      before it's used in an image reference — but
+#      WP_TAG/WP_DIGEST/DB_TAG/DB_DIGEST/CS_TAG/CS_DIGEST, loaded from
+#      pinned.env by a plain `. /etc/wp-install/pinned.env`, took a
+#      completely separate, unvalidated path into the exact same kind of
+#      reference. Not expected to ever fire against a pinned.env this
+#      version of update.sh wrote itself (see item 45 immediately above),
+#      but is a real gap against a pinned.env inherited from an older
+#      update.sh, a manual edit, or a file that predates item 45's
+#      atomic-write fix. FIX: every value pinned.env supplies is now run
+#      through the same two validators immediately after sourcing;
+#      anything that fails is discarded (reset to empty) rather than
+#      trusted, which the rest of the script already treats as "not
+#      pinned yet" and falls back to the PINNED_*_VER constants or a fresh
+#      resolve — never reaching a pull/run with an unvalidated string.
+#  47. [HIGH] #10 — vars.sh serialized with no escaping. Every value
+#      written into /etc/wp-install/vars.sh — including free-text operator
+#      input (CrowdSec enrolment key, GeoIP country lists, MaxMind Account
+#      ID and License Key) — went through plain "${VAR}" interpolation
+#      into an otherwise-unquoted heredoc. A value containing a literal
+#      double-quote, backtick, or $(...) would break out of its
+#      VAR="..." assignment the moment vars.sh is next sourced — which
+#      happens as root, during Stage 2 on first boot, and on every later
+#      run of update.sh, wp-hardening.sh, and wp-geoip-setup.sh, all of
+#      which source this same file. FIX: new host-side _vars_q() wraps
+#      every value in single quotes, escaping any embedded single quote
+#      as '\'' (close quote, escaped literal quote, reopen quote) — plain
+#      POSIX single-quote escaping, applied uniformly to every field in
+#      the heredoc rather than a per-field judgment call about which ones
+#      "need" it. Deliberately NOT bash's own `printf %q`: %q can emit
+#      $'...' ANSI-C-quoted output for some inputs, which BusyBox ash
+#      (/bin/sh on the Alpine VM, and what update.sh / wp-hardening.sh /
+#      wp-geoip-setup.sh all source vars.sh under) does not reliably
+#      parse — using %q here could have silently broken the very file it
+#      was meant to make safer. Single-quote escaping is valid POSIX
+#      syntax in every Bourne-family shell without exception.
+#  48. [HIGH] #11 — MaxMind credentials in cron/process args. Both places
+#      this script invoked curl against MaxMind's download API — inside
+#      wp-geoip-setup.sh, and the weekly refresh line that script writes
+#      into /etc/crontabs/root — passed the license key directly as
+#      `curl -u "$MAXMIND_ACCOUNT_ID:$MAXMIND_LICENSE_KEY"`. A command's
+#      argv is visible to anything on the VM that can read
+#      /proc/<pid>/cmdline (or run `ps aux`) for as long as that command
+#      runs, and the cron line itself sat in /etc/crontabs/root with the
+#      credentials spelled out in plain text — readable by root only, but
+#      also re-exposed in argv every single Wednesday when cron actually
+#      ran it. FIX: wp-geoip-setup.sh now writes those credentials once,
+#      at the top of its own run, into /etc/wp-install/.maxmind-netrc
+#      (chmod 600, root-owned — the same protection level
+#      /etc/wordpress/env and /root/.wp-credentials already get elsewhere
+#      in this script) and passes --netrc-file to curl instead of -u, both
+#      in its own download and in the cron line it generates. The
+#      credentials themselves never appear on a command line again — only
+#      a file path does. Rewritten on every wp-geoip-setup.sh run, so an
+#      updated vars.sh — the script's own documented way to fix a bad
+#      MaxMind credential — is always picked up.
+#  49. [LOW] Discovered while implementing item 48: wp-geoip-setup.sh
+#      invoked curl for the GeoLite2 download without this script ever
+#      installing it anywhere on the Alpine VM itself (curl only appears
+#      pre-installed inside the transient, Debian-based apt-get build
+#      container used to compile mod_maxminddb — a completely different
+#      context). --netrc-file (item 48) isn't available in wget, the tool
+#      this script does reliably ensure is present, so this could no
+#      longer be sidestepped by switching tools. wp-geoip-setup.sh now
+#      installs curl itself before it's first needed (idempotent — a
+#      no-op if it's already present some other way), keeping this script
+#      genuinely standalone/rerunnable per its own header rather than
+#      silently depending on curl having arrived via some other path.
+#      Still open (unchanged by this entry — see Remaining_todo.docx):
+#      #12-#15 (Alpine/digest/Trivy verification fail open), #16
+#      (permissive WP HTTP check), #17 (nftables egress policy still
+#      accept), the daily backup cron's pipe-to-gzip pattern, and the
+#      do_digest_check()/`all` dispatch gap noted in the v7-10 entry above.
+#      Two related items were spotted but are NOT fixed by this entry,
+#      since neither is one of the 18 and both are meaningfully larger in
+#      scope than this patch: (a) ADMIN_CIDR / ALLOWED_ADMIN_IP / PROXY_IP
+#      / SSH_CIDR / WEB_CIDR flow into the Apache and nftables config
+#      heredocs the same way vars.sh's fields used to — but those are
+#      config files, not shell scripts that later get sourced and
+#      executed, so this is a config-injection question, not the
+#      command-injection question item 47 closes, and would need its own
+#      review of what nftables/Apache syntax actually needs escaping; (b)
+#      the CrowdSec console enrolment key is passed as a `podman exec`
+#      argument (`cscli console enroll ... "$CROWDSEC_ENROLL_KEY"`), which
+#      is visible in argv for the one-time enrolment call the same way the
+#      MaxMind key used to be — unlike curl, it's not established here
+#      whether cscli has an equivalent file-based credential input, so
+#      this is noted rather than guessed at.
+#
+# v7-13 PATCH NOTES (on top of v7-12) — DISPATCH AGGREGATION + BACKUP CRON +
+# TRIVY SUPPLY CHAIN + CANDIDATE ISOLATION + DEPLOYMENT PROFILE. Addresses
+# an independent audit (ChatGPT's forensic review of v7-11 that landed
+# after v7-12 shipped) — several of its findings duplicate items already
+# fixed in v7-12 (state-file integrity #10, vars.sh escaping #11, MaxMind
+# credential exposure #12 — closed by v7-12 items 45-49). The rest are
+# addressed here or documented with explicit reasoning:
+#  50. [HIGH] `update.sh all` and `update.sh digest-check` stopped at the
+#      first failing component (audit finding #5+#6). This dispatch-level
+#      gap was noted in v7-10 and again in v7-12's "related but not one
+#      of the 18" — folded in here now that the audit reraised it as
+#      HIGH. update.sh runs under set -e, so a WordPress registry blip
+#      during `digest-check` silently skipped the MariaDB and CrowdSec
+#      digest checks entirely — the operator saw a WordPress error and no
+#      information at all about the other two components. FIX: both
+#      dispatch paths now capture per-component return codes via `|| rc=$?`
+#      (which set -e does not treat as an error, per bash's own documented
+#      errexit exceptions), run every component regardless of prior
+#      failures, and print a per-component OK/FAILED summary at the end.
+#      Aggregate return status stays nonzero if any component failed, so
+#      cron and any calling script see the whole-run status they expect.
+#  51. [HIGH] Daily MariaDB backup cron used the same unsafe
+#      pipe-to-gzip pattern that v7-9 fixed inside do_db_update() (audit
+#      finding #7). Noted in v7-9 as "related but not one of the 18" and
+#      still open. Same failure mode: cron's default shell has no
+#      pipefail, so a `mariadb-dump` failure gets masked by gzip's
+#      exit-0 on empty input, producing a valid, empty, unrestorable
+#      .sql.gz that then rotates out yesterday's real good backup.
+#      FIX: new /usr/local/bin/wp-db-backup.sh reuses do_db_update()'s
+#      three-gate pattern — write raw .sql first (so mariadb-dump's own
+#      exit status is what's checked), confirm dump-completed marker
+#      present, gzip -t verify the archive — and rotates old backups
+#      ONLY after all three gates pass. A failed backup leaves yesterday's
+#      good archive untouched.
+#  52. [MEDIUM] WordPress HTTP health check accepted every status code
+#      other than 500 and 000 (audit finding #15). Which quietly waved
+#      through 401/403/404/429/502/503/504 — the exact list of "something
+#      is actually broken" codes a WordPress front page should never
+#      legitimately return on GET /. FIX: replaced with an explicit
+#      allowlist (200, 301, 302) applied identically at both call sites
+#      inside wp-health-check.sh. Any other code is now a real failure
+#      signal, not silently accepted.
+#  53. [MEDIUM/HIGH] scan_image() collapsed real vulnerability findings
+#      and scanner-side failures into the same "vulnerabilities detected"
+#      prompt (audit finding #14). Trivy's own convention is exit 0 =
+#      clean, exit 10 = findings, anything else = scanner problem —
+#      the old code used --exit-code 1 and swallowed stderr, so a DB
+#      download failure, registry timeout, or corrupt cache all looked
+#      like "review CVEs" to the operator. FIX: --exit-code 10 for
+#      findings, explicit case on the return code, and stderr captured
+#      to a temp file surfaced only when the scan itself fails —
+#      operators now see "scan did not complete" distinctly from "HIGH/
+#      CRITICAL detected", and can choose to proceed or abort with full
+#      information about why.
+#  54. [MEDIUM/HIGH] Trivy install.sh was fetched from the mutable
+#      `main` branch and executed as root (audit finding #13). This is
+#      the exact supply chain surface that produced the real Trivy
+#      v0.69.4 compromise (StepSecurity's writeup: malicious release
+#      exfiltrating RSA-encrypted C2 traffic to scan.aquasecurtiy.org,
+#      backdoor tpcp-docs repos created on every runner's GitHub account).
+#      FIX: both install sites (Stage 2 installer and update.sh's
+#      setup_trivy()) now fetch install.sh from a specific commit hash
+#      — the same commit aquasecurity's OWN setup-trivy Action pins to
+#      (PR #28, "Pin Trivy install script checkout to a specific
+#      commit"). raw.githubusercontent.com serves files by commit hash
+#      content-addressably, so a compromise of the trivy repo's main
+#      branch cannot change what this URL returns. Documented in-place
+#      that TRIVY_VER and TRIVY_INSTALL_COMMIT should be updated
+#      together after auditing any change to install.sh.
+#  55. [HIGH] WordPress candidate container mounted PRODUCTION's writable
+#      docroot and logs (audit finding #3 — a NEW finding not in the
+#      original 18). The candidate exists to prove a new image works
+#      BEFORE production is touched, but it did so with
+#      `-v /home/wpuser/wp/html:/var/www/html` (production docroot,
+#      writable), `-v /home/wpuser/wp/logs:/var/log/apache2` (production
+#      access logs), and `-v .../wp/htaccess/.htaccess:...:rw` — meaning
+#      a plugin write-on-init code path in the candidate could pollute
+#      the live docroot BEFORE the candidate was even declared healthy,
+#      and candidate failure could leave orphaned files behind that
+#      outlived the throwaway container. FIX: three mount-surface
+#      changes, none of which break the health check itself:
+#        • /home/wpuser/wp/html mounted :ro. Candidate can serve every
+#          file production serves but cannot write to any of them. A
+#          new-image plugin that writes on init will EACCES — which is
+#          the CORRECT signal, since that behavior would corrupt
+#          production either way; catching it against a throwaway is
+#          far cheaper than catching it live.
+#        • /var/log/apache2 mounted as a tmpfs (candidate's own throwaway
+#          logs — vanishes with the container).
+#        • .htaccess :rw mount dropped entirely. The health check
+#          doesn't hit any URL that requires .htaccess rewrites, and this
+#          was the last :rw mount into production storage.
+#      WP_ENVIRONMENT_TYPE=staging also set as a hint to well-behaved
+#      plugins to skip write-on-init side effects.
+#      RESIDUAL RISK (audit finding #4 — deliberately NOT fixed): the
+#      candidate still authenticates to the LIVE production database
+#      with production credentials. The audit's suggested full fix
+#      (spin up a temporary MariaDB, restore the daily dump into it,
+#      create temporary WP credentials, run the candidate against that
+#      copy, tear everything down) would double disk usage during every
+#      update, add minutes-per-GB of dump restore time to every image
+#      refresh, and introduce a new class of failure modes that
+#      themselves need careful rollback handling. That trade-off doesn't
+#      make sense for THIS script's purpose. Concretely, the candidate's
+#      DB interactions are bounded: getent hosts mariadb, PHP mysqli
+#      connect, SELECT 1, plus whatever a GET / for an anonymous user
+#      triggers with DISABLE_WP_CRON=true, WP_ENVIRONMENT_TYPE=staging,
+#      and now a read-only docroot. WordPress schema migrations are
+#      triggered by wp-admin/upgrade.php loaded WHILE authenticated, not
+#      by anonymous requests, so a version-mismatched candidate cannot
+#      silently migrate the live DB. Documented in-place; operators who
+#      need full DB isolation for their compliance regime can bolt on a
+#      dump/restore wrapper, but the base script does not pay that cost.
+#  56. [HIGH] Alpine SHA-512 verification and container digest pinning
+#      both failed OPEN by design (audit findings #8+#9 — same as
+#      original #12+#13 in Remaining_todo.docx). Both were correct
+#      defaults for a homelab install: an admin diagnosing a bad Alpine
+#      mirror or a temporary registry outage doesn't want the script to
+#      abort mid-provision. But they left MSP-graded operators with no
+#      way to INSIST on those verifications succeeding — no toggle that
+#      turns "warn and continue" into "abort". FIX: new DEPLOYMENT_PROFILE
+#      choice at install prompt time, one of {standard, production}:
+#        • standard (default) — behavior IDENTICAL to v7-12. Warnings
+#          are loud, failures don't abort. Chosen so every existing
+#          install and repeat run behaves the same.
+#        • production — verification failure is fatal. Missing sha512sum
+#          on the Proxmox host, unfetchable/malformed .sha512 sidecar,
+#          anything less than 3/3 container images pinned to a real
+#          @sha256: digest — any of these aborts the install with a
+#          clear operator-facing message. Also implies USE_DIGEST_PINNING=1
+#          (the two answers can't sensibly be contradictory).
+#      Persisted into vars.sh so update.sh and later scripts see the
+#      choice. Deliberately implemented as a per-install prompt, not a
+#      hardcoded policy: the tradeoff between "always run" and "refuse
+#      to run under unverified state" is genuinely operator-context-
+#      dependent, and the audit itself flagged the absence of exactly
+#      this toggle as the correct fix rather than picking one side.
+#      Still open (unchanged by this entry — see Remaining_todo.docx):
+#      #17 (nftables output policy still accept — audit finding #16;
+#      deliberately not touched here, see next-step reasoning in the
+#      TODO doc), the daily backup cron's related concerns beyond the
+#      immediate fix, the CrowdSec enrolment-key argv exposure noted
+#      in v7-12, and the Apache/nftables config-injection surface noted
+#      in v7-12. The audit ALSO recommended post-install DNS validation
+#      as a defense-in-depth safety net against v7-11's #3 fix (finding
+#      #1+#2 remediation) — deliberately not added here because that
+#      validation would fire during the wp-front bring-up sequence
+#      before the candidate check runs, at a point where the fix would
+#      be to re-do the container recreation this script's own health
+#      check would already catch and diagnose.
+#
 # ROOTFUL DEPLOYMENT (fixed design — not a dated note):
 #   MariaDB   — rootful, --cap-drop ALL + 5 caps, isolated to wp-db
 #               (--internal, no host port, no egress).
@@ -861,6 +1255,67 @@ else
   msg_warn "Digest pinning disabled — images run by floating tag only"
 fi
 
+# BUG FIX (v7-13, ChatGPT Findings 8+9 in the audit): DEPLOYMENT_PROFILE
+# controls how this script behaves when its OWN security verifications
+# can't complete. Older versions had two separate, independently
+# fail-open code paths: _verify_alpine_sha512() would msg_warn and
+# return success if the .sha512 sidecar was missing/malformed or if
+# sha512sum itself wasn't installed on the Proxmox host, and _pin_digest()
+# would silently fall back to a tag-only reference every time its Skopeo
+# lookup or its podman pull failed — so an install could complete claiming
+# "digest pinning enabled" while running as few as 0/3 pinned images.
+# Both are correct defaults for a homelab (an admin diagnosing a bad
+# Alpine mirror doesn't want the script to abort mid-provision), but they
+# leave an MSP client with no way to INSIST on those verifications
+# succeeding — no toggle that turns "warn and continue" into "abort".
+# DEPLOYMENT_PROFILE is that toggle:
+#   • standard (default) — keeps the v7-12 behavior EXACTLY. Verifications
+#     are attempted; a failure is loudly warned but not fatal. Chosen so
+#     existing installs and repeat runs behave identically to before, and
+#     so admins in a bad-network situation can still get a working VM.
+#   • production          — the audit-graded behavior. If sha512sum isn't
+#     installed on the Proxmox host, if the Alpine .sha512 sidecar can't
+#     be fetched or is malformed, if fewer than 3/3 container images
+#     resolve to a real @sha256: digest — any one of these aborts the
+#     install instead of silently continuing. Chosen when an operator
+#     needs to be able to promise a compliance auditor that the base OS
+#     image and all container images actually WERE verified against
+#     upstream, not merely attempted.
+# Not enabled by default because the loud warnings in "standard" already
+# make a failure visible to any operator who's watching the install
+# output; production mode is opt-in for the operators who need to
+# GUARANTEE that visibility rather than depend on it.
+echo ""
+echo -e "  ${BLD}Deployment profile — what happens when a verification fails${CL}"
+echo -e "  ${YW}standard   — warn and continue (default). Alpine SHA-512 mismatch or a${CL}"
+echo -e "  ${YW}             registry blip during digest pinning is loudly reported but${CL}"
+echo -e "  ${YW}             does not abort the install. Right for lab/staging installs${CL}"
+echo -e "  ${YW}             and for repeat runs on a network where the sha512 sidecar${CL}"
+echo -e "  ${YW}             is sometimes flaky. Matches the v7-11/v7-12 behavior exactly.${CL}"
+echo -e "  ${YW}production — treat verification failure as fatal. If sha512sum is missing${CL}"
+echo -e "  ${YW}             on this host, if Alpine's .sha512 sidecar can't be fetched or${CL}"
+echo -e "  ${YW}             validated, or if fewer than 3/3 container images resolve to a${CL}"
+echo -e "  ${YW}             real digest, the install ABORTS instead of continuing under${CL}"
+echo -e "  ${YW}             unverified state. Right for MSP-graded deployments that need${CL}"
+echo -e "  ${YW}             to demonstrate the verifications actually succeeded.${CL}"
+read -rp "  Deployment profile? [standard/production] (default: standard) : " DEPLOY_SEL
+case "${DEPLOY_SEL:-standard}" in
+  production|prod|p) DEPLOYMENT_PROFILE="production" ;;
+  *)                 DEPLOYMENT_PROFILE="standard"   ;;
+esac
+if [ "$DEPLOYMENT_PROFILE" = "production" ]; then
+  msg_ok "Deployment profile: production — verification failures will abort the install"
+  # Force digest pinning ON under production — a "digest pinning disabled"
+  # install can't satisfy the production-mode 3/3 requirement below, so
+  # it makes no sense to offer both toggles as independently answerable.
+  if [ "$USE_DIGEST_PINNING" != "1" ]; then
+    msg_warn "  Digest pinning was answered [n] but production profile requires it — enabling."
+    USE_DIGEST_PINNING=1
+  fi
+else
+  msg_ok "Deployment profile: standard — verification failures will warn but not abort"
+fi
+
 echo ""
 echo -e "  ${BLD}Vulnerability & compliance tooling (always installed)${CL}"
 echo -e "  ${YW}Trivy  — scans every container image for known CVEs (HIGH/CRITICAL)${CL}"
@@ -932,6 +1387,16 @@ _verify_alpine_sha512() {
   sidecar_url="${url}.sha512"
   expected=$(curl -fsSL --max-time 10 "$sidecar_url" 2>/dev/null | awk '{print $1}')
   if [[ -z "$expected" || ! "$expected" =~ ^[0-9a-fA-F]{128}$ ]]; then
+    # BUG FIX (v7-13, ChatGPT Finding 8): under DEPLOYMENT_PROFILE=production
+    # a missing or malformed .sha512 sidecar is now fatal instead of a warn.
+    # Rationale: an install that CAN'T verify the base OS image but still
+    # deploys can't be handed to an auditor as "the image was verified."
+    # Under DEPLOYMENT_PROFILE=standard (the default), behavior is
+    # unchanged from v7-12 — warn and continue, so a bad-mirror day doesn't
+    # brick a homelab install.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      msg_error "Could not fetch a valid .sha512 for $(basename "$img") — refusing to continue under DEPLOYMENT_PROFILE=production. Retry once the mirror recovers, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install."
+    fi
     msg_warn "Could not fetch a valid .sha512 for $(basename "$img") — skipping integrity check"
     msg_warn "  (provisioning continues, but this download was not verified)"
     return 0
@@ -961,6 +1426,15 @@ fi
 if command -v sha512sum &>/dev/null; then
   _verify_alpine_sha512 "$IMG_FILE" "$ALPINE_URL"
 else
+  # BUG FIX (v7-13, ChatGPT Finding 8): under DEPLOYMENT_PROFILE=production
+  # a Proxmox host missing sha512sum is now an abort instead of a warn.
+  # Same reasoning as the sidecar-missing branch inside
+  # _verify_alpine_sha512: an install that CAN'T check the base image
+  # isn't a verified install, and production mode is opting in to failing
+  # rather than silently downgrading.
+  if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+    msg_error "sha512sum not found on this Proxmox host — refusing to continue under DEPLOYMENT_PROFILE=production. Install coreutils on the Proxmox host (apt install coreutils), or re-run under DEPLOYMENT_PROFILE=standard."
+  fi
   msg_warn "sha512sum not found on this host — skipping Alpine image integrity check"
 fi
 WORK_IMG="/tmp/wp-vm-${VMID}-alpine.qcow2"
@@ -1521,13 +1995,24 @@ _fail() { echo "  ✗  $*" >&2; FAIL=1; }
 
 # 1) HTTP response — sanity check only, proves nothing about WordPress
 # itself (a DB-error page or PHP fatal page can still answer 200/302).
+# BUG FIX (v7-13, ChatGPT Finding 15 in the audit): the old check accepted
+# ANY code that wasn't 500 or 000 as healthy — which quietly waved through
+# 401/403/404/429/502/503/504 as "OK", the exact list of "something is
+# actually broken" codes a WordPress front page should never legitimately
+# return on GET /. A permission-denied Apache config error (403), a Basic-
+# Auth wall that the health check can't authenticate against (401), or a
+# reverse-proxy backend failure (502/504) would all look healthy under the
+# old check. Fixed to an explicit allowlist: only 200 OK (front page
+# serving), 301 Moved Permanently (HTTPS/canonical URL redirect), and 302
+# Found (temporary redirect, common on WP session/login flows) count as
+# healthy for a GET / on a working WordPress. Any other status is a real
+# failure signal worth investigating, not something to silently accept.
 HTTP_CODE=$(wget -S -O /dev/null "http://127.0.0.1:${HTTP_PORT}/" 2>&1 \
   | awk '/HTTP\// {print $2}' | tail -1)
-if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "500" ] && [ "$HTTP_CODE" != "000" ]; then
-  _pass "HTTP response: ${HTTP_CODE}"
-else
-  _fail "HTTP response: ${HTTP_CODE:-none}"
-fi
+case "$HTTP_CODE" in
+  200|301|302) _pass "HTTP response: ${HTTP_CODE}" ;;
+  *) _fail "Unexpected HTTP response: ${HTTP_CODE:-none} (expected 200, 301, or 302)" ;;
+esac
 
 # 2) PHP actually executes inside the container.
 PHP_OK=$(podman exec "$CONTAINER" php -r 'echo "ok";' 2>/dev/null)
@@ -2002,6 +2487,16 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   if [ "$DIGEST_PIN_COUNT" = "3" ]; then
     ok "Digest pinning: ${DIGEST_PIN_SUMMARY}"
   else
+    # BUG FIX (v7-13, ChatGPT Finding 9): under DEPLOYMENT_PROFILE=production
+    # anything less than 3/3 pinned aborts the install. Under
+    # DEPLOYMENT_PROFILE=standard (default) it stays a warning — the same
+    # silent-degradation behavior v7-12 had, deliberately preserved so a
+    # temporary registry outage doesn't brick a homelab install. See
+    # DEPLOYMENT_PROFILE's own definition at prompt time for the full
+    # rationale on why this is a per-install choice, not a hardcoded policy.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      msg_error "Digest pinning: ${DIGEST_PIN_SUMMARY} — refusing to continue under DEPLOYMENT_PROFILE=production. Every image must resolve to a real @sha256: digest before the install proceeds. See ${DIGEST_PIN_LOG} for exactly which lookups failed and why. Retry once registry access recovers, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where tag-only fallback is acceptable."
+    fi
     warn "Digest pinning: ${DIGEST_PIN_SUMMARY} — see ${DIGEST_PIN_LOG} for exactly why the rest fell back to tag-only"
   fi
 else
@@ -2026,7 +2521,17 @@ WP_PIN_DIGEST=""; case "$WP_IMAGE" in *@sha256:*) WP_PIN_DIGEST="${WP_IMAGE#*@}"
 DB_PIN_DIGEST=""; case "$DB_IMAGE" in *@sha256:*) DB_PIN_DIGEST="${DB_IMAGE#*@}" ;; esac
 CS_PIN_DIGEST=""; case "$CROWDSEC_IMAGE" in *@sha256:*) CS_PIN_DIGEST="${CROWDSEC_IMAGE#*@}" ;; esac
 mkdir -p /etc/wp-install
-cat > /etc/wp-install/pinned.env << PINNEDENV
+# BUG FIX (v7-12, #8): write via temp-file + mv instead of a direct `cat >`.
+# A direct `cat > pinned.env << EOF` truncates the target the instant the
+# shell opens it for writing — before a single byte of the heredoc body
+# lands — so anything reading pinned.env in that exact window (a crash
+# mid-write, or wp-geoip-setup.sh reading this same file later in this
+# very install run) could see a truncated or empty file, not the old
+# value and not the new one. mv within the same directory is a single
+# rename(2) — POSIX-atomic — so a reader always sees either the complete
+# previous file or the complete new one, never a partial write.
+_PINNEDENV_TMP="/etc/wp-install/pinned.env.tmp.$$"
+cat > "$_PINNEDENV_TMP" << PINNEDENV
 # WordPress VM — pinned image tag + digest per component.
 # Written by the installer; kept current by update.sh after every
 # successful update. update.sh treats this file as authoritative for
@@ -2040,7 +2545,8 @@ DB_DIGEST="${DB_PIN_DIGEST}"
 CS_TAG="${CS_TAG_INIT}"
 CS_DIGEST="${CS_PIN_DIGEST}"
 PINNEDENV
-chmod 600 /etc/wp-install/pinned.env
+chmod 600 "$_PINNEDENV_TMP"
+mv -f "$_PINNEDENV_TMP" /etc/wp-install/pinned.env
 ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}"
 
 ts "Creating wpuser account"
@@ -2402,6 +2908,7 @@ podman run -d \
   --name    mariadb \
   --network wp-db \
   --ip      10.89.20.2 \
+  --network-alias mariadb \
   --restart always \
   --label   io.containers.autoupdate=image \
   --cap-drop ALL \
@@ -2538,7 +3045,6 @@ podman run -d \
   --env-file /etc/wordpress/env \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
-  --add-host "mariadb:10.89.20.2" \
   -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
   ${WP_VOL_ARGS} \
   "${WP_IMAGE}"
@@ -2695,6 +3201,46 @@ if [ -z "${MAXMIND_ACCOUNT_ID:-}" ] || [ -z "${MAXMIND_LICENSE_KEY:-}" ]; then
   exit 1
 fi
 
+# BUG FIX (v7-12, #11): credentials to a netrc file, never on a curl
+# command line. `curl -u "$MAXMIND_ACCOUNT_ID:$MAXMIND_LICENSE_KEY"` (the
+# previous form, used both here and in the weekly refresh cron job below)
+# puts the license key directly into that process's own argv — visible to
+# anything on this VM that can read /proc/<pid>/cmdline (or run `ps aux`)
+# for as long as the download takes. The cron line had it worse: the same
+# credentials sat spelled out in plain text in /etc/crontabs/root itself,
+# in addition to reappearing in argv every Wednesday when cron actually
+# ran it. A netrc file holds the same credentials at rest — chmod 600,
+# root-owned, the same protection level /etc/wordpress/env and
+# /root/.wp-credentials already get elsewhere in this script — and both
+# this script's own download and the cron job it writes now reference it
+# by PATH ONLY via --netrc-file. The credentials themselves never sit on a
+# command line again. Rewritten every run (built with printf, one value
+# per line, rather than a heredoc — nothing to reason about regarding
+# expansion rules for a file that's about to hold this VM's most sensitive
+# external credential) so an updated vars.sh — this script's own
+# documented way to fix a bad MaxMind credential — is always picked up.
+MAXMIND_NETRC="/etc/wp-install/.maxmind-netrc"
+mkdir -p /etc/wp-install
+{
+  printf 'machine download.maxmind.com\n'
+  printf 'login %s\n' "$MAXMIND_ACCOUNT_ID"
+  printf 'password %s\n' "$MAXMIND_LICENSE_KEY"
+} > "$MAXMIND_NETRC"
+chmod 600 "$MAXMIND_NETRC"
+
+# Defensive (spotted while fixing #11): curl is used below for MaxMind's
+# HTTP Basic Auth download API — wget, used elsewhere in this script for
+# the mod_maxminddb release lookup, has no --netrc-file equivalent, so the
+# fix above depends on curl specifically. Nothing in this script's Alpine
+# provisioning actually installs curl on the VM (it's only ever apt-get
+# installed inside the transient, Debian-based mod_maxminddb build
+# container below — a completely different context) — install it here if
+# missing so this script stays genuinely standalone/rerunnable per its own
+# header, instead of silently depending on curl having arrived some other
+# way.
+command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 \
+  || { echo "FATAL: curl is unavailable and 'apk add curl' failed — cannot fetch GeoLite2-Country"; exit 1; }
+
 CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/null)
 [ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:6.9.4-php8.3-apache"
 # Derive a human-friendly tag for naming the local GeoIP image.
@@ -2772,7 +3318,7 @@ chmod 644 /home/wpuser/wp/apache-mods/maxminddb.load
 
 echo "Fetching GeoLite2-Country database…"
 HTTP_CODE=$(curl -sS -o /tmp/geolite2-country.tar.gz -w '%{http_code}' \
-  -u "${MAXMIND_ACCOUNT_ID}:${MAXMIND_LICENSE_KEY}" \
+  --netrc-file "$MAXMIND_NETRC" \
   'https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz')
 if [ "$HTTP_CODE" != "200" ]; then
   echo "FATAL: GeoLite2 download failed — HTTP ${HTTP_CODE}."
@@ -2840,7 +3386,6 @@ podman run -d \
   --env-file /etc/wordpress/env \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
-  --add-host "mariadb:10.89.20.2" \
   -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
   -v /home/wpuser/wp/html:/var/www/html \
   -v /home/wpuser/wp/logs:/var/log/apache2 \
@@ -2886,7 +3431,10 @@ fi
 
 grep -q "GeoLite2-Country database refresh" /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root << GEOCRON
 # Weekly GeoLite2-Country database refresh (Wednesday 06:00 UTC)
-0 6 * * 3 curl -fsSL -u "${MAXMIND_ACCOUNT_ID}:${MAXMIND_LICENSE_KEY}" 'https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz' -o /tmp/geolite-refresh.tar.gz && mkdir -p /tmp/geolite-refresh && tar xzf /tmp/geolite-refresh.tar.gz -C /tmp/geolite-refresh --strip-components=1 && find /tmp/geolite-refresh -name '*.mmdb' -exec cp {} /home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb \; && rm -rf /tmp/geolite-refresh /tmp/geolite-refresh.tar.gz && logger -t geoip-update "GeoLite2-Country refreshed"
+# Credentials read from ${MAXMIND_NETRC} (chmod 600, root-owned) via
+# --netrc-file — never placed on this line, so they never sit in
+# /etc/crontabs/root itself or reappear in argv/ps output while cron runs it.
+0 6 * * 3 curl -fsSL --netrc-file ${MAXMIND_NETRC} 'https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz' -o /tmp/geolite-refresh.tar.gz && mkdir -p /tmp/geolite-refresh && tar xzf /tmp/geolite-refresh.tar.gz -C /tmp/geolite-refresh --strip-components=1 && find /tmp/geolite-refresh -name '*.mmdb' -exec cp {} /home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb \; && rm -rf /tmp/geolite-refresh /tmp/geolite-refresh.tar.gz && logger -t geoip-update "GeoLite2-Country refreshed"
 GEOCRON
 
 echo "=== wp-geoip-setup.sh done — GeoIP ${GEOIP_MODE} (${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST}) active ==="
@@ -2894,6 +3442,7 @@ WPGEOSETUP
 chmod +x /usr/local/bin/wp-geoip-setup.sh
 ok "wp-geoip-setup.sh installed — reusable, rerunnable anytime with no reboot needed"
 ok "  Retry after fixing creds: /usr/local/bin/wp-geoip-setup.sh   then: tail -40 /var/log/wp-geoip.log"
+ok "  MaxMind credentials now flow through a netrc file (--netrc-file) — never on a curl command line or exposed in argv/ps output"
 
 if [ "${GEOIP_ENABLED:-0}" = "1" ] && [ -n "${MAXMIND_ACCOUNT_ID}" ] && [ -n "${MAXMIND_LICENSE_KEY}" ]; then
   ts "GeoIP country filtering — building mod_maxminddb image layer"
@@ -2950,7 +3499,7 @@ start() {
       . /etc/wp-install/pinned.env
       [ -n "\$DB_DIGEST" ] && _DB_RUN_IMAGE="docker.io/mariadb@\${DB_DIGEST}"
     fi
-    podman run -d --name mariadb --network wp-db --ip 10.89.20.2 --restart always \\
+    podman run -d --name mariadb --network wp-db --ip 10.89.20.2 --network-alias mariadb --restart always \\
       --label io.containers.autoupdate=image \\
       --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \\
       --cap-add DAC_OVERRIDE --cap-add FOWNER \\
@@ -3051,7 +3600,6 @@ start() {
       --env-file /etc/wordpress/env \\
       -e WORDPRESS_DB_HOST=mariadb:3306 \\
       -e WORDPRESS_DEBUG="" \\
-      --add-host "mariadb:10.89.20.2" \\
       -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
       -v /home/wpuser/wp/html:/var/www/html \\
       -v /home/wpuser/wp/logs:/var/log/apache2 \\
@@ -3098,10 +3646,14 @@ cat > /usr/local/bin/update.sh << 'UPDSCRIPT'
 #  - Assumes container names wordpress / mariadb / crowdsec, and the
 #    network-segmented layout from the v7-6/v7-6c line: wp-front (public,
 #    WordPress's egress + published port) and wp-db (--internal,
-#    WordPress+MariaDB only, static MariaDB address 10.89.20.2). If your
-#    main script still uses a single flat wp-net, the two spots that
-#    reference wp-front/wp-db/10.89.20.2 (marked below) are the only ones
-#    that need adjusting to match.
+#    WordPress+MariaDB only). MariaDB is addressed purely by DNS name
+#    ("mariadb", via aardvark-dns + an explicit --network-alias on wp-db)
+#    rather than a fixed IP baked into WordPress — v7-11 removed the old
+#    --add-host "mariadb:10.89.20.2" entries that used to shadow this (see
+#    that patch note for why a static entry was actively wrong, not just
+#    redundant, and why removing it doesn't touch wp-db's own isolation).
+#    If your main script still uses a single flat wp-net, wp-front/wp-db
+#    is the only naming assumption left to adjust to match.
 #  - Reads /etc/wp-install/vars.sh for USE_DIGEST_PINNING and GEOIP_ENABLED
 #    (same file your installer already writes) and reads/writes a new
 #    /etc/wp-install/pinned.env for per-component pinned tag+digest — see
@@ -3254,9 +3806,65 @@ WP_TAG="" WP_DIGEST="" DB_TAG="" DB_DIGEST="" CS_TAG="" CS_DIGEST=""
 # shellcheck disable=SC1091
 [ -f /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
+# BUG FIX (v7-12, #9): validate what was just loaded before trusting it.
+# The operator-supplied [VER] argument to `update.sh wp|db|crowdsec [VER]`
+# has gone through validate_image_tag()/validate_digest_ref() (defined
+# above) since v7-6d (item 24) before it's used in an image reference —
+# but WP_TAG/WP_DIGEST/DB_TAG/DB_DIGEST/CS_TAG/CS_DIGEST, loaded from
+# pinned.env by a plain `. /etc/wp-install/pinned.env`, took a completely
+# separate, unvalidated path into the exact same kind of reference. This
+# should never actually fire against a pinned.env this version of
+# update.sh wrote itself (see the atomic _save_pinned() below), but is a
+# safety net for a pinned.env inherited from an older update.sh, a manual
+# edit, or a file that predates that atomic-write fix. A value that fails
+# validation is discarded (reset to empty), which the rest of this script
+# already treats as "not pinned yet" — falling back to the PINNED_*_VER
+# constants above, or triggering a fresh bootstrap/resolve just below —
+# rather than ever reaching a `podman pull`/`podman run` with an
+# unvalidated string. Six explicit checks rather than a loop over dynamic
+# variable names: every value here is used directly, by its own name, for
+# the rest of this script, and spelling each one out avoids reaching for
+# eval to touch them programmatically.
+if [ -n "$WP_TAG" ] && ! validate_image_tag "$WP_TAG" 2>/dev/null; then
+  echo "  ⚠  pinned.env: WP_TAG '${WP_TAG}' failed validation — ignoring, will re-resolve" >&2
+  WP_TAG=""
+fi
+if [ -n "$WP_DIGEST" ] && ! validate_digest_ref "$WP_DIGEST" 2>/dev/null; then
+  echo "  ⚠  pinned.env: WP_DIGEST '${WP_DIGEST}' failed validation — ignoring, will re-resolve" >&2
+  WP_DIGEST=""
+fi
+if [ -n "$DB_TAG" ] && ! validate_image_tag "$DB_TAG" 2>/dev/null; then
+  echo "  ⚠  pinned.env: DB_TAG '${DB_TAG}' failed validation — ignoring, will re-resolve" >&2
+  DB_TAG=""
+fi
+if [ -n "$DB_DIGEST" ] && ! validate_digest_ref "$DB_DIGEST" 2>/dev/null; then
+  echo "  ⚠  pinned.env: DB_DIGEST '${DB_DIGEST}' failed validation — ignoring, will re-resolve" >&2
+  DB_DIGEST=""
+fi
+if [ -n "$CS_TAG" ] && ! validate_image_tag "$CS_TAG" 2>/dev/null; then
+  echo "  ⚠  pinned.env: CS_TAG '${CS_TAG}' failed validation — ignoring, will re-resolve" >&2
+  CS_TAG=""
+fi
+if [ -n "$CS_DIGEST" ] && ! validate_digest_ref "$CS_DIGEST" 2>/dev/null; then
+  echo "  ⚠  pinned.env: CS_DIGEST '${CS_DIGEST}' failed validation — ignoring, will re-resolve" >&2
+  CS_DIGEST=""
+fi
+
 _save_pinned() {
+  # BUG FIX (v7-12, #8): temp-file + mv instead of a direct `cat >`. A
+  # direct `cat > pinned.env << EOF` truncates the target the instant the
+  # shell opens it for writing, before a single byte of the heredoc body
+  # lands — so anything reading pinned.env in that exact window (this
+  # function runs after every successful wp/db/crowdsec update, and
+  # wp-geoip-setup.sh reads this file independently of update.sh's own
+  # update-lock, which only guards state-changing update.sh subcommands
+  # against each other, not an unrelated reader) could see a truncated or
+  # empty file instead of the old value or the new one. mv within the
+  # same directory is a single rename(2) — POSIX-atomic — so a reader
+  # always sees either the complete previous file or the complete new one.
   mkdir -p /etc/wp-install
-  cat > /etc/wp-install/pinned.env << PINNEDENV
+  local _tmp="/etc/wp-install/pinned.env.tmp.$$"
+  cat > "$_tmp" << PINNEDENV
 # WordPress VM — pinned image tag + digest per component.
 # Written by the installer's digest-pinning snippet; kept current by
 # update.sh after every successful update. Do not edit by hand while
@@ -3268,7 +3876,8 @@ DB_DIGEST="${DB_DIGEST}"
 CS_TAG="${CS_TAG}"
 CS_DIGEST="${CS_DIGEST}"
 PINNEDENV
-  chmod 600 /etc/wp-install/pinned.env 2>/dev/null || true
+  chmod 600 "$_tmp" 2>/dev/null || true
+  mv -f "$_tmp" /etc/wp-install/pinned.env 2>/dev/null || true
 }
 
 # Running-container inspection — status display and GeoIP detection only.
@@ -3395,40 +4004,96 @@ setup_trivy() {
   else
     apk add --no-cache wget >/dev/null 2>&1 || true
     TRIVY_VER="v0.71.2"
+    # BUG FIX (v7-13, ChatGPT Finding 13): install.sh is now fetched at a
+    # specific COMMIT HASH, not off the mutable `main` branch. Same commit
+    # aquasecurity's OWN setup-trivy GitHub Action pins to (per their PR
+    # #28, "Pin Trivy install script checkout to a specific commit"), so
+    # what's fetched here is byte-identical to what their supply-chain-
+    # hardened workflow fetches. This matters concretely: aquasecurity/
+    # trivy's main branch was compromised in the real v0.69.4 supply chain
+    # attack (StepSecurity's public writeup — the malicious release
+    # exfiltrated data to scan.aquasecurtiy.org via an RSA-encrypted C2
+    # channel and dropped a tpcp-docs backdoor repo on every runner's
+    # GitHub account). raw.githubusercontent.com serves files by commit
+    # hash content-addressably — a compromise of main cannot change what
+    # THIS URL returns. To update: after auditing any change to trivy's
+    # contrib/install.sh, update TRIVY_INSTALL_COMMIT to the newer commit.
+    TRIVY_INSTALL_COMMIT="75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a"
     wget -qO /tmp/trivy-install.sh \
-      https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh 2>/dev/null \
+      "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_INSTALL_COMMIT}/contrib/install.sh" 2>/dev/null \
     && sh /tmp/trivy-install.sh -b /usr/local/bin "${TRIVY_VER}" >/dev/null 2>&1 \
-    && echo "  ✔  Trivy ${TRIVY_VER} installed (official script)" \
+    && echo "  ✔  Trivy ${TRIVY_VER} installed (official script, commit-pinned)" \
     || { echo "  ⚠  Trivy install failed — scans will be skipped"; return 1; }
     rm -f /tmp/trivy-install.sh
   fi
 }
 
 scan_image() {
-  local img="$1"
+  local img="$1" rc
   if ! command -v trivy >/dev/null 2>&1; then
     echo "  ⚠  Trivy not available — skipping vulnerability scan"
     return 0
   fi
   echo "  → Scanning ${img} for HIGH/CRITICAL vulnerabilities (cache: ${TRIVY_CACHE_DIR})..."
-  if trivy image \
+  # BUG FIX (v7-13, ChatGPT Finding 14 in the audit): the old scan used
+  # `--exit-code 1`, then treated ANY nonzero return as
+  # "vulnerabilities detected". But Trivy exits nonzero for many reasons
+  # that aren't findings — DB download failure, registry timeout, corrupt
+  # cache, invalid image reference, scanner-init failure. An operator who
+  # got "HIGH or CRITICAL vulnerabilities detected" after a scanner
+  # outage would either wave the update through (thinking it's a normal
+  # CVE prompt) or panic-block a clean image. Worse, 2>/dev/null was
+  # throwing away the diagnostic stderr that would have distinguished the
+  # two cases. Fixed here by using `--exit-code 10` (deliberately reserved
+  # for "findings" per Trivy's own convention — 0=no findings, 10=findings,
+  # anything else=scanner problem), sending stderr to a temp file so it
+  # can be surfaced when the scan itself failed, and branching on the
+  # actual return code rather than a boolean "success or not".
+  local _trivy_err
+  _trivy_err=$(mktemp)
+  set +e
+  trivy image \
        --cache-dir "${TRIVY_CACHE_DIR}" \
-       --exit-code 1 \
+       --exit-code 10 \
        --severity HIGH,CRITICAL \
        --no-progress \
        --quiet \
-       "${img}" 2>/dev/null; then
-    echo "  ✔  No HIGH/CRITICAL vulnerabilities found"
-    return 0
-  else
-    echo "  ⚠  HIGH or CRITICAL vulnerabilities detected in ${img}"
-    echo "     Review the findings above before updating."
-    ask_yn "  Proceed with update anyway? (not recommended)" || {
-      echo "  Update aborted. Check for a newer image version."
-      return 1
-    }
-    return 0
-  fi
+       "${img}" 2>"${_trivy_err}"
+  rc=$?
+  set -e
+  case "$rc" in
+    0)
+      rm -f "${_trivy_err}"
+      echo "  ✔  No HIGH/CRITICAL vulnerabilities found"
+      return 0
+      ;;
+    10)
+      rm -f "${_trivy_err}"
+      echo "  ⚠  HIGH or CRITICAL vulnerabilities detected in ${img}"
+      echo "     Review the findings above before updating."
+      ask_yn "  Proceed with update anyway? (not recommended)" || {
+        echo "  Update aborted. Check for a newer image version."
+        return 1
+      }
+      return 0
+      ;;
+    *)
+      echo "  ✗  Trivy scan DID NOT COMPLETE for ${img} (rc=${rc}) — this is NOT" >&2
+      echo "     a clean scan and NOT a vulnerability finding. Scanner-side" >&2
+      echo "     failures (DB download, registry timeout, corrupt cache) look" >&2
+      echo "     like this — treat as unknown security state." >&2
+      if [ -s "${_trivy_err}" ]; then
+        echo "     Trivy stderr:" >&2
+        sed 's/^/       /' "${_trivy_err}" >&2 || true
+      fi
+      rm -f "${_trivy_err}"
+      ask_yn "  Proceed with update WITHOUT a completed scan? (not recommended)" || {
+        echo "  Update aborted. Investigate the scanner failure and retry."
+        return 1
+      }
+      return 0
+      ;;
+  esac
 }
 
 do_os_update() {
@@ -3517,6 +4182,62 @@ do_wp_update() {
   # guarantee of failure, not an occasional race. The pulled image is
   # proven out here instead, on a throwaway container bound ONLY to
   # loopback:WP_CANDIDATE_PORT, with production left completely alone.
+  #
+  # BUG FIX (v7-13, ChatGPT Finding 3 in the audit): the candidate used to
+  # bind-mount PRODUCTION's /home/wpuser/wp/html rw, /home/wpuser/wp/logs
+  # rw, and /home/wpuser/wp/htaccess/.htaccess rw — so a plugin
+  # write-on-init code path in the candidate image (cache seeding,
+  # transient files under wp-content/uploads, a first-request
+  # optimization that touches a marker file) could pollute the live
+  # production docroot BEFORE the candidate had even been declared
+  # healthy. Candidate failure then left production storage with
+  # candidate-authored artifacts that outlived the throwaway container.
+  # Mitigated here by three changes to the mount surface, none of which
+  # break the health check itself (HTTP GET / + PHP exec + DB DNS + real
+  # DB query — none require write access to any of these paths):
+  #   • /home/wpuser/wp/html mounted :ro (read-only). The candidate can
+  #     serve every file production serves, but cannot write to any of
+  #     them. If the new image's WordPress ships a plugin that writes on
+  #     init, the write itself will EACCES — which is the CORRECT signal:
+  #     that plugin behavior would corrupt production either way, catching
+  #     it against a throwaway is far cheaper than catching it live.
+  #   • /var/log/apache2 mounted as a tmpfs (candidate's own throwaway
+  #     logs). Production's real access log is no longer written to by
+  #     the candidate, and there's nothing to clean up after — the tmpfs
+  #     disappears with the container.
+  #   • The production .htaccess :rw mount is dropped entirely. The health
+  #     check doesn't need it (it doesn't hit any URL that requires
+  #     .htaccess rewrites), and having ANY :rw mount into
+  #     /home/wpuser/wp was the last direct write path into production
+  #     storage from the candidate.
+  # WP_ENVIRONMENT_TYPE=staging is also set as a hint to well-behaved
+  # plugins to skip write-on-init side effects; WordPress core itself
+  # respects this env var per the WordPress developer docs.
+  #
+  # RESIDUAL RISK (ChatGPT Finding 4 in the audit — Deliberately NOT fixed
+  # here): the candidate still authenticates to the LIVE production
+  # database with production credentials. ChatGPT's suggested full fix
+  # (spin up a temporary MariaDB, restore the daily dump into it, create
+  # temporary WordPress credentials, run the candidate against that copy,
+  # tear it all down) would double disk usage during every update, add
+  # minutes-per-GB of dump restore time to every image refresh, and
+  # introduce a new class of failure modes (temporary-DB startup, dump
+  # restore integrity, credential lifecycle) that themselves need careful
+  # rollback handling. That trade-off doesn't make sense for THIS
+  # script's purpose — the candidate's DB interactions are limited to
+  # what a health check needs (getent hosts mariadb, PHP mysqli connect,
+  # SELECT 1, plus whatever a GET / for an anonymous user triggers with
+  # DISABLE_WP_CRON=true, WP_ENVIRONMENT_TYPE=staging, and now a RO
+  # docroot). WordPress schema migrations are triggered by wp-admin/
+  # upgrade.php loaded WHILE authenticated, not by anonymous requests, so
+  # a version-mismatched candidate cannot silently migrate the live DB.
+  # The remaining exposure — an anonymous plugin init routine that
+  # opportunistically writes an options-table row on first request — is
+  # bounded, benign, and would happen against production on first real
+  # traffic anyway. Documented here rather than half-solved: an operator
+  # who needs full DB isolation for their compliance regime can bolt it
+  # on with a dump/restore step wrapping this function, but the base
+  # script does not pay that cost by default.
   local WP_CANDIDATE="wordpress-candidate"
   local candidate_ok=0 i
   podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
@@ -3537,14 +4258,13 @@ do_wp_update() {
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
-    --add-host "mariadb:10.89.20.2" \
+    -e WP_ENVIRONMENT_TYPE=staging \
     -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
-    -v /home/wpuser/wp/html:/var/www/html \
-    -v /home/wpuser/wp/logs:/var/log/apache2 \
+    -v /home/wpuser/wp/html:/var/www/html:ro \
+    --tmpfs /var/log/apache2:size=32M,noexec,nosuid,nodev \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
     -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
     -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
-    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
     ${RI_VOLS} \
     "${_UPD_PULL_REF}"; then
     podman network connect wp-db "$WP_CANDIDATE" >/dev/null 2>&1 || true
@@ -3633,7 +4353,6 @@ do_wp_update() {
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
-    --add-host "mariadb:10.89.20.2" \
     -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
     -v /home/wpuser/wp/html:/var/www/html \
     -v /home/wpuser/wp/logs:/var/log/apache2 \
@@ -4025,11 +4744,19 @@ do_db_update() {
   fi
 
   # No --ip here either — mariadb-old still holds its wp-db address until
-  # removed below. netavark auto-assigns a free wp-db address; WordPress
-  # still finds it via aardvark-dns (the --add-host static entry above is a
-  # fallback only, and can go stale after this — pre-existing limitation,
-  # unrelated to Skopeo/pinning).
-  if podman run -d --name mariadb --network wp-db --restart always \
+  # removed below, so netavark assigns this replacement whatever address is
+  # free instead. WordPress finds it purely via aardvark-dns now (v7-11
+  # removed the static --add-host "mariadb:10.89.20.2" entry this comment
+  # used to describe as a "fallback" — it wasn't one: glibc's default
+  # files-before-dns resolution order meant that entry pre-empted DNS
+  # rather than backing it up, and it was wrong for the entire span this
+  # container runs without a fixed .2, i.e. essentially every update, not
+  # an edge case — see the v7-11 patch note for the full failure chain).
+  # --network-alias mariadb below makes the DNS-only discovery explicit
+  # rather than implicit; it changes nothing about wp-db's own isolation
+  # (still --internal, still no published port, still only reachable from
+  # containers already on wp-db).
+  if podman run -d --name mariadb --network wp-db --network-alias mariadb --restart always \
     --label io.containers.autoupdate=image \
     --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
     --cap-add DAC_OVERRIDE --cap-add FOWNER \
@@ -4070,13 +4797,35 @@ do_db_update() {
 
     if [ "$DB_READY" = "1" ]; then
       echo "  → mariadb-upgrade (no-op if not needed)…"
-      # mariadb-upgrade's own exit status is still not checked here — open
-      # finding #5, intentionally out of scope for this patch (see
-      # Remaining_todo.docx). The WordPress-reconnect gate immediately below
-      # at least catches the case where an upgrade problem breaks
-      # WordPress's own queries.
-      podman exec mariadb sh -c \
-        'mariadb-upgrade -uroot -p"$MARIADB_ROOT_PASSWORD"' >/dev/null 2>&1 || true
+      # v7-10 (closes open finding #5): mariadb-upgrade's own exit status is
+      # now checked instead of being discarded with `|| true`. DB_READY
+      # above only proves the new server accepts connections and InnoDB is
+      # initialized (mariadb-health-check.sh) — it says nothing about
+      # mariadb-upgrade's own outcome, since that command hasn't run yet at
+      # that point. A non-zero exit means mariadb-upgrade hit something it
+      # couldn't reconcile on its own (an unrepairable table, a permission
+      # problem, a dropped connection mid-run); continuing silently past
+      # that risked handing WordPress a database that only LOOKED ready.
+      # Combined stdout+stderr is captured to a variable rather than a temp
+      # file — mariadb-upgrade prints even on a clean run ("already
+      # upgraded"-style lines), so this is captured purely for diagnostics
+      # on failure, never used as the pass/fail signal itself — and shown
+      # only if the command actually failed. That failure now routes
+      # through the same _db_rollback() helper item 41 built for this
+      # function's other failure paths, instead of being swallowed. The
+      # WordPress-reconnect gate right below is unchanged and still runs
+      # either way: mariadb-upgrade's own exit code isn't necessarily
+      # exhaustive, so a schema issue that slips past it but still breaks a
+      # real WordPress query is caught there, same safety net as before.
+      if MARIADB_UPGRADE_OUTPUT=$(podman exec mariadb sh -c \
+        'mariadb-upgrade -uroot -p"$MARIADB_ROOT_PASSWORD"' 2>&1); then
+        echo "  ✔  mariadb-upgrade completed"
+      else
+        echo "✗  mariadb-upgrade failed:" >&2
+        echo "$MARIADB_UPGRADE_OUTPUT" | sed 's/^/     /' >&2
+        _db_rollback "mariadb-upgrade failed" || true
+        return 1
+      fi
 
       # v7-9 (item 41c): mariadb-old and the pre-update snapshot used to be
       # deleted right after `podman start wordpress ... || true` — WordPress's
@@ -4278,9 +5027,58 @@ do_digest_check() {
     echo "  Digest pinning is disabled (USE_DIGEST_PINNING=0 in vars.sh) — nothing to check."
     return 0
   fi
-  do_wp_update "${WP_TAG:-$PINNED_WP_VER}"
-  do_db_update "${DB_TAG:-$PINNED_DB_VER}"
-  do_cs_update "${CS_TAG:-$PINNED_CS_VER}"
+  # BUG FIX (v7-13, ChatGPT Findings 5+6 in the audit): this function and the
+  # `all` dispatch below used to call do_wp_update / do_db_update /
+  # do_cs_update as unguarded bare statements. update.sh runs under set -e
+  # (imposed at the top of this file), so the moment the first component
+  # failed, the entire process aborted — leaving the later components
+  # unchecked and unrun. Concrete symptom: an intermittent WordPress
+  # registry blip during `update.sh digest-check` would leave the MariaDB
+  # and CrowdSec digests silently unverified, and `update.sh all` would
+  # skip the CrowdSec image update entirely if MariaDB rolled back for any
+  # reason. Fixed here by capturing each component's exit status with `||
+  # rc=$?` (which set -e does not treat as an error) and then reporting a
+  # per-component summary at the end, so an operator sees exactly which
+  # components succeeded, which rolled back, and which weren't reached.
+  # Return status is nonzero if any single component failed, so cron / a
+  # calling script still sees the aggregate as a failure.
+  local wp_rc=0 db_rc=0 cs_rc=0
+  do_wp_update "${WP_TAG:-$PINNED_WP_VER}" || wp_rc=$?
+  do_db_update "${DB_TAG:-$PINNED_DB_VER}" || db_rc=$?
+  do_cs_update "${CS_TAG:-$PINNED_CS_VER}" || cs_rc=$?
+  echo ""
+  echo "── Digest Check Summary ──"
+  _fmt_rc() { case "$1" in 0) echo "OK" ;; *) echo "FAILED (rc=$1)" ;; esac; }
+  printf "  WordPress: %s\n" "$(_fmt_rc "$wp_rc")"
+  printf "  MariaDB:   %s\n" "$(_fmt_rc "$db_rc")"
+  printf "  CrowdSec:  %s\n" "$(_fmt_rc "$cs_rc")"
+  [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && return 0
+  return 1
+}
+
+# BUG FIX (v7-13, ChatGPT Finding 5): same fix for `update.sh all`. The old
+# `all)` dispatch line was `do_os_update; do_wp_update; do_db_update;
+# do_cs_update` — same set -e trap, same silently-skipped-later-components
+# failure mode, but with an extra step (do_os_update) at the front. Now
+# each component's exit status is captured and a summary printed, so
+# operators see "OS updated, WordPress rolled back, MariaDB up to date,
+# CrowdSec skipped due to WordPress failure" clearly instead of just
+# "process exited nonzero somewhere."
+do_all_updates() {
+  local os_rc=0 wp_rc=0 db_rc=0 cs_rc=0
+  do_os_update || os_rc=$?
+  do_wp_update || wp_rc=$?
+  do_db_update || db_rc=$?
+  do_cs_update || cs_rc=$?
+  echo ""
+  echo "── Update Summary ──"
+  _fmt_rc() { case "$1" in 0) echo "OK" ;; *) echo "FAILED (rc=$1)" ;; esac; }
+  printf "  Alpine OS: %s\n" "$(_fmt_rc "$os_rc")"
+  printf "  WordPress: %s\n" "$(_fmt_rc "$wp_rc")"
+  printf "  MariaDB:   %s\n" "$(_fmt_rc "$db_rc")"
+  printf "  CrowdSec:  %s\n" "$(_fmt_rc "$cs_rc")"
+  [ "$os_rc" -eq 0 ] && [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && return 0
+  return 1
 }
 
 # ── Read-only summary (default action) ─────────────────────────────────────
@@ -4393,7 +5191,7 @@ case "${1:-check}" in
   wp)          acquire_lock || exit 1; do_wp_update "${2:-}" ;;
   db)          acquire_lock || exit 1; do_db_update "${2:-}" ;;
   crowdsec|cs) acquire_lock || exit 1; do_cs_update "${2:-}" ;;
-  all)         acquire_lock || exit 1; do_os_update; do_wp_update; do_db_update; do_cs_update ;;
+  all)         acquire_lock || exit 1; do_all_updates ;;
   digest-check|digest|pin) acquire_lock || exit 1; do_digest_check ;;
   trivy|scan)
     setup_trivy
@@ -4411,6 +5209,8 @@ ok "  Concurrent runs are now blocked by an exclusive lock at /run/lock/wordpres
 ok "  Container swaps (wp/db/crowdsec) now check every rename/start instead of discarding the result — a silent failure here used to be able to delete a still-healthy container"
 ok "  WordPress updates now validate the pulled image on a loopback candidate (127.0.0.1:18080) before cutting production over on :80"
 ok "  MariaDB updates now verify the backup dump itself, snapshot the data directory before the swap, and confirm WordPress can use the new database before mariadb-old is ever deleted"
+ok "  MariaDB updates now also check mariadb-upgrade's own exit status and roll back instead of continuing past a failure"
+ok "  pinned.env is now written atomically (temp file + rename) and re-validated on load — a truncated or hand-edited file can no longer feed an unvalidated image reference into a pull or run"
 
 # ════════════════════════════════════════════════════════════════════════════
 # CROWDSEC
@@ -4590,6 +5390,78 @@ ok "crowdsec-container service registered"
 
 # BUG FIX: podman-compose is NOT needed for podman auto-update.
 # podman auto-update is a built-in Podman command.
+# BUG FIX (v7-13, ChatGPT Finding 7 in the audit): the inline daily backup
+# cron used to be `podman exec ... mariadb-dump ... | gzip > file.sql.gz`
+# — the exact pipe-to-gzip pattern that #4 in the original audit closed
+# inside do_db_update() during v7-9, but that hadn't been folded into this
+# cron line because it wasn't inside do_db_update() itself. Same failure
+# mode: cron's default shell has no pipefail, so a `mariadb-dump` failure
+# was masked by gzip's own successful exit on empty input — producing a
+# valid, empty, unrestorable .sql.gz that then aged into the retention
+# window while older good backups were rotated out. wp-db-backup.sh
+# reuses do_db_update's proven pipeline: write raw SQL first (so its own
+# exit status is what's checked, not gzip's), confirm the dump completed
+# by looking for mariadb-dump's own trailing marker, gzip and verify with
+# gzip -t, and only THEN rotate. If any step fails, the partial file is
+# removed and the rotation is skipped, so a bad day never destroys the
+# previous good backup.
+cat > /usr/local/bin/wp-db-backup.sh << 'DBBACKUP'
+#!/bin/sh
+# wp-db-backup.sh — verified daily MariaDB backup. Called from cron.
+# Design mirrors do_db_update()'s in-flight backup step in update.sh.
+set -eu
+BACKUP_DIR="/root/wp-db-backups"
+STAMP=$(date -u +%Y%m%d)
+BACKUP_FILE="${BACKUP_DIR}/wp-db-${STAMP}.sql.gz"
+BACKUP_RAW="${BACKUP_FILE%.gz}"
+
+install -d -m 0700 "${BACKUP_DIR}"
+BACKUP_OK=0
+
+# Step 1: dump to a plain .sql file so mariadb-dump's own exit status is
+# what gets checked (gzip on the end of a pipe would mask the failure).
+if (umask 077; podman exec mariadb sh -c \
+     'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+     > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err"); then
+  # Step 2: confirm mariadb-dump actually finished (non-empty + trailing marker).
+  # An interrupted dump can still exit 0 in some connection-drop scenarios.
+  if [ -s "${BACKUP_RAW}" ] && tail -c 200 "${BACKUP_RAW}" | grep -q "Dump completed"; then
+    # Step 3: compress and integrity-check the archive itself.
+    if gzip -f "${BACKUP_RAW}" && gzip -t "${BACKUP_FILE}" 2>/dev/null; then
+      chmod 600 "${BACKUP_FILE}" 2>/dev/null || true
+      BACKUP_OK=1
+    else
+      logger -t wp-db-backup "FAILED — gzip compress/verify of ${BACKUP_FILE}"
+    fi
+  else
+    logger -t wp-db-backup "FAILED — dump looks incomplete (empty or missing completion marker)"
+  fi
+else
+  logger -t wp-db-backup "FAILED — mariadb-dump exited nonzero"
+fi
+
+if [ "${BACKUP_OK}" != "1" ]; then
+  # Preserve stderr from the failed run for diagnosis, but remove the
+  # broken .sql/.sql.gz so it can't be mistaken for a good backup by
+  # anything (a monitoring script, an operator, or the rotation below).
+  [ -s "${BACKUP_RAW}.err" ] && \
+    logger -t wp-db-backup "stderr: $(head -c 500 "${BACKUP_RAW}.err")"
+  rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" "${BACKUP_FILE}" 2>/dev/null || true
+  # DELIBERATE: no rotation on failure. Yesterday's good backup stays.
+  exit 1
+fi
+
+rm -f "${BACKUP_RAW}.err" 2>/dev/null || true
+logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
+
+# Step 4: rotate ONLY after a new backup passed all three verification
+# gates. If any earlier step failed, we exited above and yesterday's
+# good backup is safe.
+find "${BACKUP_DIR}" -type f -name 'wp-db-*.sql.gz' -mtime +7 -delete 2>&1 \
+  | logger -t wp-db-backup
+DBBACKUP
+chmod 755 /usr/local/bin/wp-db-backup.sh
+
 cat >> /etc/crontabs/root << 'AUTOCRON'
 # Weekly container image update check (Sunday 04:00 UTC — dry run only)
 0 4 * * 0 podman auto-update --dry-run 2>&1 | logger -t podman-autoupdate
@@ -4597,14 +5469,16 @@ cat >> /etc/crontabs/root << 'AUTOCRON'
 # page loads). DISABLE_WP_CRON=true is set in WORDPRESS_CONFIG_EXTRA.
 # Runs every 5 min; WordPress schedules (backups, updates, email) fire on time.
 */5 * * * * /usr/local/bin/wp-cron-run.sh >/dev/null 2>&1
-# Daily MariaDB backup — gzipped SQL dump to /root/wp-db-backups/.
-# Retains 7 days automatically. Restore: gunzip < file.sql.gz | mariadb -u root
-0 2 * * * mkdir -p /root/wp-db-backups && podman exec mariadb sh -c 'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' | gzip > "/root/wp-db-backups/wp-db-$(date +\%Y\%m\%d).sql.gz" && find /root/wp-db-backups -name 'wp-db-*.sql.gz' -mtime +7 -delete 2>&1 | logger -t wp-db-backup
+# Daily MariaDB backup — verified logical dump (v7-13, was pipe-to-gzip).
+# Now runs a dedicated script that checks mariadb-dump's own exit status,
+# confirms the dump completed to its own marker, verifies the gzip
+# archive, and rotates old backups ONLY after all three checks pass.
+0 2 * * * /usr/local/bin/wp-db-backup.sh
 AUTOCRON
 ok "Cron jobs scheduled:"
 ok "  Weekly  : podman auto-update dry-run (Sun 04:00)"
 ok "  Every 5m: WordPress system cron (replaces WP-Cron)"
-ok "  Daily   : MariaDB backup to /root/wp-db-backups/ (7-day retention)"
+ok "  Daily   : MariaDB backup to /root/wp-db-backups/ (verified, 7-day retention)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 8G FIREWALL v1.4 — Apache .htaccess WAF, runs before PHP (fast)
@@ -4625,16 +5499,25 @@ TRIVY_VER="v0.71.2"
 TRIVY_CACHE_DIR="/var/cache/trivy"
 mkdir -p "${TRIVY_CACHE_DIR}"; chmod 755 "${TRIVY_CACHE_DIR}"
 
-# Try edge/testing first (clean apk) then fall back to official install script
+# BUG FIX (v7-13, ChatGPT Finding 13): fallback install.sh fetch is pinned
+# to a specific commit hash, not `main`. Same commit aquasecurity's own
+# setup-trivy Action pins to. See the identical fix in update.sh's
+# setup_trivy() further above for the full rationale (Trivy v0.69.4 supply
+# chain compromise, raw.githubusercontent.com serves by content-addressed
+# commit hash, etc). Keep both TRIVY_VER and TRIVY_INSTALL_COMMIT updated
+# together after auditing any change to contrib/install.sh.
+TRIVY_INSTALL_COMMIT="75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a"
+
+# Try edge/testing first (clean apk) then fall back to commit-pinned installer
 if apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \
      trivy >/dev/null 2>&1; then
   ok "Trivy installed via apk edge/testing"
 elif apk add --no-cache wget >/dev/null 2>&1 && \
      wget -qO /tmp/trivy-install.sh \
-       https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+       "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_INSTALL_COMMIT}/contrib/install.sh" \
        2>/dev/null; then
   sh /tmp/trivy-install.sh -b /usr/local/bin "${TRIVY_VER}" >/dev/null 2>&1 \
-    && ok "Trivy ${TRIVY_VER} installed via official script" \
+    && ok "Trivy ${TRIVY_VER} installed via official script (commit-pinned)" \
     || warn "Trivy install failed — vulnerability scanning disabled in update.sh"
   rm -f /tmp/trivy-install.sh
 else
@@ -5370,26 +6253,58 @@ IFACEEOF
   msg_ok "DHCP network config injected"
 fi
 
+# ── Shell-safe serialization for vars.sh (BUG FIX v7-12, #10) ──────────────
+# Every value below that came from free-text operator input (CrowdSec
+# enrolment key, GeoIP country lists, MaxMind Account ID / License Key)
+# used to be written into this heredoc via plain "${VAR}" interpolation —
+# safe only as long as the operator never typed a literal double-quote,
+# backtick, or $(...) into any of those prompts. Any of those characters
+# would break out of the VAR="..." assignment the moment vars.sh is next
+# sourced — which happens as root, during Stage 2 on first boot, and on
+# every later run of update.sh / wp-hardening.sh / wp-geoip-setup.sh,
+# which all source this file too — turning a typo or a hostile paste into
+# arbitrary shell execution. _vars_q() closes this the standard way: wrap
+# the value in single quotes, escaping any embedded single quote as '\''
+# (close quote, escaped literal quote, reopen quote). This is plain POSIX
+# single-quote escaping, deliberately NOT bash's own `printf %q` — %q can
+# emit $'...' ANSI-C-quoted output for some inputs, which is not reliably
+# parsed by BusyBox ash (this is /bin/sh on the Alpine VM, and what
+# update.sh / wp-hardening.sh / wp-geoip-setup.sh all source vars.sh
+# under, since their shebang is #!/bin/sh, not #!/bin/bash) — so %q's own
+# output could have silently broken the exact file it was meant to make
+# safer. The single-quote form is valid POSIX syntax in every
+# Bourne-family shell without exception, applied uniformly to every field
+# below rather than a per-field judgment call about which ones "need" it.
+_vars_q() {
+  local q=${1//\'/\'\\\'\'}
+  printf "'%s'" "$q"
+}
+
 # Write installer variables that can't go in the INSTALLER_EOF heredoc
 # (which is single-quoted on the host, so host variables don't expand inside).
 # The installer sources this file early in Stage 2.
 mkdir -p "$MNT/etc/wp-install"
 cat > "$MNT/etc/wp-install/vars.sh" << INSTALLERENV
 # WordPress VM installer variables — generated by create-wordpress-vm.sh
-# Sourced by /root/install-wordpress.sh during Stage 2
-WP_ADMIN_SLUG="${WP_ADMIN_SLUG}"
-CROWDSEC_ENROLL_KEY="${CROWDSEC_ENROLL_KEY}"
-NET_MODE="${NET_MODE}"
-VM_STATIC_IP="${VM_STATIC_IP}"
-GEOIP_ENABLED="${GEOIP_ENABLED:-0}"
-GEOIP_MODE="${GEOIP_MODE:-}"
-GEOIP_WHITELIST="${GEOIP_WHITELIST:-}"
-GEOIP_BLOCKLIST="${GEOIP_BLOCKLIST:-}"
-MAXMIND_ACCOUNT_ID="${MAXMIND_ACCOUNT_ID:-}"
-MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
-USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
-ADMIN_USER="${ADMIN_USER}"
-ADMIN_USER_CREATED="${ADMIN_USER_CREATED:-0}"
+# Sourced by /root/install-wordpress.sh during Stage 2, and by update.sh /
+# wp-hardening.sh / wp-geoip-setup.sh afterward. Every value below is
+# single-quote escaped (see _vars_q in create-wordpress-vm.sh) rather than
+# bare interpolation — do not hand-edit with an unescaped value pasted
+# back in.
+WP_ADMIN_SLUG=$(_vars_q "$WP_ADMIN_SLUG")
+CROWDSEC_ENROLL_KEY=$(_vars_q "$CROWDSEC_ENROLL_KEY")
+NET_MODE=$(_vars_q "$NET_MODE")
+VM_STATIC_IP=$(_vars_q "$VM_STATIC_IP")
+GEOIP_ENABLED=$(_vars_q "${GEOIP_ENABLED:-0}")
+GEOIP_MODE=$(_vars_q "${GEOIP_MODE:-}")
+GEOIP_WHITELIST=$(_vars_q "${GEOIP_WHITELIST:-}")
+GEOIP_BLOCKLIST=$(_vars_q "${GEOIP_BLOCKLIST:-}")
+MAXMIND_ACCOUNT_ID=$(_vars_q "${MAXMIND_ACCOUNT_ID:-}")
+MAXMIND_LICENSE_KEY=$(_vars_q "${MAXMIND_LICENSE_KEY:-}")
+USE_DIGEST_PINNING=$(_vars_q "${USE_DIGEST_PINNING:-1}")
+DEPLOYMENT_PROFILE=$(_vars_q "${DEPLOYMENT_PROFILE:-standard}")
+ADMIN_USER=$(_vars_q "$ADMIN_USER")
+ADMIN_USER_CREATED=$(_vars_q "${ADMIN_USER_CREATED:-0}")
 INSTALLERENV
 chmod 600 "$MNT/etc/wp-install/vars.sh"
 msg_ok "Installer vars injected (slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE}, geoip=${GEOIP_ENABLED:-0}, digest-pin=${USE_DIGEST_PINNING:-1}, admin=${ADMIN_USER})"
