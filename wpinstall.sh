@@ -945,6 +945,115 @@
 #      be to re-do the container recreation this script's own health
 #      check would already catch and diagnose.
 #
+# v7-14 PATCH NOTES (on top of v7-13) — FIELD-BUG SWEEP: custom slug made
+# functional, unbounded log growth fixed, Skopeo digest resolution fixed,
+# candidate fidelity restored, health check hardened, validation tooling
+# rewritten for self-service diagnosis. This pass was a review for real
+# bugs rather than an external audit response; each item below is a defect
+# that would (or did) bite an operator in the field.
+#  57. [CRITICAL] Skopeo digest resolution returned a MULTI-LINE value and
+#      silently broke both digest pinning and `update.sh check`. `skopeo
+#      inspect` emits a top-level manifest "Digest" AND a "LayersData"
+#      array where every element also has a "Digest" field; the old
+#      unbounded grep returned the manifest digest followed by every layer
+#      digest, one per line. Two silent consequences: (a) _pin_digest()
+#      built "${repo}@${multiline}", an invalid reference podman rejected
+#      on all 3 retries before falling through to a full tag pull — so the
+#      entire "resolve cheaply via Skopeo without pulling" design never
+#      actually took effect and every install did full pulls; (b) worse,
+#      show_check_summary() and do_digest_check() compare that value
+#      against the single-line stored digest, which can never match — so
+#      EVERY `update.sh check` reported "NEWER DIGEST AVAILABLE" for all
+#      three components on every run forever, and `digest-check` re-pulled
+#      and re-deployed everything each time even when nothing had changed.
+#      FIX: both copies of _skopeo_digest() now ask Skopeo for exactly the
+#      one field via `--format '{{.Digest}}'` (no JSON parsing, so
+#      LayersData cannot contaminate it), fall back to a head-1'd grep for
+#      older Skopeo builds, and validate the result is exactly one
+#      well-formed sha256 line before returning — failing closed to a tag
+#      pull if anything is off rather than building garbage.
+#  58. [CRITICAL] THE CUSTOM LOGIN SLUG WAS COSMETIC AND, WORSE, COULD LOCK
+#      YOU OUT. Two layers: (a) the install printed "direct /wp-admin
+#      access will return 403", but the DirectoryMatch that produces that
+#      403 is only emitted when ADMIN_CIDR/ALLOWED_ADMIN_IP is set — with a
+#      slug alone, /wp-login.php stayed wide open right beside the slug, so
+#      credential-stuffing bots that only ever try the default path were
+#      completely unaffected; (b) even as a pure alias the slug leaked
+#      immediately, because WordPress generates its own login URLs from
+#      site_url('wp-login.php', 'login_post') in the login form action and
+#      in every auth redirect. FIX, in three parts: the slug rewrite now
+#      tags the request with an Apache env marker (E=WPVM_SLUG:1) and a
+#      following rule rejects any /wp-login.php request WITHOUT that marker
+#      (install.php and setup-config.php exempted so first-run setup is
+#      never locked out); a must-use plugin (mu-plugins load
+#      unconditionally and can't be disabled from the admin UI) rewrites
+#      WordPress's own generated login URLs to the slug, WITHOUT which the
+#      new block would make login impossible — this is almost certainly the
+#      "slug didn't work" symptom from earlier versions, now made correct
+#      rather than merely decorative; and the install validates the
+#      placeholder was substituted and runs `php -l` on the plugin,
+#      removing it rather than leaving a site-wide fatal if it doesn't
+#      parse. Slugs colliding with a real WordPress path (wp-content,
+#      wp-json, etc.) are now rejected at prompt time.
+#  59. [HIGH] LOGS GREW WITHOUT BOUND AND EVENTUALLY FILLED THE DISK.
+#      Nothing in any prior version rotated anything. Four writers appended
+#      forever to the same VM disk: access.log, error.log,
+#      remoteip-debug.log, and CrowdSec's logs. When the disk fills the
+#      failure is nasty and non-obvious — MariaDB can corrupt its data
+#      directory mid-write, the backup script fails, Apache stops serving,
+#      and the first symptom is "the site is down" with no clue a log file
+#      is the cause. FIX: logrotate installed with copytruncate (MANDATORY
+#      here — Apache runs in a container holding an open fd on the
+#      bind-mounted log, so a rename-based rotate would leave it writing to
+#      the unlinked inode forever while the new file stayed empty), both a
+#      daily and a 50M size trigger, 14 days retained, plus an explicit
+#      cron entry rather than relying on Alpine's periodic dir surviving
+#      this script's own crontab edits, plus an install-time
+#      `logrotate --debug` validation. Podman's own container logs (MariaDB
+#      and CrowdSec are chatty on stdout, and that stream grows
+#      independently of the Apache files) are separately capped at 50MB
+#      each via a containers.conf.d drop-in.
+#  60. [MEDIUM] remoteip-debug.log wrote a SECOND line per request
+#      unconditionally — including on the majority of installs with no
+#      reverse proxy, where the peer-vs-interpreted comparison it exists to
+#      verify is identical by definition and proves nothing. That doubled
+#      total log volume (and, before item 59, the rate the disk filled) to
+#      answer a question nobody asked. FIX: emitted only when PROXY_IP is
+#      actually set, in both the host-generated config and the fallback.
+#  61. [MEDIUM] v7-13 REGRESSION: dropping the candidate's .htaccess mount
+#      entirely (to close a write path the audit flagged) meant the
+#      candidate ran with NO .htaccess at all — no 8G firewall, no slug
+#      rules, no permalink rules — so it was no longer validating the
+#      configuration production actually serves, defeating the point of a
+#      candidate. FIX: mount it :ro instead, which keeps the config
+#      realistic while still closing the write path into production
+#      storage.
+#  62. [MEDIUM] The HTTP health check followed redirects offsite and had no
+#      timeout. `tail -1` graded the FINAL redirect hop, so a canonical
+#      redirect to the real site domain (behind Cloudflare, say) returning
+#      403 would fail a health check that has nothing to do with container
+#      health — and during an update that means a spurious rollback. FIX:
+#      --max-redirect=0 pins the check to this server's own first response,
+#      --timeout=10 stops a half-open socket hanging an entire update, and
+#      `head -1` takes the right status line.
+#  63. [FEATURE] validate-wordpress.sh REWRITTEN for self-service
+#      diagnosis. The old version reported WHAT failed but never HOW to fix
+#      it, and most checks only confirmed a container was in state
+#      "running" — which says nothing about whether the site works. The
+#      new version runs LIVE functional tests (real HTTP fetches pinned to
+#      this server, a real DB query through WordPress's own credentials, a
+#      real gzip+completion-marker check on the newest backup, a live
+#      Skopeo digest resolution that would have caught item 57), attaches a
+#      concrete copy-paste remediation command to every single failure and
+#      reprints them all in one block at the end, separates FAIL (broken)
+#      from WARN (works but will bite later — disk filling, backup aging),
+#      and can be scoped to one area (--section security) while debugging
+#      instead of all-or-nothing. Installed also as `wp-validate`. It
+#      explicitly tests the slug end-to-end (slug path serves, default path
+#      403s, mu-plugin present and parses) and correctly reports "can't
+#      verify from this host" rather than a false failure when ADMIN_CIDR
+#      excludes the VM's own address.
+#
 # ROOTFUL DEPLOYMENT (fixed design — not a dated note):
 #   MariaDB   — rootful, --cap-drop ALL + 5 caps, isolated to wp-db
 #               (--internal, no host port, no egress).
@@ -1188,16 +1297,33 @@ echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}
 read -rp "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : " PROXY_IP
 echo ""
 echo -e "  ${BLD}Security features${CL}"
-echo -e "  ${YW}Custom wp-admin slug: replaces /wp-admin and /wp-login.php with a secret URL.${CL}"
+echo -e "  ${YW}Custom wp-admin slug: moves the login page to a secret URL and blocks${CL}"
+echo -e "  ${YW}the default /wp-login.php, so credential-stuffing bots hitting the${CL}"
+echo -e "  ${YW}standard path get 403 before WordPress or PHP is ever reached.${CL}"
 echo -e "  ${YW}Choose something unique (e.g. siteadmin, seclogin, mymsp2024).${CL}"
 echo -e "  ${YW}Avoid obvious words: admin, login, dashboard, wp, secure.${CL}"
 read -rp "  wp-admin custom slug?  (blank = keep default /wp-admin) : " WP_ADMIN_SLUG
 # Sanitise: lowercase, alphanumeric + hyphen only
 WP_ADMIN_SLUG=$(echo "${WP_ADMIN_SLUG}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
+# BUG FIX (v7-14): reject slugs that collide with a real WordPress path.
+# A slug of "wp-content", "wp-admin", "wp-includes" or similar would have
+# its RewriteRule shadow (or be shadowed by) the real directory, producing
+# a site that half-works in ways that are extremely hard to diagnose — the
+# rewrite fires for some paths and the real directory wins for others.
+case "$WP_ADMIN_SLUG" in
+  wp-admin|wp-includes|wp-content|wp-login|wp-json|index|xmlrpc|feed|admin-ajax)
+    msg_warn "Slug '${WP_ADMIN_SLUG}' collides with a real WordPress path — ignoring it."
+    msg_warn "  Re-run and pick something that isn't a WordPress reserved path."
+    WP_ADMIN_SLUG=""
+    ;;
+esac
 if [[ -n "$WP_ADMIN_SLUG" ]]; then
-  msg_ok "Admin slug: /${WP_ADMIN_SLUG}  (direct /wp-admin access will return 403)"
+  msg_ok "Admin slug: /${WP_ADMIN_SLUG}-login  (default /wp-login.php will return 403)"
+  msg_info "  A must-use plugin makes WordPress emit the slug in its own login links,"
+  msg_info "  so the default path is never advertised. Recovery instructions if you"
+  msg_info "  ever lock yourself out are printed at the end of the install."
 else
-  msg_warn "No slug set — /wp-admin accessible at default URL (still protected by ADMIN_CIDR + CrowdSec)"
+  msg_warn "No slug set — /wp-login.php accessible at default URL (still protected by ADMIN_CIDR + CrowdSec)"
 fi
 echo ""
 echo -e "  ${BLD}CrowdSec Console enrolment (optional — can be done after install):${CL}"
@@ -1551,6 +1677,13 @@ fi
 
 # Build mod_remoteip block (only if PROXY_IP was set)
 if [[ -n "$PROXY_IP" ]]; then
+  # v7-14: the dual-IP verification log is only meaningful behind a proxy —
+  # see the long note at its emission point in APACHE_SECURITY_CONF below.
+  REMOTEIP_DEBUG_LOG=$(cat << 'RIDEBUG'
+LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
+CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
+RIDEBUG
+)
   REMOTEIP_BLOCK=$(cat << RIBLOCK
 # mod_remoteip — loaded because a reverse proxy IP was specified.
 # Tells Apache to trust X-Forwarded-For from ${PROXY_IP} only.
@@ -1561,6 +1694,7 @@ RemoteIPTrustedProxy ${PROXY_IP}
 RIBLOCK
 )
 else
+  REMOTEIP_DEBUG_LOG="# remoteip-debug.log not enabled (no PROXY_IP set — the peer-vs-interpreted"$'\n'"# comparison it exists to verify is meaningless without a trusted proxy)."
   REMOTEIP_BLOCK="# mod_remoteip not loaded (direct access — no proxy IP specified)."$'\n'"# If you add a reverse proxy later, set RemoteIPTrustedProxy here and"$'\n'"# LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so"
 fi
 
@@ -1619,9 +1753,19 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
     # rewritten directory target — every RewriteRule target below is a real file.
     <IfModule mod_rewrite.c>
       RewriteEngine On
-      RewriteRule ^${WP_ADMIN_SLUG}/?$ /wp-admin/index.php [L,QSA]
-      RewriteRule ^${WP_ADMIN_SLUG}/(.+)$ /wp-admin/\$1 [L,QSA]
-      RewriteRule ^${WP_ADMIN_SLUG}-login/?$ /wp-login.php [L,QSA]
+      RewriteRule ^${WP_ADMIN_SLUG}/?$ /wp-admin/index.php [L,QSA,E=WPVM_SLUG:1]
+      RewriteRule ^${WP_ADMIN_SLUG}/(.+)$ /wp-admin/\$1 [L,QSA,E=WPVM_SLUG:1]
+      RewriteRule ^${WP_ADMIN_SLUG}-login/?$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]
+
+      # v7-14: block the default login path unless the request came through
+      # the slug rewrite above. Without this the slug was decorative — bots
+      # hammering /wp-login.php never noticed it existed. install.php and
+      # setup-config.php stay reachable so first-run setup still works.
+      RewriteCond %{ENV:WPVM_SLUG} !=1
+      RewriteCond %{ENV:REDIRECT_WPVM_SLUG} !=1
+      RewriteCond %{REQUEST_URI} !install\.php$
+      RewriteCond %{REQUEST_URI} !setup-config\.php$
+      RewriteRule ^wp-login\.php$ - [F,L]
     </IfModule>
 SLUGEOF
 )
@@ -1662,8 +1806,16 @@ CustomLog /var/log/apache2/access.log combined
 # post-substitution address. If a trusted proxy is configured and these two
 # never differ, RemoteIPTrustedProxy doesn't match the real proxy source —
 # a silent misconfiguration that would otherwise be invisible.
-LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
-CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
+#
+# BUG FIX (v7-14): this used to be emitted UNCONDITIONALLY, writing a second
+# line to disk for every single request on every install — including the
+# majority of installs with no reverse proxy at all, where %{c}a and %a are
+# always identical by definition and the log proves nothing. That doubled
+# total log volume (and, before v7-14 added logrotate, doubled the rate at
+# which the disk filled) to answer a question nobody had asked. Now emitted
+# only when PROXY_IP is actually set, which is the only case where the
+# comparison carries information.
+${REMOTEIP_DEBUG_LOG}
 
 ${WP_ADMIN_BLOCK}
 
@@ -2007,8 +2159,20 @@ _fail() { echo "  ✗  $*" >&2; FAIL=1; }
 # Found (temporary redirect, common on WP session/login flows) count as
 # healthy for a GET / on a working WordPress. Any other status is a real
 # failure signal worth investigating, not something to silently accept.
-HTTP_CODE=$(wget -S -O /dev/null "http://127.0.0.1:${HTTP_PORT}/" 2>&1 \
-  | awk '/HTTP\// {print $2}' | tail -1)
+#
+# BUG FIX (v7-14): two robustness problems with how the status was read.
+# (1) wget follows redirects by default, and `tail -1` took the status of
+# the FINAL hop — so if WordPress issued a canonical redirect to the real
+# site domain, this check was grading whatever that domain returned rather
+# than what this VM returned. A site behind Cloudflare returning 403 to the
+# VM's own IP would fail a health check that has nothing to do with the
+# container being healthy, and during an update that means a spurious
+# rollback. --max-redirect=0 plus `head -1` pins the check to this
+# server's own first response. (2) No timeout: a half-open socket could
+# hang the health check, and with it an entire update, indefinitely.
+HTTP_CODE=$(wget -S -O /dev/null --max-redirect=0 --tries=2 --timeout=10 \
+  "http://127.0.0.1:${HTTP_PORT}/" 2>&1 \
+  | awk '/^[[:space:]]*HTTP\// {print $2}' | head -1)
 case "$HTTP_CODE" in
   200|301|302) _pass "HTTP response: ${HTTP_CODE}" ;;
   *) _fail "Unexpected HTTP response: ${HTTP_CODE:-none} (expected 200, 301, or 302)" ;;
@@ -2291,6 +2455,23 @@ firewall_driver = "nftables"
 CONTAINERSCONF
 ok "netavark: firewall_driver=nftables (drop-in: containers.conf.d/)"
 
+# BUG FIX (v7-14): cap Podman's own container log files. Separate from the
+# Apache file logs that logrotate handles — this is the container stdout/
+# stderr stream Podman itself writes under
+# /var/lib/containers/storage/.../ctr.log, which has NO size limit by
+# default. MariaDB and CrowdSec are both chatty on stdout (every
+# connection error, every decision), so this grows continuously and
+# invisibly: `du -sh /home/wpuser/wp/logs` looks fine while the real
+# consumer is container storage. Set globally via a drop-in for the same
+# TOML duplicate-section-header reason explained for the netavark drop-in
+# above. 50MB per container is enough to debug a recent failure without
+# being able to fill the disk on its own.
+cat > /etc/containers/containers.conf.d/20-log-limits.conf << 'CONTAINERSLOG'
+[containers]
+log_size_max = 52428800
+CONTAINERSLOG
+ok "Podman container logs capped at 50MB each (drop-in: containers.conf.d/)"
+
 ts "Configuring Podman storage"
 mkdir -p /etc/containers
 cat > /etc/containers/registries.conf << 'REGCONF'
@@ -2377,13 +2558,35 @@ _skopeo_digest() {
   # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
   # missing, network error, unparseable output) — treated as "fall back",
   # never as fatal.
+  #
+  # BUG FIX (v7-14): this used to return a MULTI-LINE value. `skopeo
+  # inspect` emits the top-level image manifest "Digest" AND a "LayersData"
+  # array whose every element also carries a "Digest" field, so an
+  # unbounded grep returned the manifest digest plus every layer digest.
+  # _pin_digest() then built "${repo}@${digest}" out of that, producing an
+  # invalid reference that `podman pull` rejected on all 3 attempts before
+  # falling through to a full tag pull — so the whole point of resolving
+  # via Skopeo (cheap manifest query, no pull) never actually happened.
+  # See the fuller note on the matching function inside update.sh.
+  # FIX: use Skopeo's --format to ask for exactly that one field, fall back
+  # to a head-1'd grep on older Skopeo, and validate single-line sha256
+  # shape before returning.
   local ref="$1" out digest
   command -v skopeo >/dev/null 2>&1 || return 1
-  out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
-  digest=$(printf '%s' "$out" \
-    | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
-    | grep -oE 'sha256:[0-9a-f]{64}')
+
+  digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null | head -1) || digest=""
+
+  if [ -z "$digest" ]; then
+    out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
+    digest=$(printf '%s' "$out" \
+      | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+      | grep -oE 'sha256:[0-9a-f]{64}' \
+      | head -1)
+  fi
+
   [ -n "$digest" ] || return 1
+  [ "$(printf '%s\n' "$digest" | wc -l | tr -d ' ')" = "1" ] || return 1
+  printf '%s' "$digest" | grep -qE '^sha256:[0-9a-f]{64}$' || return 1
   printf '%s\n' "$digest"
 }
 
@@ -2699,11 +2902,34 @@ if [ -n "${WP_ADMIN_SLUG}" ]; then
   {
     echo ""
     echo "# ── Custom wp-admin slug (mirrors wp-security.conf) ─────────────────────────"
+    echo "# BUG FIX (v7-14): the slug used to be a pure ALIAS — /slug-login served"
+    echo "# the login page, but /wp-login.php stayed wide open right beside it, so"
+    echo "# every credential-stuffing bot that only ever tries the default path was"
+    echo "# completely unaffected. The install even printed 'direct /wp-admin access"
+    echo "# will return 403', which was only true if ADMIN_CIDR happened to be set."
+    echo "# Now the slug rewrite tags the request with an environment marker, and"
+    echo "# the block below rejects any request for wp-login.php that arrives"
+    echo "# WITHOUT that marker — i.e. anything that didn't come through the slug."
+    echo "# Apache prefixes env vars set before an internal redirect with REDIRECT_,"
+    echo "# so both spellings are checked."
     echo "<IfModule mod_rewrite.c>"
     echo "    RewriteEngine On"
-    echo "    RewriteRule ^${WP_ADMIN_SLUG}/?\$ /wp-admin/index.php [L,QSA]"
-    echo "    RewriteRule ^${WP_ADMIN_SLUG}/(.+)\$ /wp-admin/\$1 [L,QSA]"
-    echo "    RewriteRule ^${WP_ADMIN_SLUG}-login/?\$ /wp-login.php [L,QSA]"
+    echo ""
+    echo "    # Slug -> real admin paths. E=WPVM_SLUG:1 marks the request as having"
+    echo "    # legitimately come through the secret URL."
+    echo "    RewriteRule ^${WP_ADMIN_SLUG}/?\$ /wp-admin/index.php [L,QSA,E=WPVM_SLUG:1]"
+    echo "    RewriteRule ^${WP_ADMIN_SLUG}/(.+)\$ /wp-admin/\$1 [L,QSA,E=WPVM_SLUG:1]"
+    echo "    RewriteRule ^${WP_ADMIN_SLUG}-login/?\$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]"
+    echo ""
+    echo "    # Block the default login path unless it came via the slug above."
+    echo "    # install.php and setup-config.php are exempt: first-run WordPress"
+    echo "    # setup ALWAYS happens at the default /wp-admin/install.php URL, and"
+    echo "    # locking that out would make a fresh VM unusable."
+    echo "    RewriteCond %{ENV:WPVM_SLUG} !=1"
+    echo "    RewriteCond %{ENV:REDIRECT_WPVM_SLUG} !=1"
+    echo "    RewriteCond %{REQUEST_URI} !install\\.php\$"
+    echo "    RewriteCond %{REQUEST_URI} !setup-config\\.php\$"
+    echo "    RewriteRule ^wp-login\\.php\$ - [F,L]"
     echo "</IfModule>"
   } >> /home/wpuser/wp/htaccess/.htaccess
 fi
@@ -2769,11 +2995,11 @@ else
 ServerTokens Prod
 ServerSignature Off
 CustomLog /var/log/apache2/access.log combined
-# Dual-IP diagnostic log — see main wp-security.conf for rationale. Kept
-# separate from access.log so CrowdSec's apache2 collection parsing is
-# never affected.
-LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
-CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
+# v7-14: the dual-IP remoteip-debug log is deliberately NOT enabled here.
+# This fallback only runs when the host-generated config is missing, which
+# means no PROXY_IP was baked in, which means peer and interpreted address
+# are identical by definition — a second log line per request proving
+# nothing, at the cost of doubling log volume.
 <Directory /var/www/html>
     Options -Indexes +FollowSymLinks
     AllowOverride All
@@ -2849,6 +3075,117 @@ ts "Enabling syslog"
 rc-update add syslog boot 2>/dev/null || true
 rc-service syslog status >/dev/null 2>&1 || rc-service syslog start 2>/dev/null || true
 ok "syslog active"
+
+# ── Log rotation ────────────────────────────────────────────────────────────
+# BUG FIX (v7-14) — LOGS GREW WITHOUT BOUND AND EVENTUALLY FILLED THE DISK.
+# Nothing in any previous version rotated anything. Four separate writers
+# all appended forever to the same VM disk:
+#   • /home/wpuser/wp/logs/access.log       — every HTTP request, combined format
+#   • /home/wpuser/wp/logs/error.log        — Apache errors + PHP warnings
+#   • /home/wpuser/wp/logs/remoteip-debug.log — a SECOND line per request
+#   • /var/log/crowdsec/*.log               — decisions, parser output
+# On a site getting even modest bot traffic that's easily hundreds of MB a
+# month, and the failure mode when the disk finally fills is nasty and
+# non-obvious: MariaDB can corrupt its data directory mid-write, the daily
+# backup script fails (and its own error output has nowhere to go), Apache
+# stops serving, and the first symptom an operator sees is "the site is
+# down" with no clue that a log file is the cause.
+#
+# copytruncate is REQUIRED here, not a preference: Apache runs inside a
+# container and holds an open file descriptor on the bind-mounted log.
+# A normal rotate (rename + create new) would leave Apache writing to the
+# now-unlinked inode forever — the new file would stay empty and the old
+# one would keep growing invisibly, which is worse than not rotating at
+# all. copytruncate copies then truncates in place, so the container's
+# existing fd keeps working. The small window where lines can be lost
+# between copy and truncate is an acceptable trade for access logs.
+#
+# Both a size trigger and a time trigger are set: `daily` bounds how old
+# a log can get, `maxsize` bounds how big it can get between daily runs
+# so a traffic spike can't blow past the budget in a few hours.
+ts "Configuring log rotation"
+apk add --no-cache logrotate >/dev/null 2>&1 || warn "logrotate install failed — logs will NOT be rotated; check disk usage manually"
+
+mkdir -p /etc/logrotate.d
+cat > /etc/logrotate.d/wordpress-vm << 'LOGROTEOF'
+# WordPress VM log rotation — installed by create-wordpress-vm.sh
+# copytruncate is mandatory: Apache runs in a container holding an open fd
+# on these bind-mounted files. See the note in the provisioning script.
+
+/home/wpuser/wp/logs/*.log {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+    create 0640 33 33
+}
+
+/var/log/crowdsec/*.log {
+    daily
+    rotate 7
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+/var/log/wp-*.log {
+    weekly
+    rotate 8
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+LOGROTEOF
+chmod 644 /etc/logrotate.d/wordpress-vm
+
+# Alpine's logrotate package drops a hook in /etc/periodic/daily, but that
+# only runs if the stock busybox crontab entries that call run-parts are
+# still present — and this script appends its own entries to
+# /etc/crontabs/root, so relying on that is a silent single point of
+# failure. An explicit entry is scheduled instead (03:30, after the 02:00
+# backup so a rotation can never truncate a log the backup is reading).
+if ! grep -q 'logrotate.*wordpress-vm\|/usr/sbin/logrotate /etc/logrotate.conf' /etc/crontabs/root 2>/dev/null; then
+  echo '30 3 * * * /usr/sbin/logrotate /etc/logrotate.conf 2>&1 | logger -t logrotate' >> /etc/crontabs/root
+fi
+
+# logrotate.conf must exist and must include logrotate.d — Alpine's package
+# ships one, but create a minimal fallback if it somehow isn't there so the
+# cron entry above is never a no-op.
+if [ ! -f /etc/logrotate.conf ]; then
+  cat > /etc/logrotate.conf << 'LRCONF'
+weekly
+rotate 4
+create
+compress
+include /etc/logrotate.d
+LRCONF
+  chmod 644 /etc/logrotate.conf
+fi
+
+if command -v logrotate >/dev/null 2>&1; then
+  # --debug parses the config without touching anything: catches a syntax
+  # error now, at install time, instead of silently never rotating.
+  if logrotate --debug /etc/logrotate.conf >/dev/null 2>&1; then
+    ok "Log rotation active (daily + 50M cap, 14 days retained, copytruncate)"
+  else
+    warn "logrotate config did not validate — check: logrotate --debug /etc/logrotate.conf"
+  fi
+else
+  warn "logrotate not available — logs are NOT bounded. Monitor: du -sh /home/wpuser/wp/logs"
+fi
 
 
 
@@ -3119,6 +3456,148 @@ done
 # restarts (container UID 33 maps 1:1 to host UID 33 under rootful Podman).
 chown -R 33:33 /home/wpuser/wp/html/wp-content 2>/dev/null \
   && ok "Host-side /home/wpuser/wp/html/wp-content ownership fixed too" || true
+
+# ── Custom login slug: WordPress-side support (v7-14) ───────────────────────
+# BUG FIX (v7-14) — WITHOUT THIS THE SLUG LOCKS YOU OUT OF YOUR OWN SITE.
+# v7-14 made the slug a real boundary by blocking direct /wp-login.php in
+# .htaccess. But WordPress generates its OWN login URLs from
+# site_url('wp-login.php', ...) in at least four places that all matter:
+#   • the <form action> on the login page itself (scheme 'login_post')
+#   • wp_login_url() used by auth_redirect() when a logged-out user hits
+#     any /wp-admin/ page
+#   • the "Lost your password?" and logout links
+#   • the redirect after a successful login
+# So without a WordPress-side fix, the sequence is: visit /slug-login (works,
+# internal rewrite) -> page renders with action="http://host/wp-login.php"
+# -> submit -> POST goes to the DEFAULT path -> Apache 403s it -> login is
+# impossible. That is almost certainly the "custom slug didn't work" symptom
+# from earlier versions, made fatal rather than merely cosmetic by the new
+# block. This must-use plugin closes it by rewriting those generated URLs to
+# the slug, so WordPress never emits (or depends on) the default path.
+#
+# mu-plugins is used deliberately over a normal plugin: mu-plugins load
+# unconditionally, cannot be deactivated from the admin UI, and survive
+# plugin-wipe recovery steps — appropriate for something that, if disabled,
+# makes the site unreachable.
+if [ -n "${WP_ADMIN_SLUG}" ]; then
+  ts "Installing custom login slug support (mu-plugin)"
+  MU_DIR="/home/wpuser/wp/html/wp-content/mu-plugins"
+  mkdir -p "${MU_DIR}"
+  # The slug is substituted here on the VM (vars.sh already sourced), so the
+  # heredoc body is quoted and the one dynamic value is injected via sed
+  # afterwards — avoids any chance of PHP's $ syntax being mangled by shell
+  # expansion inside the heredoc.
+  cat > "${MU_DIR}/00-wpvm-login-slug.php" << 'MUPLUGIN'
+<?php
+/**
+ * Plugin Name: WPVM Custom Login Slug
+ * Description: Routes WordPress-generated login URLs through the custom slug
+ *              configured at provisioning time. Installed by
+ *              create-wordpress-vm.sh — do not edit by hand.
+ *
+ * Apache blocks direct requests to wp-login.php unless they arrive through
+ * the slug rewrite. WordPress, left alone, would still emit wp-login.php in
+ * its login form action and in every auth redirect, so submitting the login
+ * form would hit the blocked path and fail. This rewrites those URLs.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+if ( ! defined( 'WPVM_LOGIN_SLUG' ) ) {
+    define( 'WPVM_LOGIN_SLUG', 'WPVM_SLUG_PLACEHOLDER-login' );
+}
+
+/**
+ * Swap wp-login.php for the slug in any URL string.
+ */
+function wpvm_swap_login_path( $url ) {
+    if ( is_string( $url ) && false !== strpos( $url, 'wp-login.php' ) ) {
+        return str_replace( 'wp-login.php', WPVM_LOGIN_SLUG, $url );
+    }
+    return $url;
+}
+
+/*
+ * site_url() with the 'login' or 'login_post' scheme is what wp_login_url()
+ * and the login form's own action attribute are built from — filtering here
+ * covers both, plus anything else in core or a plugin that asks for a login
+ * URL the documented way.
+ */
+add_filter(
+    'site_url',
+    function ( $url, $path, $scheme ) {
+        if ( 'login' === $scheme || 'login_post' === $scheme ) {
+            return wpvm_swap_login_path( $url );
+        }
+        return $url;
+    },
+    100,
+    3
+);
+
+add_filter( 'network_site_url', function ( $url, $path, $scheme ) {
+    if ( 'login' === $scheme || 'login_post' === $scheme ) {
+        return wpvm_swap_login_path( $url );
+    }
+    return $url;
+}, 100, 3 );
+
+add_filter( 'login_url',        'wpvm_swap_login_path', 100 );
+add_filter( 'logout_url',       'wpvm_swap_login_path', 100 );
+add_filter( 'lostpassword_url', 'wpvm_swap_login_path', 100 );
+add_filter( 'register_url',     'wpvm_swap_login_path', 100 );
+
+/*
+ * Catch redirects that were built before the filters above could apply
+ * (some plugins hand-assemble a wp-login.php URL and pass it to
+ * wp_redirect / wp_safe_redirect directly).
+ */
+add_filter( 'wp_redirect', 'wpvm_swap_login_path', 100 );
+
+/*
+ * Emails — password reset and new-user notifications embed a login URL
+ * built from network_site_url() in some code paths that run before the
+ * filters above are registered in a multisite context.
+ */
+add_filter( 'retrieve_password_message', 'wpvm_swap_login_path', 100 );
+add_filter( 'wp_mail', function ( $args ) {
+    if ( isset( $args['message'] ) ) {
+        $args['message'] = wpvm_swap_login_path( $args['message'] );
+    }
+    return $args;
+}, 100 );
+MUPLUGIN
+
+  # Inject the actual slug. Using a delimiter that cannot appear in the
+  # sanitised slug (lowercase alnum + hyphen only), so no escaping needed.
+  sed -i "s|WPVM_SLUG_PLACEHOLDER|${WP_ADMIN_SLUG}|g" "${MU_DIR}/00-wpvm-login-slug.php"
+
+  chown -R 33:33 "${MU_DIR}" 2>/dev/null || true
+  chmod 644 "${MU_DIR}/00-wpvm-login-slug.php"
+
+  # Verify the substitution actually happened — a leftover placeholder would
+  # mean every login URL points at a nonexistent path.
+  if grep -q "WPVM_SLUG_PLACEHOLDER" "${MU_DIR}/00-wpvm-login-slug.php" 2>/dev/null; then
+    warn "Login slug mu-plugin still contains a placeholder — slug will NOT work."
+    warn "  Fix by hand: ${MU_DIR}/00-wpvm-login-slug.php"
+  else
+    ok "Login slug mu-plugin installed (/${WP_ADMIN_SLUG}-login)"
+    # Confirm PHP can actually parse it. A syntax error in an mu-plugin is a
+    # site-wide fatal, and mu-plugins can't be disabled from the admin UI —
+    # so this is checked now, while there's still a console to report it on.
+    if PRUN exec wordpress php -l /var/www/html/wp-content/mu-plugins/00-wpvm-login-slug.php >/dev/null 2>&1; then
+      ok "  mu-plugin syntax verified by PHP"
+    else
+      warn "  mu-plugin FAILED PHP syntax check — removing it to avoid a fatal error"
+      rm -f "${MU_DIR}/00-wpvm-login-slug.php"
+      warn "  The slug rewrite still works, but WordPress will emit /wp-login.php"
+      warn "  URLs that the .htaccess block rejects. Remove the wp-login block from"
+      warn "  /home/wpuser/wp/htaccess/.htaccess if you get locked out."
+    fi
+  fi
+fi
 
 
 # ── OpenRC: mariadb-container ─────────────────────────────────────────────────
@@ -3969,14 +4448,69 @@ require_clean_container_state() {
 # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
 # missing, network error, unparseable output) — every caller treats that as
 # "fall back to the old method", never as fatal.
+#
+# BUG FIX (v7-14) — THIS RETURNED A MULTI-LINE VALUE AND SILENTLY BROKE
+# DIGEST PINNING AND digest-check. `skopeo inspect` emits a top-level
+# "Digest" (the image manifest digest — the one we want) AND a "LayersData"
+# array in which EVERY ENTRY also has its own "Digest" field. The old
+# extraction was:
+#     grep -oE '"Digest"...' | grep -oE 'sha256:[0-9a-f]{64}'
+# with no head/limit, so for a typical WordPress image it returned the
+# manifest digest followed by 10-20 layer digests, one per line. Two
+# concrete failures resulted, both silent:
+#   1. _pin_digest() built candidate="${repo}@${digest}" from that
+#      multi-line value, producing a syntactically invalid image reference.
+#      `podman pull` rejected it every time, burned all 3 retry attempts
+#      with 4-second sleeps, logged a scary "Skopeo resolved a digest but
+#      pulling it failed" warning, then fell through to the tag-pull
+#      fallback — meaning the entire "resolve cheaply via Skopeo without
+#      pulling" design never actually took effect, and every install did
+#      full pulls anyway.
+#   2. Worse: show_check_summary()'s _report_one() and do_digest_check()
+#      compare the resolved remote digest against the stored single-line
+#      digest from pinned.env. A multi-line value can never equal a
+#      single-line one, so EVERY `update.sh check` reported "NEWER DIGEST
+#      AVAILABLE under this tag" for all three components on every run,
+#      forever, and `update.sh digest-check` re-pulled and re-deployed all
+#      three components every single time it ran even when nothing had
+#      changed upstream.
+# FIX: ask Skopeo for exactly the one field via its Go-template --format
+# (unambiguous, no parsing), fall back to the grep path with an explicit
+# `head -1` for older Skopeo builds that lack --format, and validate the
+# final value is exactly one well-formed sha256 line before returning it.
 _skopeo_digest() {
   local ref="$1" out digest
   command -v skopeo >/dev/null 2>&1 || return 1
-  out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
-  digest=$(printf '%s' "$out" \
-    | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
-    | grep -oE 'sha256:[0-9a-f]{64}')
+
+  # Preferred: let Skopeo emit just the manifest digest. No JSON parsing,
+  # so LayersData can't contaminate the result no matter how it's shaped.
+  digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null | head -1) || digest=""
+
+  # Fallback for Skopeo builds without --format support: parse the JSON,
+  # but take only the FIRST "Digest" match. skopeo emits the top-level
+  # image digest before the LayersData array, so head -1 is the manifest
+  # digest. (The validation below is what actually guarantees correctness —
+  # if this ever picks up the wrong field, it fails closed to "no digest"
+  # and the caller falls back to a tag pull rather than using garbage.)
+  if [ -z "$digest" ]; then
+    out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
+    digest=$(printf '%s' "$out" \
+      | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+      | grep -oE 'sha256:[0-9a-f]{64}' \
+      | head -1)
+  fi
+
+  # Validate: exactly one line, exactly the sha256:<64 hex> shape. Anything
+  # else (empty, multi-line, truncated, wrong prefix) is treated as a
+  # failed lookup so the caller falls back cleanly instead of building an
+  # invalid image reference out of it.
   [ -n "$digest" ] || return 1
+  [ "$(printf '%s\n' "$digest" | wc -l | tr -d ' ')" = "1" ] || return 1
+  case "$digest" in
+    sha256:*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$digest" | grep -qE '^sha256:[0-9a-f]{64}$' || return 1
   printf '%s\n' "$digest"
 }
 _resolve_digest() {
@@ -4205,11 +4739,12 @@ do_wp_update() {
   #     logs). Production's real access log is no longer written to by
   #     the candidate, and there's nothing to clean up after — the tmpfs
   #     disappears with the container.
-  #   • The production .htaccess :rw mount is dropped entirely. The health
-  #     check doesn't need it (it doesn't hit any URL that requires
-  #     .htaccess rewrites), and having ANY :rw mount into
-  #     /home/wpuser/wp was the last direct write path into production
-  #     storage from the candidate.
+  #   • The production .htaccess is mounted :ro rather than :rw. v7-13
+  #     dropped this mount entirely, which removed the write path but also
+  #     meant the candidate ran with NO .htaccess at all — no 8G firewall,
+  #     no slug rules, no WordPress permalink rules — so it was no longer
+  #     testing the configuration production actually serves. Read-only
+  #     restores that fidelity while keeping the write path closed.
   # WP_ENVIRONMENT_TYPE=staging is also set as a hint to well-behaved
   # plugins to skip write-on-init side effects; WordPress core itself
   # respects this env var per the WordPress developer docs.
@@ -4265,6 +4800,7 @@ do_wp_update() {
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
     -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
     -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
+    -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:ro \
     ${RI_VOLS} \
     "${_UPD_PULL_REF}"; then
     podman network connect wp-db "$WP_CANDIDATE" >/dev/null 2>&1 || true
@@ -5843,78 +6379,650 @@ fi
 # Write the validation script for ongoing use
 cat > /usr/local/bin/validate-wordpress.sh << 'VALSCRIPT'
 #!/bin/sh
-# WordPress VM Health Validation
-# Usage: validate-wordpress.sh [--quiet]
-# Exit code: 0 = all pass, 1 = failures found
-QUIET="${1:-}"
-PASS=0; FAIL=0
+# ============================================================================
+# validate-wordpress.sh — live validation and self-service diagnostics
+# ============================================================================
+# Rewritten in v7-14. The previous version reported WHAT failed but never HOW
+# to fix it, and most of its checks only confirmed a container was in state
+# "running" — which says nothing about whether the site actually works. An
+# operator hitting a problem after install had no path from "✗ something"
+# to a resolution without reading the 6000-line provisioning script.
+#
+# This version:
+#   • runs LIVE functional tests (real HTTP fetches, a real DB query through
+#     WordPress's own credentials, a real gzip integrity check on the newest
+#     backup, a real Skopeo digest resolution) rather than status lookups
+#   • attaches a concrete remediation command to every single failure and
+#     reprints them all in one block at the end, so fixing is copy-paste
+#   • separates FAIL (something is broken) from WARN (works, but will bite
+#     you later — disk filling, backup aging, verification degraded)
+#   • can be scoped to one area while debugging, instead of all-or-nothing
+#
+# Usage:
+#   validate-wordpress.sh                  run everything
+#   validate-wordpress.sh --section web    run one section
+#   validate-wordpress.sh --list           show section names
+#   validate-wordpress.sh --quiet          only output failures/warnings
+#   validate-wordpress.sh --quick          skip slow checks (network, backups)
+#
+# Exit: 0 = all passed, 1 = one or more failures, 2 = warnings only
+# ============================================================================
+
+QUIET=0
+QUICK=0
+ONLY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet|-q)   QUIET=1 ;;
+    --quick)      QUICK=1 ;;
+    --section|-s) shift; ONLY="$1" ;;
+    --list|-l)
+      echo "Sections: containers database web security updates logs backups"
+      exit 0 ;;
+    --help|-h)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
-PRUN() {
-  podman "$@"
+
+PASS=0; FAIL=0; WARN=0
+REMEDIES=""
+CUR_SECTION=""
+
+# ── output helpers ─────────────────────────────────────────────────────────
+_c_ok=""; _c_bad=""; _c_warn=""; _c_dim=""; _c_off=""
+if [ -t 1 ]; then
+  _c_ok=$(printf '\033[32m'); _c_bad=$(printf '\033[31m')
+  _c_warn=$(printf '\033[33m'); _c_dim=$(printf '\033[2m'); _c_off=$(printf '\033[0m')
+fi
+
+section() {
+  CUR_SECTION="$1"
+  [ "$QUIET" = "1" ] && return 0
+  echo ""
+  echo "── $2 ──────────────────────────────────────────"
 }
 
-chk() {
-  local label="$1" got="$2" want="${3:-ok}"
-  if [ "$got" = "$want" ]; then
-    [ "$QUIET" != "--quiet" ] && echo "  ✔  ${label}"
-    PASS=$((PASS+1))
-  else
-    echo "  ✗  ${label}  (got: ${got})"
-    FAIL=$((FAIL+1))
+# want_section: should this section run?
+want_section() {
+  [ -z "$ONLY" ] && return 0
+  [ "$ONLY" = "$1" ] && return 0
+  return 1
+}
+
+pass() {
+  PASS=$((PASS+1))
+  [ "$QUIET" = "1" ] && return 0
+  printf '  %s✔%s  %s\n' "$_c_ok" "$_c_off" "$1"
+}
+
+# fail <label> <detail> <remedy>
+fail() {
+  FAIL=$((FAIL+1))
+  printf '  %s✗%s  %s\n' "$_c_bad" "$_c_off" "$1"
+  [ -n "$2" ] && printf '     %s%s%s\n' "$_c_dim" "$2" "$_c_off"
+  REMEDIES="${REMEDIES}
+[FAIL] ${1}
+       ${3}"
+}
+
+# warn <label> <detail> <remedy>
+warn() {
+  WARN=$((WARN+1))
+  printf '  %s!%s  %s\n' "$_c_warn" "$_c_off" "$1"
+  [ -n "$2" ] && printf '     %s%s%s\n' "$_c_dim" "$2" "$_c_off"
+  REMEDIES="${REMEDIES}
+[WARN] ${1}
+       ${3}"
+}
+
+info() {
+  [ "$QUIET" = "1" ] && return 0
+  printf '     %s%s%s\n' "$_c_dim" "$1" "$_c_off"
+}
+
+# ── shared probes ──────────────────────────────────────────────────────────
+
+# _http_code <url> — this server's own status, no redirect following
+_http_code() {
+  wget -S -O /dev/null --max-redirect=0 --tries=1 --timeout=8 "$1" 2>&1 \
+    | awk '/^[[:space:]]*HTTP\// {print $2}' | head -1
+}
+
+_running() {
+  podman inspect "$1" --format '{{.State.Status}}' 2>/dev/null
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "  WordPress VM — Validation & Diagnostics"
+echo "  $(date '+%Y-%m-%d %H:%M:%S')   profile=${DEPLOYMENT_PROFILE:-standard}"
+echo "═══════════════════════════════════════════════════════════"
+
+# ── CONTAINERS ─────────────────────────────────────────────────────────────
+if want_section containers; then
+section containers "Containers"
+
+for c in wordpress mariadb crowdsec; do
+  st=$(_running "$c")
+  case "$st" in
+    running) pass "${c} is running" ;;
+    "")      fail "${c} does not exist" \
+                  "No container by that name — it was never created, or was removed." \
+                  "podman ps -a | grep ${c}   # then recreate:  rc-service ${c}-container start" ;;
+    *)       fail "${c} is '${st}', not running" \
+                  "Container exists but is stopped or exited." \
+                  "podman logs --tail 50 ${c}   # find the cause, then:  podman start ${c}" ;;
+  esac
+done
+
+# Stale *-old containers mean a previous update was interrupted. Left in
+# place they block the NEXT update outright (require_clean_container_state
+# refuses to rename over them), so this is worth surfacing before someone
+# hits it mid-update.
+for c in wordpress-old mariadb-old crowdsec-old; do
+  if podman container exists "$c" 2>/dev/null; then
+    warn "Stale rollback container '${c}' present" \
+         "Left by an update that did not finish. It will block the next update." \
+         "podman inspect ${c}    # confirm it is not needed, then:  podman rm -f ${c}"
   fi
-}
+done
 
+# A lock held by a dead PID wedges every future update until cleared.
+if [ -d /run/lock/wordpress-update.lock ]; then
+  lp=$(cat /run/lock/wordpress-update.lock/pid 2>/dev/null)
+  if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
+    info "An update is currently running (PID ${lp}) — some checks may be transient"
+  else
+    warn "Stale update lock held by dead PID ${lp:-unknown}" \
+         "update.sh will refuse to run until this is cleared." \
+         "rm -rf /run/lock/wordpress-update.lock"
+  fi
+fi
+fi
+
+# ── DATABASE ───────────────────────────────────────────────────────────────
+if want_section database; then
+section database "Database"
+
+if [ "$(_running mariadb)" = "running" ]; then
+  if podman exec mariadb sh -c \
+       'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" >/dev/null 2>&1 \
+        || mariadb-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" >/dev/null 2>&1' \
+       >/dev/null 2>&1; then
+    pass "MariaDB responds to ping"
+  else
+    fail "MariaDB is running but not answering ping" \
+         "The daemon is up but not accepting admin connections — often mid-crash-recovery." \
+         "podman logs --tail 80 mariadb    # look for InnoDB recovery or a corrupt tablespace"
+  fi
+
+  if [ -x /usr/local/bin/mariadb-health-check.sh ] \
+     && /usr/local/bin/mariadb-health-check.sh mariadb >/dev/null 2>&1; then
+    pass "MariaDB deep health (real query + InnoDB engine active)"
+  else
+    fail "MariaDB deep health check failed" \
+         "Ping succeeded but a real query or the InnoDB engine check did not." \
+         "/usr/local/bin/mariadb-health-check.sh mariadb    # run it directly to see which gate failed"
+  fi
+else
+  fail "MariaDB not running — database checks skipped" \
+       "" \
+       "podman logs --tail 50 mariadb ; podman start mariadb"
+fi
+
+# The query that matters: WordPress's OWN credentials, from inside the
+# WordPress container, over the wp-db network. This is what a page load does.
+if [ "$(_running wordpress)" = "running" ]; then
+  dbq=$(podman exec --user www-data wordpress php -r '
+    $db = @new mysqli(getenv("WORDPRESS_DB_HOST"), getenv("WORDPRESS_DB_USER"),
+                      getenv("WORDPRESS_DB_PASSWORD"), getenv("WORDPRESS_DB_NAME"));
+    if ($db->connect_errno) { echo "connect_fail"; exit(0); }
+    $r = $db->query("SELECT 1");
+    echo $r ? "ok" : "query_fail";' 2>/dev/null)
+  case "$dbq" in
+    ok) pass "WordPress can query the database with its own credentials" ;;
+    connect_fail)
+      fail "WordPress cannot connect to MariaDB" \
+           "DNS, credentials, or the wp-db network path is broken." \
+           "podman exec wordpress getent hosts mariadb   # if this fails it is DNS/network, not credentials" ;;
+    query_fail)
+      fail "WordPress connected but SELECT 1 failed" \
+           "Authentication worked; the database itself rejected a trivial query." \
+           "podman exec mariadb mariadb -uroot -p\"\$MARIADB_ROOT_PASSWORD\" -e 'SHOW DATABASES;'" ;;
+    *)
+      fail "WordPress DB check did not run" \
+           "PHP or mysqli is unavailable inside the container." \
+           "podman exec wordpress php -m | grep -i mysqli" ;;
+  esac
+fi
+fi
+
+# ── WEB ────────────────────────────────────────────────────────────────────
+if want_section web; then
+section web "Web server"
+
+code=$(_http_code "http://127.0.0.1/")
+case "$code" in
+  200|301|302) pass "Site responds on :80 (HTTP ${code})" ;;
+  403) warn "Site returns 403 on :80" \
+            "Expected if WEB_CIDR or GeoIP filtering excludes this host's own address." \
+            "Test from an allowed client IP. To inspect: tail -20 /home/wpuser/wp/logs/access.log" ;;
+  "")  fail "No HTTP response on :80" \
+            "Apache is not answering at all." \
+            "podman logs --tail 50 wordpress ; netstat -tlnp | grep ':80 '" ;;
+  *)   fail "Unexpected HTTP ${code} on :80" \
+            "A working WordPress front page returns 200, 301, or 302." \
+            "podman logs --tail 50 wordpress ; tail -30 /home/wpuser/wp/logs/error.log" ;;
+esac
+
+if [ "$(_running wordpress)" = "running" ]; then
+  if [ "$(podman exec wordpress php -r 'echo "ok";' 2>/dev/null)" = "ok" ]; then
+    pass "PHP executes inside the container"
+  else
+    fail "PHP does not execute" \
+         "The container is up but the PHP binary is not usable." \
+         "podman logs --tail 50 wordpress"
+  fi
+
+  # Apache's own config parser is the authority on whether wp-security.conf
+  # and the .htaccess-adjacent config are valid. A syntax error here means
+  # Apache fell back to defaults or refused to reload.
+  if podman exec wordpress apachectl -t >/dev/null 2>&1; then
+    pass "Apache configuration parses cleanly"
+  else
+    fail "Apache configuration has a syntax error" \
+         "Apache is running on an older config or failed to reload." \
+         "podman exec wordpress apachectl -t    # prints the offending file and line"
+  fi
+
+  podman exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
+  if podman exec --user www-data wordpress sh -c \
+       'touch /var/www/html/wp-content/uploads/.vtest && rm -f /var/www/html/wp-content/uploads/.vtest' \
+       >/dev/null 2>&1; then
+    pass "Uploads directory is writable by www-data"
+  else
+    fail "Uploads directory is not writable by www-data" \
+         "Media uploads and plugin installs will fail with a permissions error." \
+         "podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content && chown -R 33:33 /home/wpuser/wp/html/wp-content"
+  fi
+fi
+
+if [ -f /home/wpuser/wp/htaccess/.htaccess ] \
+   && grep -q '8G FIREWALL' /home/wpuser/wp/htaccess/.htaccess 2>/dev/null; then
+  pass ".htaccess present with 8G firewall rules"
+else
+  fail ".htaccess missing or missing its 8G rules" \
+       "The request-filtering layer that runs before PHP is not in place." \
+       "ls -l /home/wpuser/wp/htaccess/.htaccess ; grep -c '8G FIREWALL' /home/wpuser/wp/htaccess/.htaccess"
+fi
+fi
+
+# ── SECURITY ───────────────────────────────────────────────────────────────
+if want_section security; then
+section security "Security"
+
+# --- Custom login slug: the end-to-end test this script never had ---
+if [ -n "${WP_ADMIN_SLUG}" ]; then
+  slug_code=$(_http_code "http://127.0.0.1/${WP_ADMIN_SLUG}-login")
+  dflt_code=$(_http_code "http://127.0.0.1/wp-login.php")
+
+  if [ "$slug_code" = "403" ] && [ "$dflt_code" = "403" ] \
+     && { [ -n "${ADMIN_CIDR}" ] || [ -n "${ALLOWED_ADMIN_IP}" ]; }; then
+    warn "Login slug cannot be verified from this host" \
+         "Both paths return 403 because ADMIN_CIDR/ALLOWED_ADMIN_IP excludes this host's own source address. That is correct behaviour, not a fault." \
+         "Re-test from an allowed client:  curl -o /dev/null -w '%{http_code}\\n' http://<vm-ip>/${WP_ADMIN_SLUG}-login"
+  else
+    case "$slug_code" in
+      200|302) pass "Login slug /${WP_ADMIN_SLUG}-login serves the login page (HTTP ${slug_code})" ;;
+      404)     fail "Login slug /${WP_ADMIN_SLUG}-login returns 404" \
+                    "The rewrite is not firing. Usually AllowOverride, a missing .htaccess mount, or mod_rewrite disabled." \
+                    "grep -A6 'Custom wp-admin slug' /home/wpuser/wp/htaccess/.htaccess ; podman exec wordpress apachectl -M | grep rewrite" ;;
+      "")      fail "Login slug /${WP_ADMIN_SLUG}-login gave no response" "" \
+                    "podman logs --tail 30 wordpress" ;;
+      *)       fail "Login slug returned unexpected HTTP ${slug_code}" "" \
+                    "tail -20 /home/wpuser/wp/logs/error.log" ;;
+    esac
+
+    case "$dflt_code" in
+      403) pass "Default /wp-login.php is blocked (HTTP 403)" ;;
+      200) fail "Default /wp-login.php is NOT blocked (HTTP 200)" \
+                "The slug is decorative — bots hitting the standard path reach the real login form." \
+                "grep -A5 'wp-login' /home/wpuser/wp/htaccess/.htaccess    # the RewriteCond block should be present" ;;
+      *)   warn "Default /wp-login.php returned HTTP ${dflt_code:-none}" \
+                "Expected 403 when a slug is configured." \
+                "grep -A5 'wp-login' /home/wpuser/wp/htaccess/.htaccess" ;;
+    esac
+  fi
+
+  # Without the mu-plugin, WordPress emits /wp-login.php in the login form
+  # action — which the block above rejects — and login becomes impossible.
+  MU=/home/wpuser/wp/html/wp-content/mu-plugins/00-wpvm-login-slug.php
+  if [ -f "$MU" ]; then
+    if grep -q "WPVM_SLUG_PLACEHOLDER" "$MU" 2>/dev/null; then
+      fail "Login slug mu-plugin still contains an unsubstituted placeholder" \
+           "WordPress will generate login URLs pointing at a path that does not exist." \
+           "sed -i 's|WPVM_SLUG_PLACEHOLDER|${WP_ADMIN_SLUG}|g' ${MU}"
+    elif podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/00-wpvm-login-slug.php >/dev/null 2>&1; then
+      pass "Login slug mu-plugin installed and parses"
+    else
+      fail "Login slug mu-plugin has a PHP syntax error" \
+           "An mu-plugin fatal takes the whole site down and cannot be disabled from the admin UI." \
+           "rm -f ${MU}    # removes the fatal; then also remove the wp-login block from .htaccess or you will be locked out"
+    fi
+  else
+    fail "Login slug configured but mu-plugin is missing" \
+         "The login form will POST to the blocked default path — login will fail." \
+         "Remove the wp-login block from /home/wpuser/wp/htaccess/.htaccess to restore access, then re-run provisioning"
+  fi
+else
+  info "No custom login slug configured (default /wp-login.php in use)"
+fi
+
+# --- wp-admin IP restriction ---
+APACHE_CONF=/home/wpuser/wp/apache-conf/wp-security.conf
+if [ -n "${ADMIN_CIDR}${ALLOWED_ADMIN_IP}" ]; then
+  if grep -q 'Require ip' "$APACHE_CONF" 2>/dev/null; then
+    pass "wp-admin IP restriction present (${ADMIN_CIDR:-}${ALLOWED_ADMIN_IP:+ ${ALLOWED_ADMIN_IP}})"
+  else
+    fail "ADMIN_CIDR configured but no 'Require ip' rule found" \
+         "wp-admin is reachable from any source IP." \
+         "grep -n 'Require ip' ${APACHE_CONF}    # re-run provisioning if absent"
+  fi
+else
+  warn "No wp-admin IP restriction configured" \
+       "wp-admin is reachable from any source address that can reach port 80." \
+       "Re-run provisioning with an ADMIN_CIDR, or add a 'Require ip' block to ${APACHE_CONF}"
+fi
+
+for pat in 'xmlrpc.php' 'wp-config' 'wp-content/uploads'; do
+  if grep -q "$pat" "$APACHE_CONF" 2>/dev/null; then
+    pass "Hardening rule present for ${pat}"
+  else
+    warn "No hardening rule for ${pat}" "" \
+         "grep -n '${pat}' ${APACHE_CONF}    # re-run provisioning to regenerate"
+  fi
+done
+
+if nft list tables 2>/dev/null | grep -q filter; then
+  pass "nftables ruleset loaded"
+else
+  fail "nftables has no filter table" \
+       "The host firewall is not active — all ports are exposed." \
+       "rc-service nftables restart ; nft list ruleset | head -40"
+fi
+
+if rc-service cs-firewall-bouncer status 2>/dev/null | grep -q started; then
+  pass "CrowdSec firewall bouncer running"
+else
+  warn "CrowdSec firewall bouncer is not running" \
+       "Detections are logged but bans are never enforced at the firewall." \
+       "rc-service cs-firewall-bouncer restart ; tail -30 /var/log/crowdsec/crowdsec.log"
+fi
+
+if [ "${GEOIP_ENABLED:-0}" = "1" ]; then
+  if podman exec wordpress apachectl -M 2>/dev/null | grep -q maxminddb; then
+    pass "GeoIP: mod_maxminddb loaded in Apache"
+  else
+    fail "GeoIP enabled but mod_maxminddb is not loaded" \
+         "Country filtering is silently inactive — all traffic is being allowed through." \
+         "/usr/local/bin/wp-geoip-setup.sh ; tail -40 /var/log/wp-geoip.log"
+  fi
+fi
+fi
+
+# ── UPDATES ────────────────────────────────────────────────────────────────
+if want_section updates; then
+section updates "Update machinery"
+
+if [ -x /usr/local/bin/update.sh ]; then
+  pass "update.sh present and executable"
+else
+  fail "update.sh is missing or not executable" \
+       "No supported path to update WordPress, MariaDB, or CrowdSec." \
+       "ls -l /usr/local/bin/update.sh ; chmod +x /usr/local/bin/update.sh"
+fi
+
+if [ -f /etc/wp-install/pinned.env ]; then
+  perm=$(stat -c '%a' /etc/wp-install/pinned.env 2>/dev/null)
+  if [ "$perm" = "600" ]; then
+    pass "pinned.env present with 0600 permissions"
+  else
+    warn "pinned.env permissions are ${perm}, expected 600" \
+         "Image state is readable by non-root users." \
+         "chmod 600 /etc/wp-install/pinned.env"
+  fi
+else
+  warn "pinned.env not present" \
+       "update.sh will rebuild it from the running containers on next run." \
+       "update.sh check    # regenerates it"
+fi
+
+if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
+  pinned=0
+  for v in WP_DIGEST DB_DIGEST CS_DIGEST; do
+    eval "d=\${$v}"
+    case "$d" in sha256:*) pinned=$((pinned+1)) ;; esac
+  done
+  if [ "$pinned" = "3" ]; then
+    pass "Digest pinning: 3/3 images pinned"
+  elif [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+    fail "Digest pinning: only ${pinned}/3 pinned under production profile" \
+         "Production profile requires all three images pinned to a digest." \
+         "cat /var/log/wp-digest-pinning.log    # shows which lookup failed and why"
+  else
+    warn "Digest pinning: only ${pinned}/3 images pinned" \
+         "The unpinned images run from a mutable tag." \
+         "update.sh digest-check    # re-resolves and re-pins"
+  fi
+
+  # Live test of the Skopeo path itself. This is what silently regressed in
+  # every version before v7-14: the digest parser returned a multi-line value
+  # (manifest digest plus every layer digest), which made digest-check report
+  # "newer digest available" forever and forced a full pull on every install.
+  if [ "$QUICK" = "0" ] && command -v skopeo >/dev/null 2>&1; then
+    probe=$(skopeo inspect --format '{{.Digest}}' \
+              "docker://docker.io/library/wordpress:latest" 2>/dev/null | head -1)
+    if [ -z "$probe" ]; then
+      warn "Skopeo could not reach the registry" \
+           "Digest checks will fall back to a full image pull." \
+           "skopeo inspect docker://docker.io/library/wordpress:latest    # check egress/DNS"
+    elif [ "$(printf '%s\n' "$probe" | wc -l | tr -d ' ')" = "1" ] \
+         && printf '%s' "$probe" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+      pass "Skopeo resolves a single well-formed digest"
+    else
+      fail "Skopeo returned a malformed digest" \
+           "Digest comparison will never match, so every check reports a false update." \
+           "skopeo inspect --format '{{.Digest}}' docker://docker.io/library/wordpress:latest"
+    fi
+  fi
+else
+  info "Digest pinning disabled (USE_DIGEST_PINNING=0)"
+fi
+
+if command -v trivy >/dev/null 2>&1; then
+  pass "Trivy available for image scanning"
+else
+  warn "Trivy is not installed" \
+       "Updates proceed without a CVE scan of the new image." \
+       "update.sh trivy    # attempts install, or: apk add trivy"
+fi
+
+for job in wp-db-backup.sh wp-cron-run.sh logrotate; do
+  if grep -q "$job" /etc/crontabs/root 2>/dev/null; then
+    pass "Cron entry present: ${job}"
+  else
+    fail "No cron entry for ${job}" \
+         "That scheduled task will never run." \
+         "crontab -l -u root    # then add the missing line, or re-run provisioning"
+  fi
+done
+fi
+
+# ── LOGS ───────────────────────────────────────────────────────────────────
+if want_section logs; then
+section logs "Logging and disk"
+
+if command -v logrotate >/dev/null 2>&1; then
+  pass "logrotate installed"
+  if [ -f /etc/logrotate.d/wordpress-vm ]; then
+    if logrotate --debug /etc/logrotate.conf >/dev/null 2>&1; then
+      pass "logrotate configuration validates"
+    else
+      fail "logrotate configuration has an error" \
+           "Nothing is being rotated — logs will grow until the disk fills." \
+           "logrotate --debug /etc/logrotate.conf    # prints the offending directive"
+    fi
+    if grep -q copytruncate /etc/logrotate.d/wordpress-vm 2>/dev/null; then
+      pass "logrotate uses copytruncate (required for containerised Apache)"
+    else
+      fail "logrotate config is missing copytruncate" \
+           "Apache holds an open fd on these files; without copytruncate it keeps writing to the unlinked inode and the rotated file stays empty forever." \
+           "Add 'copytruncate' to /etc/logrotate.d/wordpress-vm"
+    fi
+  else
+    fail "No logrotate config for this VM's logs" \
+         "Apache and CrowdSec logs grow without bound until the disk fills." \
+         "Re-run provisioning, or create /etc/logrotate.d/wordpress-vm"
+  fi
+else
+  fail "logrotate is not installed" \
+       "Nothing bounds log growth. A busy site will fill the disk and corrupt MariaDB." \
+       "apk add --no-cache logrotate    # then re-run provisioning to install the config"
+fi
+
+# Actual on-disk sizes — config can be perfect and a log still be huge if
+# rotation was added after the log had already grown.
+for lf in /home/wpuser/wp/logs/access.log /home/wpuser/wp/logs/error.log; do
+  [ -f "$lf" ] || continue
+  sz=$(du -m "$lf" 2>/dev/null | awk '{print $1}')
+  [ -z "$sz" ] && continue
+  if [ "$sz" -ge 200 ]; then
+    warn "$(basename "$lf") is ${sz}MB" \
+         "Larger than one rotation cycle should allow." \
+         "logrotate -f /etc/logrotate.conf    # force a rotation now"
+  else
+    pass "$(basename "$lf") size OK (${sz}MB)"
+  fi
+done
+
+use=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+if [ -n "$use" ]; then
+  if [ "$use" -ge 90 ]; then
+    fail "Root filesystem is ${use}% full" \
+         "At 100% MariaDB can corrupt its data directory and backups will fail." \
+         "du -sh /home/wpuser/wp/logs /root/wp-db-backups /var/lib/containers | sort -h"
+  elif [ "$use" -ge 75 ]; then
+    warn "Root filesystem is ${use}% full" "" \
+         "du -sh /home/wpuser/wp/logs /root/wp-db-backups /var/lib/containers | sort -h"
+  else
+    pass "Disk usage healthy (${use}%)"
+  fi
+fi
+fi
+
+# ── BACKUPS ────────────────────────────────────────────────────────────────
+if want_section backups; then
+section backups "Backups"
+
+BK=/root/wp-db-backups
+if [ -x /usr/local/bin/wp-db-backup.sh ]; then
+  pass "Backup script present"
+else
+  fail "wp-db-backup.sh is missing" \
+       "The daily backup cron has nothing to run." \
+       "ls -l /usr/local/bin/wp-db-backup.sh    # re-run provisioning to reinstall"
+fi
+
+if [ -d "$BK" ]; then
+  newest=$(ls -t "$BK"/wp-db-*.sql.gz 2>/dev/null | head -1)
+  if [ -z "$newest" ]; then
+    fail "No backups exist in ${BK}" \
+         "Nothing to restore from." \
+         "/usr/local/bin/wp-db-backup.sh    # run one now and watch for errors"
+  else
+    age_h=$(( ( $(date +%s) - $(date -r "$newest" +%s 2>/dev/null || echo 0) ) / 3600 ))
+    if [ "$age_h" -le 48 ]; then
+      pass "Most recent backup is ${age_h}h old"
+    else
+      fail "Most recent backup is ${age_h}h old" \
+           "The daily backup has not succeeded in over two days." \
+           "/usr/local/bin/wp-db-backup.sh ; logger -t check 'manual run' ; tail -50 /var/log/messages | grep wp-db-backup"
+    fi
+
+    if [ "$QUICK" = "0" ]; then
+      # A backup that exists but does not restore is worse than no backup,
+      # because it produces false confidence. Verify the archive and the
+      # dump's own completion marker, exactly as the backup script does.
+      if gzip -t "$newest" 2>/dev/null; then
+        pass "Newest backup passes gzip integrity check"
+        if gunzip -c "$newest" 2>/dev/null | tail -c 200 | grep -q "Dump completed"; then
+          pass "Newest backup contains mariadb-dump's completion marker"
+        else
+          fail "Newest backup has no completion marker" \
+               "The dump was truncated — it will not restore cleanly." \
+               "/usr/local/bin/wp-db-backup.sh    # take a fresh one and verify"
+        fi
+      else
+        fail "Newest backup fails gzip integrity check" \
+             "The archive is corrupt and cannot be restored." \
+             "rm -f ${newest} ; /usr/local/bin/wp-db-backup.sh"
+      fi
+    fi
+
+    cnt=$(ls "$BK"/wp-db-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')
+    info "${cnt} backup(s) retained in ${BK}"
+  fi
+else
+  fail "Backup directory ${BK} does not exist" \
+       "No backup has ever run successfully." \
+       "/usr/local/bin/wp-db-backup.sh"
+fi
+fi
+
+# ── SUMMARY ────────────────────────────────────────────────────────────────
 echo ""
-echo "═══════════════════════════════════════════════════"
-echo "  WordPress VM — Health Validation"
-echo "═══════════════════════════════════════════════════"
+echo "═══════════════════════════════════════════════════════════"
+printf '  Passed: %s%d%s   Warnings: %s%d%s   Failed: %s%d%s\n' \
+  "$_c_ok" "$PASS" "$_c_off" "$_c_warn" "$WARN" "$_c_off" "$_c_bad" "$FAIL" "$_c_off"
+echo "═══════════════════════════════════════════════════════════"
 
-chk "WordPress running"  "$(PRUN inspect wordpress --format '{{.State.Status}}' 2>/dev/null)" "running"
-chk "MariaDB running"    "$(PRUN inspect mariadb --format '{{.State.Status}}' 2>/dev/null)" "running"
-chk "CrowdSec running"  "$(PRUN inspect crowdsec --format '{{.State.Status}}' 2>/dev/null)" "running"
-  # stdout redirected too, not just stderr — mariadb(d)-admin ping --silent
-  # still prints "mysqld is alive" on success, which otherwise leaks into
-  # $_DB_PING and breaks the "ok" string comparison even on a good ping.
-  _DB_PING=$(PRUN exec mariadb sh -c 'mariadbd-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" >/dev/null 2>&1 || mariadb-admin ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" >/dev/null 2>&1' && echo ok || echo fail)
-  chk "MariaDB reachable (exec ping)" "${_DB_PING}"
+if [ -n "$REMEDIES" ]; then
+  echo ""
+  echo "  HOW TO FIX WHAT WAS FLAGGED"
+  echo "  ─────────────────────────────────────────────────────────"
+  printf '%s\n' "$REMEDIES"
+  echo ""
+  echo "  Re-run a single area while fixing:  validate-wordpress.sh --section <name>"
+  echo "  Sections: containers database web security updates logs backups"
+fi
 
-DB=$(PRUN exec --user www-data wordpress php -r   'echo @mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"))?"ok":"fail";' 2>/dev/null || echo error)
-chk "DB connectivity (www-data)" "$DB"
-
-# PRODUCTION SAFETY FIX (v7-6k): same strengthened checks used at install
-# and update time — see the matching comment in the post-install
-# validation suite (create-wordpress-vm.sh) for the full rationale. Added
-# alongside, not instead of, the ping/mysqli_connect checks above, so an
-# admin running this script gets the same depth of validation update.sh
-# relies on for its own rollback decisions.
-_MARIADB_FULL=$([ -x /usr/local/bin/mariadb-health-check.sh ] && /usr/local/bin/mariadb-health-check.sh mariadb >/dev/null 2>&1 && echo ok || echo fail)
-chk "MariaDB full health (query + InnoDB)" "${_MARIADB_FULL}"
-
-_WP_FULL=$([ -x /usr/local/bin/wp-health-check.sh ] && /usr/local/bin/wp-health-check.sh wordpress 80 >/dev/null 2>&1 && echo ok || echo fail)
-chk "WordPress full health (HTTP+PHP+DB)" "${_WP_FULL}"
-
-PRUN exec wordpress mkdir -p /var/www/html/wp-content/uploads >/dev/null 2>&1 || true
-UPL=$(PRUN exec --user www-data wordpress sh -c   'touch /var/www/html/wp-content/uploads/.wt && rm /var/www/html/wp-content/uploads/.wt && echo ok || echo fail' 2>/dev/null || echo fail)
-chk "Uploads writable (www-data)" "$UPL"
-
-chk "Port 80 listening" "$(netstat -tlnp 2>/dev/null | grep -c ':80 ' | tr -d ' ')" "1"
-chk "nftables active"   "$(nft list tables 2>/dev/null | grep -c filter | tr -d ' ')" "1"
-chk "CS bouncer"        "$(rc-service cs-firewall-bouncer status 2>/dev/null | grep -c started | tr -d ' ')" "1"
-chk "8G .htaccess"      "$(grep -c '8G FIREWALL' /home/wpuser/wp/htaccess/.htaccess 2>/dev/null || echo 0)" "1"
-chk "Trivy available"   "$(command -v trivy >/dev/null 2>&1 && echo ok || echo missing)"
-chk "Lynis available"   "$(command -v lynis >/dev/null 2>&1 && echo ok || echo missing)"
-
-WP_DEBUG=$(PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo "?")
-chk "WP_DEBUG is OFF"   "$WP_DEBUG" "OFF"
-
+if [ "$FAIL" -gt 0 ]; then
+  echo ""
+  echo "  Result: FAILED — ${FAIL} issue(s) need attention."
+  exit 1
+fi
+if [ "$WARN" -gt 0 ]; then
+  echo ""
+  echo "  Result: PASSED WITH WARNINGS — nothing is broken, but see above."
+  exit 2
+fi
 echo ""
-echo "  Passed: ${PASS}  Failed: ${FAIL}"
-[ "$FAIL" -gt 0 ] && echo "  Run wp-hardening.sh status for details" && exit 1
-echo "  All checks passed"
+echo "  Result: ALL CHECKS PASSED"
 exit 0
 VALSCRIPT
 chmod +x /usr/local/bin/validate-wordpress.sh
-ok "validate-wordpress.sh installed — run anytime to check VM health"
+ln -sf /usr/local/bin/validate-wordpress.sh /usr/local/bin/wp-validate 2>/dev/null || true
+ok "validate-wordpress.sh installed (also available as: wp-validate)"
+ok "  Full run     : validate-wordpress.sh"
+ok "  One area     : validate-wordpress.sh --section security"
+ok "  Every failure prints a copy-paste remediation command"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 touch /var/log/wp-install.done
