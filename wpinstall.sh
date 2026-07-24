@@ -3,6 +3,78 @@
 # WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
+# v7-15 PATCH NOTES (on top of v7-14) — INSTALL-FAILURE FIX + AUDIT RESPONSE.
+# This version fixes the reason a v7-14 install failed in the field (WordPress
+# could not reach MariaDB) plus the actionable findings from an independent
+# ChatGPT audit of v7-14. The install-failure fix is the important one — it
+# would recur on every install until patched.
+#  64. [CRITICAL] WORDPRESS COULD NOT RESOLVE THE 'mariadb' HOSTNAME — the
+#      install failed here, retrying DNS 24 times and giving up. MariaDB
+#      itself was fully healthy (its own in-container healthcheck passed
+#      every gate), but WordPress on the wp-db network kept reporting
+#      "mariadb hostname does not resolve (Aardvark DNS / wp-db network
+#      issue)". Root cause: aardvark-dns (Podman's DNS) runs ON THE HOST,
+#      bound to each network's GATEWAY IP (10.89.20.1, 10.89.10.1) on port
+#      53. A container's DNS query goes to that gateway — a host-local
+#      address — so the packet traverses the nftables INPUT hook, not the
+#      forward hook. The input chain had `policy drop` and no rule
+#      permitting the container subnets to reach the gateway on 53, so every
+#      lookup was silently dropped. (MariaDB worked because talking to
+#      itself over localhost needs no DNS.) Netavark adds its own accept in
+#      a separate table, but an nftables `drop` verdict in ANY base chain on
+#      a hook is final, so the filter chain's drop policy overrode it. FIX:
+#      explicit input-chain accepts for udp+tcp port 53 from both container
+#      subnets to their gateways, plus DHCP (67). Also fixed a related boot
+#      hazard: /etc/nftables.nft does `flush ruleset`, which wipes netavark's
+#      table (container NAT + DNS); the mariadb/wp/crowdsec OpenRC services
+#      now order `after nftables` + `use nftables` so the firewall loads
+#      first and netavark lays its table on top without being flushed later.
+#  65. [MEDIUM] logrotate config failed to validate on the VM (v7-14 bug of
+#      my own): `copytruncate` and `create` were in the same stanza, and
+#      per the logrotate man page `create` has no effect with copytruncate —
+#      the combination is rejected/ignored inconsistently across versions.
+#      Removed the pointless `create`. Validation now checks OUR file
+#      specifically (a tiny wrapper `include`) instead of the whole
+#      /etc/logrotate.conf tree (which pulls in distro fragments we don't
+#      control), and surfaces the actual error text instead of a generic
+#      "did not validate".
+#  66. [MEDIUM, audit #4] logrotate ran once daily, which made `maxsize 50M`
+#      cosmetic — a traffic spike could grow a log to gigabytes before the
+#      cap was ever evaluated. Now runs HOURLY (the `daily` directive still
+#      limits low-volume rotation to once a day); the size cap is now real.
+#  67. [MEDIUM, audit #14] scheduled + in-flight backups omitted stored
+#      routines, events, and triggers — a restore would rebuild tables but
+#      silently drop the logic operating on them. Added --routines --events
+#      --triggers --single-transaction to both mariadb-dump calls. The daily
+#      backup filename now includes the time (not just the date) so a manual
+#      backup on the same day doesn't overwrite the scheduled one.
+#  68. [MEDIUM, audit #2] the Skopeo JSON fallback parser relied on the
+#      manifest "Digest" appearing before the LayersData array in field
+#      order — not a stable contract. It now uses jq (`.Digest // empty`,
+#      extracted by key) with the ordering-based grep kept only as a last
+#      resort if jq is absent. jq is installed alongside aardvark-dns.
+#  69. [HIGH, audit #13] SSH_CIDR / WEB_CIDR / ADMIN_CIDR / ALLOWED_ADMIN_IP
+#      / PROXY_IP were inserted verbatim into nftables and Apache config. A
+#      malformed value could break the firewall load (leaving the host
+#      unprotected) or Apache startup (leaving the site down), or slip a
+#      stray token into a security rule. All five are now validated at
+#      prompt time (CIDR fields accept IPv4 or IPv4/prefix; single-IP fields
+#      reject CIDR and lists), re-prompting on bad input. Defence in depth:
+#      the generated ruleset is `nft -c` syntax-checked before it's applied,
+#      and if the check fails the ruleset is NOT loaded (rather than
+#      half-loading and leaving the firewall broken).
+#      Also added to validate-wordpress.sh: an explicit container-DNS
+#      resolution check (the #64 failure, with the exact firewall rule to
+#      inspect as its remedy), a check that the input chain carries the
+#      port-53 accepts, and consistency with the logrotate validation fix.
+#      NOT changed, with reasoning (audit findings that are deliberate
+#      tradeoffs, not defects): Trivy remains skippable and the candidate
+#      still uses the production DB in `standard` profile — both are the
+#      same documented cost/benefit calls from v7-13; the audit's own
+#      remediation for each is "make it configurable / use for production
+#      profile", a feature request rather than a bug. The residual
+#      candidate-DB risk is already documented inline in do_wp_update().
+#
 # v7-5d PATCH NOTES (on top of v7-3 baseline). Older per-version notes (v2
 # through v7-1) have been removed from this header — those bugs are long
 # fixed and stable, and kept growing into a changelog nobody was reading;
@@ -1275,9 +1347,80 @@ fi
 echo ""
 echo -e "  ${BLD}Firewall + access control${CL}"
 echo ""
+
+# BUG FIX (v7-15, audit #13): validate every CIDR/IP before it's accepted.
+# These values are inserted verbatim into root-owned security config —
+# nftables rules (`ip saddr ${SSH_CIDR} ...`) and Apache directives
+# (`Require ip ${ADMIN_CIDR}`, `RemoteIPTrustedProxy ${PROXY_IP}`). A
+# malformed value doesn't just get ignored: it makes nftables fail to load
+# (potentially leaving the firewall down) or Apache fail to start
+# (potentially leaving the site down), and a stray token could weaken the
+# very restriction it's meant to express. Validated here at input time so a
+# typo is caught immediately, with a re-prompt, instead of surfacing as a
+# baffling service failure 10 minutes into a background install.
+#
+# _valid_octet: 0-255. _valid_ipv4: four dotted octets. _valid_cidr:
+# IPv4 or IPv4/prefix (prefix 0-32).
+_v15_valid_ipv4() {
+  case "$1" in
+    *[!0-9.]*) return 1 ;;
+  esac
+  local IFS=. o count=0
+  set -- $1
+  [ $# -eq 4 ] || return 1
+  for o in "$@"; do
+    [ -n "$o" ] || return 1
+    case "$o" in *[!0-9]*) return 1 ;; esac
+    [ "$o" -le 255 ] 2>/dev/null || return 1
+    # reject leading-zero forms like 01 / 001 (ambiguous, octal-looking)
+    [ "$o" = "0" ] || [ "${o#0}" = "$o" ] || return 1
+    count=$((count+1))
+  done
+  [ "$count" -eq 4 ]
+}
+_v15_valid_cidr() {
+  case "$1" in
+    */*)
+      local addr="${1%/*}" pfx="${1#*/}"
+      case "$pfx" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      [ "$pfx" -le 32 ] 2>/dev/null || return 1
+      _v15_valid_ipv4 "$addr"
+      ;;
+    *)
+      _v15_valid_ipv4 "$1"
+      ;;
+  esac
+}
+# Prompt for a CIDR-or-blank value, re-asking until valid.
+_ask_cidr() {  # $1 prompt text ; echoes validated value (may be empty)
+  local _p="$1" _v
+  while :; do
+    printf '%s' "$_p" >&2
+    IFS= read -r _v
+    [ -z "$_v" ] && { printf '' ; return 0; }
+    if _v15_valid_cidr "$_v"; then printf '%s' "$_v"; return 0; fi
+    echo -e "  ${RD}Not a valid IPv4 address or CIDR (e.g. 192.168.1.0/24 or 192.168.1.5). Try again or leave blank.${CL}" >&2
+  done
+}
+_ask_single_ip() {  # $1 prompt text ; echoes validated single IPv4 (may be empty)
+  local _p="$1" _v
+  while :; do
+    printf '%s' "$_p" >&2
+    IFS= read -r _v
+    [ -z "$_v" ] && { printf '' ; return 0; }
+    case "$_v" in
+      */*|*[!0-9.]*) echo -e "  ${RD}Enter a single IPv4 address (no CIDR, no list). Try again or leave blank.${CL}" >&2; continue ;;
+    esac
+    if _v15_valid_ipv4 "$_v"; then printf '%s' "$_v"; return 0; fi
+    echo -e "  ${RD}Not a valid IPv4 address. Try again or leave blank.${CL}" >&2
+  done
+}
+
 echo -e "  ${BLD}Layer 1 — nftables (packet level, applies to ALL traffic on 80/443):${CL}"
-read -rp "  Restrict SSH (22) to a CIDR?           (blank = any)  : " SSH_CIDR
-read -rp "  Restrict Web (80/443) to a CIDR?       (blank = any)  : " WEB_CIDR
+SSH_CIDR=$(_ask_cidr "  Restrict SSH (22) to a CIDR?           (blank = any)  : ")
+WEB_CIDR=$(_ask_cidr "  Restrict Web (80/443) to a CIDR?       (blank = any)  : ")
 [[ -z "$WEB_CIDR" ]] && msg_warn "Web ports open to any IP — Layer 2 (Apache) still enforces wp-admin"
 echo ""
 echo -e "  ${BLD}Layer 2 — Apache (request level, wp-admin + wp-login.php only):${CL}"
@@ -1287,14 +1430,14 @@ echo ""
 echo -e "  ${YW}Your workstation is likely on one of these subnets (from the Proxmox host):${CL}"
 ip -4 addr show scope global 2>/dev/null | awk '/inet /{split($2,a,"/"); print "    " a[1] "  (subnet: " $2 ")"}' | head -5
 echo ""
-read -rp "  Local network CIDR for wp-admin?  e.g. 192.168.100.0/24 (blank = open) : " ADMIN_CIDR
-read -rp "  Additional IP for wp-admin?  (e.g. 203.0.113.5, blank = none)  : " ALLOWED_ADMIN_IP
+ADMIN_CIDR=$(_ask_cidr "  Local network CIDR for wp-admin?  e.g. 192.168.100.0/24 (blank = open) : ")
+ALLOWED_ADMIN_IP=$(_ask_single_ip "  Additional IP for wp-admin?  (e.g. 203.0.113.5, blank = none)  : ")
 echo ""
 echo -e "  ${BLD}Layer 2b — mod_remoteip (only needed if behind a reverse proxy):${CL}"
 echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the proxy IP${CL}"
 echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache trusts${CL}"
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
-read -rp "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : " PROXY_IP
+PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
 echo ""
 echo -e "  ${BLD}Security features${CL}"
 echo -e "  ${YW}Custom wp-admin slug: moves the login page to a secret URL and blocks${CL}"
@@ -1603,6 +1746,31 @@ table inet filter {
         ct state invalid drop
         icmp  type echo-request limit rate 5/second accept
         icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert } accept
+        # ── Container DNS (Aardvark) ────────────────────────────────────────
+        # CRITICAL (v7-15 fix): aardvark-dns runs ON THE HOST, bound to each
+        # Podman network's gateway IP (10.89.10.1 and 10.89.20.1) on port 53.
+        # A container resolving "mariadb" sends its query to that gateway
+        # address, and because the gateway IP is a host-local address the
+        # packet traverses THIS input hook — not the forward hook. Without an
+        # explicit accept here it hits `policy drop` and every in-container
+        # name lookup fails, even though netavark adds its own accept rule in
+        # a separate `netavark` table: with nftables, when two base chains are
+        # registered on the same hook, a `drop` verdict in EITHER chain is
+        # final, so this chain's drop policy overrides netavark's accept. That
+        # is the exact cause of "mariadb hostname does not resolve (Aardvark
+        # DNS / wp-db network issue)" seen in the field — MariaDB itself is
+        # healthy (its own in-container healthcheck needs no DNS), but
+        # WordPress can't find it. Both container subnets are allowed to reach
+        # their gateway on 53 (udp and tcp — large responses fall back to TCP).
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 53 accept
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 53 accept
+        ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 udp dport 53 accept
+        ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 tcp dport 53 accept
+        # DHCP from containers to the host-side gateway (netavark's IPAM can
+        # hand out leases on the bridge; without this the request is dropped
+        # and container bring-up stalls on some netavark versions).
+        ip saddr 10.89.10.0/24 udp dport 67 accept
+        ip saddr 10.89.20.0/24 udp dport 67 accept
         # SSH: CrowdSec (crowdsecurity/sshd) handles brute-force banning
         ${SSH_RULE} ct state new limit rate 10/minute accept
         # HTTP/HTTPS: CrowdSec (crowdsecurity/apache2 + crowdsecurity/wordpress
@@ -2434,6 +2602,16 @@ fi
 apk add --no-cache aardvark-dns 2>/dev/null \
   || warn "aardvark-dns not in current repo — container DNS may use fallback"
 
+# jq: used by the Skopeo digest fallback parser (audit #2 on v7-14). The
+# preferred path uses `skopeo inspect --format '{{.Digest}}'`, but on older
+# Skopeo builds without --format the fallback parses raw JSON — jq extracts
+# .Digest by key rather than relying on the top-level digest appearing
+# before the LayersData array in field order, which is not a stable
+# contract. A grep+head-1 path remains as a last resort if jq is somehow
+# unavailable.
+apk add --no-cache jq 2>/dev/null \
+  || warn "jq not available — Skopeo JSON fallback will use a less robust parser"
+
 # FIX: configure netavark to use nftables as firewall driver.
 # The default on Alpine's netavark version is iptables, which causes:
 #   Error: netavark: iptables: No such file or directory (os error 2)
@@ -2569,8 +2747,8 @@ _skopeo_digest() {
   # via Skopeo (cheap manifest query, no pull) never actually happened.
   # See the fuller note on the matching function inside update.sh.
   # FIX: use Skopeo's --format to ask for exactly that one field, fall back
-  # to a head-1'd grep on older Skopeo, and validate single-line sha256
-  # shape before returning.
+  # to jq (v7-15, audit #2) then a head-1'd grep on older Skopeo, and
+  # validate single-line sha256 shape before returning.
   local ref="$1" out digest
   command -v skopeo >/dev/null 2>&1 || return 1
 
@@ -2578,10 +2756,15 @@ _skopeo_digest() {
 
   if [ -z "$digest" ]; then
     out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
-    digest=$(printf '%s' "$out" \
-      | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
-      | grep -oE 'sha256:[0-9a-f]{64}' \
-      | head -1)
+    if command -v jq >/dev/null 2>&1; then
+      digest=$(printf '%s' "$out" | jq -r '.Digest // empty' 2>/dev/null | head -1)
+    fi
+    if [ -z "$digest" ]; then
+      digest=$(printf '%s' "$out" \
+        | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+        | grep -oE 'sha256:[0-9a-f]{64}' \
+        | head -1)
+    fi
   fi
 
   [ -n "$digest" ] || return 1
@@ -3101,8 +3284,9 @@ ok "syslog active"
 # between copy and truncate is an acceptable trade for access logs.
 #
 # Both a size trigger and a time trigger are set: `daily` bounds how old
-# a log can get, `maxsize` bounds how big it can get between daily runs
-# so a traffic spike can't blow past the budget in a few hours.
+# a log can get, `maxsize` bounds how big it gets — but maxsize is only
+# evaluated when logrotate runs, so the cron entry runs HOURLY (see the
+# scheduling note below) to make the 50M cap real rather than cosmetic.
 ts "Configuring log rotation"
 apk add --no-cache logrotate >/dev/null 2>&1 || warn "logrotate install failed — logs will NOT be rotated; check disk usage manually"
 
@@ -3111,6 +3295,9 @@ cat > /etc/logrotate.d/wordpress-vm << 'LOGROTEOF'
 # WordPress VM log rotation — installed by create-wordpress-vm.sh
 # copytruncate is mandatory: Apache runs in a container holding an open fd
 # on these bind-mounted files. See the note in the provisioning script.
+# NOTE: no `create` directive — with copytruncate the original file stays
+# in place (it's truncated, not moved), so create has no effect and mixing
+# the two is fragile across logrotate versions. su sets the rotation user.
 
 /home/wpuser/wp/logs/*.log {
     daily
@@ -3122,7 +3309,6 @@ cat > /etc/logrotate.d/wordpress-vm << 'LOGROTEOF'
     delaycompress
     copytruncate
     su root root
-    create 0640 33 33
 }
 
 /var/log/crowdsec/*.log {
@@ -3155,10 +3341,17 @@ chmod 644 /etc/logrotate.d/wordpress-vm
 # only runs if the stock busybox crontab entries that call run-parts are
 # still present — and this script appends its own entries to
 # /etc/crontabs/root, so relying on that is a silent single point of
-# failure. An explicit entry is scheduled instead (03:30, after the 02:00
-# backup so a rotation can never truncate a log the backup is reading).
+# failure. An explicit entry is scheduled instead.
+# v7-15 (audit #4): run HOURLY, not daily. `maxsize 50M` is only evaluated
+# when logrotate actually runs, so a once-daily invocation lets a traffic
+# spike or log-flooding attack grow a file to gigabytes before the cap is
+# ever checked — the cap was effectively cosmetic. Running hourly makes
+# maxsize meaningful (a log can exceed 50M for at most ~an hour), while the
+# `daily` directive inside the config still limits low-volume logs to one
+# rotation a day. Minute 17 chosen to avoid the top-of-hour cron pile-up;
+# still comfortably after the 02:00 backup on the daily overlap.
 if ! grep -q 'logrotate.*wordpress-vm\|/usr/sbin/logrotate /etc/logrotate.conf' /etc/crontabs/root 2>/dev/null; then
-  echo '30 3 * * * /usr/sbin/logrotate /etc/logrotate.conf 2>&1 | logger -t logrotate' >> /etc/crontabs/root
+  echo '17 * * * * /usr/sbin/logrotate /etc/logrotate.conf 2>&1 | logger -t logrotate' >> /etc/crontabs/root
 fi
 
 # logrotate.conf must exist and must include logrotate.d — Alpine's package
@@ -3177,12 +3370,24 @@ fi
 
 if command -v logrotate >/dev/null 2>&1; then
   # --debug parses the config without touching anything: catches a syntax
-  # error now, at install time, instead of silently never rotating.
-  if logrotate --debug /etc/logrotate.conf >/dev/null 2>&1; then
+  # error now, at install time, instead of silently never rotating. Validate
+  # OUR file specifically (via a tiny wrapper conf) rather than the whole
+  # /etc/logrotate.conf tree, which may pull in distro-shipped fragments we
+  # don't control and whose errors would be misattributed to us. Capture the
+  # actual error so the operator gets something actionable, not just "did
+  # not validate".
+  _lr_probe=$(mktemp)
+  printf 'include /etc/logrotate.d/wordpress-vm\n' > "$_lr_probe"
+  _lr_err=$(logrotate --debug "$_lr_probe" 2>&1 >/dev/null)
+  if [ -z "$_lr_err" ]; then
     ok "Log rotation active (daily + 50M cap, 14 days retained, copytruncate)"
   else
-    warn "logrotate config did not validate — check: logrotate --debug /etc/logrotate.conf"
+    warn "logrotate config validation reported:"
+    printf '%s\n' "$_lr_err" | sed 's/^/       /' | head -5
+    warn "  Logs will still be written; rotation may not run until this is resolved."
+    warn "  Reproduce with: logrotate --debug /etc/logrotate.d/wordpress-vm"
   fi
+  rm -f "$_lr_probe"
 else
   warn "logrotate not available — logs are NOT bounded. Monitor: du -sh /home/wpuser/wp/logs"
 fi
@@ -3193,9 +3398,25 @@ ts "nftables firewall"
 apk add --no-cache nftables >/dev/null
 rc-update add nftables default 2>/dev/null || true
 if [ -f /etc/nftables.nft ]; then
-  nft -f /etc/nftables.nft && ok "Rules loaded" \
-    || warn "Ruleset load failed — check /etc/nftables.nft"
-  rc-service nftables start 2>/dev/null || true
+  # v7-15 (audit #13): syntax-check with `nft -c` BEFORE applying. `-c` parses
+  # and validates the ruleset without committing it, so a malformed rule
+  # (e.g. from a bad CIDR that slipped through input validation) is caught
+  # here instead of half-loading and potentially leaving the firewall in an
+  # inconsistent or open state. The CIDR/IP inputs are already validated at
+  # prompt time, but this is defence in depth on the one config whose failure
+  # mode is "host firewall is down".
+  if nft -c -f /etc/nftables.nft 2>/tmp/nft-check.err; then
+    nft -f /etc/nftables.nft && ok "Rules loaded (syntax pre-checked)" \
+      || warn "Ruleset load failed despite passing syntax check — check /etc/nftables.nft"
+    rc-service nftables start 2>/dev/null || true
+  else
+    warn "nftables ruleset FAILED syntax check — NOT loading it (firewall would be left broken):"
+    sed 's/^/       /' /tmp/nft-check.err | head -5
+    warn "  The generated /etc/nftables.nft has a syntax error. This usually means a"
+    warn "  CIDR/IP value contained something unexpected. Inspect it, fix by hand, then:"
+    warn "    nft -c -f /etc/nftables.nft   (check)   &&   nft -f /etc/nftables.nft   (load)"
+  fi
+  rm -f /tmp/nft-check.err
 else
   warn "/etc/nftables.nft not found"
 fi
@@ -3950,7 +4171,18 @@ DB_IMAGE="${DB_IMAGE}"
 
 depend() {
   need net
-  after sysfs qemu-guest-agent
+  # v7-15: start AFTER nftables. /etc/nftables.nft does `flush ruleset`,
+  # which wipes ALL tables including the `netavark` table that provides
+  # container NAT and the DNS path to aardvark-dns. If nftables started
+  # (or restarted) after netavark had already configured this container's
+  # networking, it would silently tear down that networking. Ordering the
+  # container services after nftables makes the sequence deterministic:
+  # firewall first, then containers, then netavark lays its table on top
+  # and nothing flushes it afterward. `use` (not `need`) so a firewall
+  # hiccup doesn't block the DB from coming up — but when both are enabled,
+  # ordering is enforced.
+  after sysfs qemu-guest-agent nftables
+  use nftables
 }
 
 start() {
@@ -4486,18 +4718,24 @@ _skopeo_digest() {
   # so LayersData can't contaminate the result no matter how it's shaped.
   digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null | head -1) || digest=""
 
-  # Fallback for Skopeo builds without --format support: parse the JSON,
-  # but take only the FIRST "Digest" match. skopeo emits the top-level
-  # image digest before the LayersData array, so head -1 is the manifest
-  # digest. (The validation below is what actually guarantees correctness —
-  # if this ever picks up the wrong field, it fails closed to "no digest"
-  # and the caller falls back to a tag pull rather than using garbage.)
+  # Fallback for Skopeo builds without --format support: parse the JSON.
+  # v7-15 (audit #2): prefer jq, which extracts .Digest by KEY — no reliance
+  # on the manifest digest appearing before LayersData in field order, which
+  # is not a stable contract. Only if jq is unavailable does it drop to a
+  # grep+head-1 that does assume that ordering. The validation below is the
+  # real backstop either way: a wrong pick fails closed to "no digest" and
+  # the caller falls back to a tag pull rather than using garbage.
   if [ -z "$digest" ]; then
     out=$(skopeo inspect "docker://${ref}" 2>/dev/null) || return 1
-    digest=$(printf '%s' "$out" \
-      | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
-      | grep -oE 'sha256:[0-9a-f]{64}' \
-      | head -1)
+    if command -v jq >/dev/null 2>&1; then
+      digest=$(printf '%s' "$out" | jq -r '.Digest // empty' 2>/dev/null | head -1)
+    fi
+    if [ -z "$digest" ]; then
+      digest=$(printf '%s' "$out" \
+        | grep -oE '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
+        | grep -oE 'sha256:[0-9a-f]{64}' \
+        | head -1)
+    fi
   fi
 
   # Validate: exactly one line, exactly the sha256:<64 hex> shape. Anything
@@ -5162,7 +5400,7 @@ do_db_update() {
   echo "  → Backing up to ${BACKUP_FILE}…"
   BACKUP_OK=0
   if ( umask 077; podman exec mariadb sh -c \
-       'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+       'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction -uroot -p"$MARIADB_ROOT_PASSWORD"' \
        > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err" ); then
     if [ -s "${BACKUP_RAW}" ] && tail -c 200 "${BACKUP_RAW}" | grep -q "Dump completed"; then
       if gzip -f "${BACKUP_RAW}" && gzip -t "${BACKUP_FILE}" 2>/dev/null; then
@@ -5947,7 +6185,9 @@ cat > /usr/local/bin/wp-db-backup.sh << 'DBBACKUP'
 # Design mirrors do_db_update()'s in-flight backup step in update.sh.
 set -eu
 BACKUP_DIR="/root/wp-db-backups"
-STAMP=$(date -u +%Y%m%d)
+# v7-15 (audit #14): timestamp includes time, not just date — a manual run
+# on the same day as the scheduled one no longer overwrites it.
+STAMP=$(date -u +%Y%m%d-%H%M%S)
 BACKUP_FILE="${BACKUP_DIR}/wp-db-${STAMP}.sql.gz"
 BACKUP_RAW="${BACKUP_FILE%.gz}"
 
@@ -5956,8 +6196,13 @@ BACKUP_OK=0
 
 # Step 1: dump to a plain .sql file so mariadb-dump's own exit status is
 # what gets checked (gzip on the end of a pipe would mask the failure).
+# v7-15 (audit #14): --routines --events --triggers so stored procedures,
+# functions, scheduled events, and triggers are included — without them a
+# restore rebuilds tables but silently drops the logic that operates on
+# them. --single-transaction gives a consistent snapshot without locking
+# the whole database for the duration of the dump.
 if (umask 077; podman exec mariadb sh -c \
-     'exec mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+     'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction -uroot -p"$MARIADB_ROOT_PASSWORD"' \
      > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err"); then
   # Step 2: confirm mariadb-dump actually finished (non-empty + trailing marker).
   # An interrupted dump can still exit 0 in some connection-drop scenarios.
@@ -6580,6 +6825,19 @@ fi
 # The query that matters: WordPress's OWN credentials, from inside the
 # WordPress container, over the wp-db network. This is what a page load does.
 if [ "$(_running wordpress)" = "running" ]; then
+  # First: can WordPress even RESOLVE the mariadb hostname? This is the exact
+  # failure seen in the field (v7-15) — MariaDB fully healthy, but WordPress
+  # couldn't find it because the nftables input chain was dropping the
+  # container's DNS query to the gateway. Checking resolution separately from
+  # connection turns "database connection failed" (ambiguous) into "DNS is
+  # broken, here's the specific firewall rule to check".
+  if podman exec wordpress getent hosts mariadb >/dev/null 2>&1; then
+    pass "WordPress resolves the 'mariadb' hostname (Aardvark DNS working)"
+  else
+    fail "WordPress cannot resolve the 'mariadb' hostname" \
+         "Container DNS is broken. Aardvark-dns runs on the network gateway; the nftables input chain must allow the container subnet to reach the gateway on port 53. This is the classic 'MariaDB is healthy but WordPress can't find it' failure." \
+         "nft list chain inet filter input | grep 'dport 53'   # must show accepts for 10.89.10.0/24 and 10.89.20.0/24 to their gateways; if absent, the ruleset predates the v7-15 DNS fix"
+  fi
   dbq=$(podman exec --user www-data wordpress php -r '
     $db = @new mysqli(getenv("WORDPRESS_DB_HOST"), getenv("WORDPRESS_DB_USER"),
                       getenv("WORDPRESS_DB_PASSWORD"), getenv("WORDPRESS_DB_NAME"));
@@ -6590,7 +6848,7 @@ if [ "$(_running wordpress)" = "running" ]; then
     ok) pass "WordPress can query the database with its own credentials" ;;
     connect_fail)
       fail "WordPress cannot connect to MariaDB" \
-           "DNS, credentials, or the wp-db network path is broken." \
+           "DNS, credentials, or the wp-db network path is broken (see the DNS check just above — if that failed, fix it first)." \
            "podman exec wordpress getent hosts mariadb   # if this fails it is DNS/network, not credentials" ;;
     query_fail)
       fail "WordPress connected but SELECT 1 failed" \
@@ -6752,6 +7010,16 @@ done
 
 if nft list tables 2>/dev/null | grep -q filter; then
   pass "nftables ruleset loaded"
+  # v7-15: confirm the container-DNS accept rules are present. Their absence
+  # is exactly the field failure — WordPress can't resolve 'mariadb' because
+  # its DNS query to the gateway is dropped by the input chain's drop policy.
+  if nft list chain inet filter input 2>/dev/null | grep -q 'dport 53'; then
+    pass "nftables permits container DNS to the gateway (port 53 accept present)"
+  else
+    fail "nftables input chain has no port-53 accept for container DNS" \
+         "Containers can't reach Aardvark-dns on the gateway, so WordPress can't resolve 'mariadb'. This ruleset predates the v7-15 DNS fix." \
+         "Re-run provisioning, or add to the input chain: ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 udp dport 53 accept (and tcp, and the same for 10.89.10.0/24)"
+  fi
 else
   fail "nftables has no filter table" \
        "The host firewall is not active — all ports are exposed." \
@@ -6872,13 +7140,19 @@ section logs "Logging and disk"
 if command -v logrotate >/dev/null 2>&1; then
   pass "logrotate installed"
   if [ -f /etc/logrotate.d/wordpress-vm ]; then
-    if logrotate --debug /etc/logrotate.conf >/dev/null 2>&1; then
+    # Validate OUR file specifically (via a wrapper), not the whole
+    # /etc/logrotate.conf tree which may include distro fragments we don't
+    # control — same approach the installer uses.
+    _v_lr=$(mktemp)
+    printf 'include /etc/logrotate.d/wordpress-vm\n' > "$_v_lr"
+    if logrotate --debug "$_v_lr" >/dev/null 2>&1; then
       pass "logrotate configuration validates"
     else
       fail "logrotate configuration has an error" \
            "Nothing is being rotated — logs will grow until the disk fills." \
-           "logrotate --debug /etc/logrotate.conf    # prints the offending directive"
+           "logrotate --debug /etc/logrotate.d/wordpress-vm    # prints the offending directive"
     fi
+    rm -f "$_v_lr"
     if grep -q copytruncate /etc/logrotate.d/wordpress-vm 2>/dev/null; then
       pass "logrotate uses copytruncate (required for containerised Apache)"
     else
