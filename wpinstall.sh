@@ -3,6 +3,180 @@
 # WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
+# v8 NOTES (on top of v7-16) — VERSION DISCOVERY + PRODUCTION FAIL-CLOSED
+# TOGGLES. This release adds the future enhancements tracked in the TODO. The
+# headline feature answers a question the tool couldn't previously answer: not
+# "has the tag I'm pinned to been rebuilt?" (that's digest-check) but "has a
+# newer VERSION been published?" — e.g. you're pinned to WordPress 6.9.4 and
+# 6.9.5 ships with a security fix. You need to SEE that and CHOOSE to move the
+# pins across all components. That's what version discovery does.
+#
+#  A. VERSION DISCOVERY  (update.sh versions)  [new, fully tested]
+#     A read-only report that queries the registry (Skopeo list-tags + jq) and
+#     shows, per component, the pinned version vs the newest published release,
+#     with the exact command to move to it. It is deliberately separate from
+#     digest-check: digest-check tracks same-version rebuilds; this tracks new
+#     versions. Filtering is release-aware — WordPress excludes beta/RC/cli and
+#     non-matching PHP/server variants; CrowdSec takes stable vX.Y.Z only.
+#     Version comparison is a pure-POSIX numeric dotted compare (_ver_cmp), so
+#     6.9.10 correctly ranks above 6.9.9 and 6.10 above 6.9 — no reliance on
+#     `sort -V`, which BusyBox sort may lack.
+#
+#  B. MARIADB IS LTS-AWARE  [new]
+#     CRITICAL nuance the research surfaced: for MariaDB, a higher version
+#     number does NOT mean more support. Rolling releases (11.5/11.6/11.7,
+#     12.0/12.1/12.2, …) reach EOL SOONER than the LTS they follow — MariaDB
+#     12.2 hit EOL while 10.11 LTS is supported into 2028. A production
+#     database must track LTS lines only. So version discovery for MariaDB
+#     reports and offers ONLY LTS lines (10.6, 10.11, 11.4, 11.8, and the .3
+#     release of each major from 12 on — 12.3, 13.3, …), recommends the NEXT
+#     LTS as the safe one-step move, and never offers a rolling release.
+#
+#  C. GUIDED CROSS-COMPONENT UPGRADE  (update.sh upgrade)  [new, tested]
+#     Walks all three components and, for each that has a newer release, offers
+#     to move the pin — then runs the ORDINARY update path for that component
+#     (do_wp_update / do_db_update / do_cs_update). So a version bump inherits
+#     every existing safety property unchanged: the candidate is proven on a
+#     loopback-only throwaway container first, the new digest is pinned, a
+#     failure rolls back to the current version, and the GeoIP mod_maxminddb
+#     layer is rebuilt on the new base if GeoIP was active. MariaDB is offered
+#     the next LTS only. Each component is confirmed separately.
+#
+#  D. PRODUCTION FAIL-CLOSED: FIREWALL DEPENDENCY  [new, tested]
+#     Addresses the audit's fail-closed suggestion without giving up the reason
+#     the soft dependency existed. Under the standard profile the container
+#     services keep "use nftables" (soft — a firewall hiccup can't strand the
+#     DB; availability first). Under DEPLOYMENT_PROFILE=production they switch
+#     to "need nftables" (hard — if the firewall fails to start, MariaDB does
+#     not start, and because wp-container needs mariadb-container and crowdsec
+#     needs wp-container, the whole publicly-exposed stack stays down rather
+#     than run unprotected). Gated on the profile the installer already sourced.
+#
+#  E. PRODUCTION FAIL-CLOSED: TRIVY REQUIRED  [new, tested]
+#     The two "skippable" gaps in the CVE scan are closed under production. If
+#     Trivy isn't available, or a scan doesn't COMPLETE (DB download failure,
+#     registry timeout, corrupt cache — an unknown security state, not a clean
+#     result), the standard profile still prompts/skips so a lab install isn't
+#     blocked, but production REFUSES the update outright. A genuine findings
+#     result (HIGH/CRITICAL) keeps the operator prompt in both profiles, since
+#     that's an informed judgement call (the new version may fix a different
+#     critical CVE). This gates version upgrades too — upgrading in production
+#     requires a completed scan of the target image.
+#
+#  F. CANDIDATE DATABASE ISOLATION IN PRODUCTION  [DEFERRED — with reasoning]
+#     The remaining TODO item — clone/isolate the DB so a write-on-init plugin
+#     in a new WordPress image can't touch production during candidate
+#     validation — is NOT shipped here, deliberately. It is the one enhancement
+#     that cannot be validated without exercising live container + MariaDB +
+#     network orchestration on real hardware, and the entire v7-16 round was a
+#     lesson in what happens when orchestration ships unvalidated (four of that
+#     round's seven bugs passed every syntax check and only failed on real
+#     hardware). Shipping ~100 lines of untested clone logic with production
+#     blast radius (orphaned containers, disk exhaustion, or an isolation gap
+#     that lets the candidate reach live data) would repeat exactly that
+#     mistake. The TODO documents two concrete designs (a temporary read-only
+#     DB user as the simpler first step; a full dump-and-restore clone as the
+#     stronger one) to implement once the integration-test harness — the
+#     standing top recommendation — exists to prove it end-to-end. The current
+#     candidate mitigations from v7-13 remain in place: production docroot
+#     mounted read-only, throwaway tmpfs logs, WP_ENVIRONMENT_TYPE=staging.
+#
+# v7-16 PATCH NOTES (on top of v7-15) — POST-INSTALL FIELD-BUG SWEEP. The
+# v7-15 DNS fix worked (the field install reached the containers, updates run
+# cleanly, 3/3 digests verify), but running v7-15 surfaced a fresh batch of
+# bugs — including one I introduced in v7-15 that broke the install-complete
+# state, and one I introduced in v7-14. Plus the actionable items from an
+# independent ChatGPT audit of v7-15.
+#  70. [CRITICAL, self-inflicted in v7-15] BACKTICKS IN COMMENTS INSIDE
+#      UNQUOTED HEREDOCS were executed as command substitution. My v7-15
+#      DNS comment in the NFT_CONF heredoc (opened with `<< NFTEOF`, which
+#      MUST be unquoted so ${SSH_RULE}/${WEB_RULE} expand) contained
+#      `policy drop`, `netavark`, `drop` in backticks, and the
+#      mariadb-container OpenRC service heredoc (`<< ORCSVC_DB`, also
+#      unquoted) had `flush ruleset`, `netavark`, `use`, `need` in
+#      backticks. The shell ran each backticked phrase as a command both
+#      when the outer script wrote the installer AND when the installer
+#      wrote /etc/nftables.nft and /etc/init.d/mariadb-container, spraying
+#      "policy: command not found", "netavark: command not found", "flush:
+#      command not found", etc. through the install (visible in the field
+#      log at generated lines 1806 and 2090). The rules themselves still
+#      landed, but the noise was alarming and the command-substitution could
+#      in principle have injected output. FIX: removed every backtick from
+#      comments inside unquoted heredocs (plain words / double quotes
+#      instead), and added a scanner to the validation pass that greps every
+#      unquoted heredoc body for backticks so this class can't recur.
+#  71. [CRITICAL, self-inflicted in v7-14] WORDPRESS HTTP HEALTH CHECK
+#      ALWAYS FAILED with "Unexpected HTTP response: none", blocking the
+#      install-complete state through all 24 retries even though PHP, DNS,
+#      and the DB query all passed. My v7-14 hardening used GNU wget long
+#      options — --max-redirect, --tries, --timeout — but Alpine's wget is
+#      BusyBox wget, which supports none of them; it rejected the
+#      unrecognized option and printed nothing parseable, so awk extracted
+#      an empty string every time. (The separate post-install validator
+#      check PASSED because it uses PHP from inside the container, which is
+#      why "Port 80 listening" and "WordPress HTTP response" were green
+#      while the health check was red.) FIX: do the request from inside the
+#      container with PHP (always present in the WP image), using
+#      follow_location=0 to pin to the server's own first response — exactly
+#      what --max-redirect=0 was reaching for, but in a way that works here —
+#      and ignore_errors=true so 3xx/4xx are captured, not thrown. This is
+#      the same method the post-install validator already uses successfully.
+#  72. [MEDIUM] `update.sh status` printed "column: not found". The status
+#      table was piped through `column -t`, but `column` (util-linux) isn't
+#      on stock Alpine, and the `|| true` didn't suppress the shell's
+#      "not found". FIX: use podman's own `table` format directive (native
+#      column alignment, no external tool), re-indented with sed.
+#  73. [MEDIUM] GeoIP GeoLite2 download failed with "HTTP 302". MaxMind's
+#      download endpoint 302-redirects to a pre-signed CDN URL, and the
+#      initial-download curl lacked -L (the weekly refresh cron already had
+#      -fsSL). Without -L curl wrote the redirect body instead of the
+#      database and the 200 check failed on 302. FIX: added -L so curl
+#      follows to the CDN (credentials are correctly not resent across the
+#      redirect since the CDN URL is pre-signed).
+#  74. [MEDIUM] The helper scripts (validate-wordpress.sh, update.sh,
+#      wp-hardening.sh) hard-failed for the unprivileged admin. Run over SSH
+#      as wpadmin — the only session where copy/paste works, since the root
+#      console via `qm terminal` can't paste — validate-wordpress.sh died
+#      with "can't open /etc/wp-install/vars.sh: Permission denied", and the
+#      others printed "Run as root". FIX: all three now auto-elevate via
+#      doas (re-exec `doas "$0" "$@"`), so they "just work" over SSH: doas
+#      prompts for the admin password once (permit persist :wheel), then
+#      everything runs as root with output in the copyable SSH session.
+#      --help/--list skip elevation. Also switched the vars.sh source guard
+#      from -f to -r so a non-readable file degrades cleanly.
+#  75. [MEDIUM] The validator reported two FALSE failures that traced back
+#      to #74 AND to values simply not being where it looked. (a) "No
+#      wp-admin IP restriction configured" even when one was set — it gated
+#      on ${ADMIN_CIDR}, which was never written to vars.sh, so it was
+#      always empty. FIX: check the Apache config's `Require ip` block
+#      directly (the actual enforcement) as the source of truth, and also
+#      write ADMIN_CIDR/ALLOWED_ADMIN_IP/PROXY_IP/SSH_CIDR/WEB_CIDR to
+#      vars.sh for display. (b) "Digest pinning: 0/3 pinned" while
+#      `update.sh` correctly showed 3/3 — the digests live in pinned.env,
+#      not vars.sh, and the validator never sourced pinned.env. FIX: source
+#      it too (readable now that #74 runs the validator as root). Also
+#      downgraded the fresh-install backup checks ("directory does not
+#      exist" / "no backups yet") from FAIL to WARN, since a VM minutes old
+#      hasn't reached its first scheduled 02:00 backup — a genuinely broken
+#      backup system still fails via the >48h staleness check once a backup
+#      exists.
+#  76. [DOC] Clarified the version-bump model in `update.sh` status output.
+#      A user expected `update.sh all` to offer a new WordPress major
+#      (7.0.2) and was confused when it didn't. That's deliberate: `all` and
+#      `digest-check` track newer DIGESTS under the tag you're already on
+#      (e.g. a same-version security rebuild), and never jump major versions
+#      on their own, so an unattended update can't swap in a new major. To
+#      move versions you name it: `update.sh wp <version>`. The status
+#      output now spells this out.
+#      From the v7-15 audit, also applied: DHCP input rules scoped to the
+#      gateway destination (matching the DNS rules' precision) rather than
+#      any host-local address. NOT changed, same reasoning as prior rounds:
+#      Trivy skippable and candidate-DB-in-standard-profile remain the
+#      documented tradeoffs (the audit's own fix is "make it configurable" —
+#      a feature, not a defect); `use nftables` (vs `need`) is kept so a
+#      firewall hiccup doesn't strand the DB, with fail-closed left as a
+#      future production-profile toggle.
+#
 # v7-15 PATCH NOTES (on top of v7-14) — INSTALL-FAILURE FIX + AUDIT RESPONSE.
 # This version fixes the reason a v7-14 install failed in the field (WordPress
 # could not reach MariaDB) plus the actionable findings from an independent
@@ -1751,26 +1925,26 @@ table inet filter {
         # Podman network's gateway IP (10.89.10.1 and 10.89.20.1) on port 53.
         # A container resolving "mariadb" sends its query to that gateway
         # address, and because the gateway IP is a host-local address the
-        # packet traverses THIS input hook — not the forward hook. Without an
-        # explicit accept here it hits `policy drop` and every in-container
-        # name lookup fails, even though netavark adds its own accept rule in
-        # a separate `netavark` table: with nftables, when two base chains are
-        # registered on the same hook, a `drop` verdict in EITHER chain is
+        # packet traverses THIS input hook, not the forward hook. Without an
+        # explicit accept here it hits the chain's drop policy and every
+        # in-container name lookup fails, even though netavark adds its own
+        # accept rule in a separate table: with nftables, when two base chains
+        # are registered on the same hook, a drop verdict in EITHER chain is
         # final, so this chain's drop policy overrides netavark's accept. That
         # is the exact cause of "mariadb hostname does not resolve (Aardvark
-        # DNS / wp-db network issue)" seen in the field — MariaDB itself is
+        # DNS / wp-db network issue)" seen in the field. MariaDB itself is
         # healthy (its own in-container healthcheck needs no DNS), but
         # WordPress can't find it. Both container subnets are allowed to reach
-        # their gateway on 53 (udp and tcp — large responses fall back to TCP).
+        # their gateway on 53 (udp and tcp; large responses fall back to TCP).
         ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 53 accept
         ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 53 accept
         ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 udp dport 53 accept
         ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 tcp dport 53 accept
-        # DHCP from containers to the host-side gateway (netavark's IPAM can
-        # hand out leases on the bridge; without this the request is dropped
-        # and container bring-up stalls on some netavark versions).
-        ip saddr 10.89.10.0/24 udp dport 67 accept
-        ip saddr 10.89.20.0/24 udp dport 67 accept
+        # DHCP from containers to their gateway (netavark's IPAM can hand out
+        # leases on the bridge). Scoped to the gateway destination for the same
+        # precision as the DNS rules above.
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 67 accept
+        ip saddr 10.89.20.0/24 ip daddr 10.89.20.1 udp dport 67 accept
         # SSH: CrowdSec (crowdsecurity/sshd) handles brute-force banning
         ${SSH_RULE} ct state new limit rate 10/minute accept
         # HTTP/HTTPS: CrowdSec (crowdsecurity/apache2 + crowdsecurity/wordpress
@@ -2328,19 +2502,40 @@ _fail() { echo "  ✗  $*" >&2; FAIL=1; }
 # healthy for a GET / on a working WordPress. Any other status is a real
 # failure signal worth investigating, not something to silently accept.
 #
-# BUG FIX (v7-14): two robustness problems with how the status was read.
-# (1) wget follows redirects by default, and `tail -1` took the status of
-# the FINAL hop — so if WordPress issued a canonical redirect to the real
-# site domain, this check was grading whatever that domain returned rather
-# than what this VM returned. A site behind Cloudflare returning 403 to the
-# VM's own IP would fail a health check that has nothing to do with the
-# container being healthy, and during an update that means a spurious
-# rollback. --max-redirect=0 plus `head -1` pins the check to this
-# server's own first response. (2) No timeout: a half-open socket could
-# hang the health check, and with it an entire update, indefinitely.
-HTTP_CODE=$(wget -S -O /dev/null --max-redirect=0 --tries=2 --timeout=10 \
-  "http://127.0.0.1:${HTTP_PORT}/" 2>&1 \
-  | awk '/^[[:space:]]*HTTP\// {print $2}' | head -1)
+# BUG FIX (v7-16): the v7-14 attempt to harden this used GNU wget long
+# options — --max-redirect, --tries, --timeout — but this runs on Alpine,
+# where wget is BusyBox wget, which does NOT support any of those long
+# options. BusyBox wget rejected the unrecognized option, printed nothing
+# parseable, and awk extracted an empty string, so EVERY health check
+# reported "Unexpected HTTP response: none" — blocking the install from
+# ever reaching a healthy state through all 24 retries even though PHP,
+# DNS, and the DB query all passed. (This is the exact failure in the
+# field log: PHP/DNS/DB all ✔, HTTP ✗ none, 24/24 retries exhausted.)
+# FIX: do the request from inside the container with PHP, which is always
+# present in the WordPress image and needs no external HTTP client. This is
+# the same method the post-install validator already uses successfully.
+# follow_location=0 pins the result to the server's OWN first response —
+# achieving exactly what the v7-14 --max-redirect=0 was reaching for (don't
+# grade an offsite canonical-redirect target) but in a way that actually
+# works here. ignore_errors=true makes PHP return the status line for 3xx
+# and 4xx responses instead of throwing, so we can classify them. timeout=8
+# bounds a hung socket so a half-open connection can't stall an update.
+HTTP_CODE=$(podman exec --user www-data "$CONTAINER" php -r '
+  error_reporting(0);
+  $ctx = stream_context_create(["http" => [
+    "method"         => "GET",
+    "timeout"        => 8,
+    "follow_location"=> 0,
+    "ignore_errors"  => true,
+  ]]);
+  @file_get_contents("http://127.0.0.1:'"${HTTP_PORT}"'/", false, $ctx);
+  $code = "none";
+  if (isset($http_response_header[0]) &&
+      preg_match("#HTTP/[0-9.]+ ([0-9]{3})#", $http_response_header[0], $m)) {
+    $code = $m[1];
+  }
+  echo $code;
+' 2>/dev/null)
 case "$HTTP_CODE" in
   200|301|302) _pass "HTTP response: ${HTTP_CODE}" ;;
   *) _fail "Unexpected HTTP response: ${HTTP_CODE:-none} (expected 200, 301, or 302)" ;;
@@ -4017,7 +4212,16 @@ MMLOAD
 chmod 644 /home/wpuser/wp/apache-mods/maxminddb.load
 
 echo "Fetching GeoLite2-Country database…"
-HTTP_CODE=$(curl -sS -o /tmp/geolite2-country.tar.gz -w '%{http_code}' \
+# v7-16: -L is REQUIRED. MaxMind's download endpoint returns a 302 redirect
+# to a pre-signed CDN URL (S3/CloudFront); without -L curl stops at the 302,
+# writes the tiny redirect body to the output file instead of the database,
+# and the "!= 200" check below fails with 302 — the exact field failure
+# ("GeoLite2 download failed — HTTP 302"). curl does not resend the netrc
+# credentials across the redirect to the CDN host, which is correct: the
+# redirect URL is already pre-signed, so no credentials are needed there.
+# With -L, %{http_code} reports the FINAL response (200 from the CDN). The
+# weekly refresh cron already uses -fsSL; this makes the initial fetch match.
+HTTP_CODE=$(curl -sSL -o /tmp/geolite2-country.tar.gz -w '%{http_code}' \
   --netrc-file "$MAXMIND_NETRC" \
   'https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz')
 if [ "$HTTP_CODE" != "200" ]; then
@@ -4160,6 +4364,21 @@ elif [ "${GEOIP_ENABLED:-0}" = "1" ]; then
 fi
 
 ts "Creating mariadb-container service"
+# v8 (production fail-closed toggle): choose the nftables dependency strength
+# by deployment profile. standard = "use" (soft): ordering is enforced when
+# both are enabled, but a firewall problem can't stop the DB from coming up —
+# availability first, matching lab/staging expectations. production = "need"
+# (hard): if nftables fails to start, MariaDB does not start, and because
+# wp-container needs mariadb-container and crowdsec needs wp-container, the
+# whole publicly-exposed stack stays down rather than running unprotected —
+# fail-closed security. DEPLOYMENT_PROFILE was sourced from vars.sh near the
+# top of this installer. Only this service needs the toggle; the dependency
+# propagates transitively to wp-container and crowdsec-container.
+if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+  NFT_SVC_DEP="need nftables"
+else
+  NFT_SVC_DEP="use nftables"
+fi
 cat > /etc/init.d/mariadb-container << ORCSVC_DB
 #!/sbin/openrc-run
 name="mariadb-container"
@@ -4171,18 +4390,19 @@ DB_IMAGE="${DB_IMAGE}"
 
 depend() {
   need net
-  # v7-15: start AFTER nftables. /etc/nftables.nft does `flush ruleset`,
-  # which wipes ALL tables including the `netavark` table that provides
+  # v7-15: start AFTER nftables. /etc/nftables.nft does a full ruleset flush,
+  # which wipes ALL tables including the netavark table that provides
   # container NAT and the DNS path to aardvark-dns. If nftables started
   # (or restarted) after netavark had already configured this container's
   # networking, it would silently tear down that networking. Ordering the
   # container services after nftables makes the sequence deterministic:
   # firewall first, then containers, then netavark lays its table on top
-  # and nothing flushes it afterward. `use` (not `need`) so a firewall
-  # hiccup doesn't block the DB from coming up — but when both are enabled,
-  # ordering is enforced.
+  # and nothing flushes it afterward.
+  # v8: the nftables dependency below is "use" under the standard profile
+  # (soft — availability first) and "need" under production (hard — the
+  # stack stays down rather than run unprotected if the firewall fails).
   after sysfs qemu-guest-agent nftables
-  use nftables
+  ${NFT_SVC_DEP}
 }
 
 start() {
@@ -4450,8 +4670,23 @@ WP_CANDIDATE_PORT="18080"
 DB_DATA_DIR="/home/wpuser/wp/mysql"
 DB_SNAPSHOT_DIR="/home/wpuser/wp/mysql-preupdate-snapshot"
 
-[ "$(id -u)" -eq 0 ] || { echo "ERROR: Must run as root"; exit 1; }
-[ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+# v7-16: auto-elevate via doas rather than hard-failing. update.sh needs root
+# (reads pinned.env, swaps containers, edits the firewall). But the admin can
+# only copy/paste over SSH as the unprivileged wheel user — the root console
+# via `qm terminal` can't paste — so demanding root made gathering output
+# painful. Re-exec through doas so it "just works" over SSH: doas prompts for
+# the admin password once (permit persist :wheel), then everything runs as
+# root with output in the copyable SSH session. Args are still intact here
+# (the subcommand dispatch runs at the end of this script), so "$@" survives
+# the exec. If doas isn't present, fall back to the original hard error.
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then
+    exec doas "$0" "$@"
+  fi
+  echo "ERROR: must run as root (or install doas and run as a wheel user)" >&2
+  exit 1
+fi
+[ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
 
 # ── Image reference validation (v7-6d, carried forward) ────────────────────
@@ -4803,6 +5038,17 @@ setup_trivy() {
 scan_image() {
   local img="$1" rc
   if ! command -v trivy >/dev/null 2>&1; then
+    # v8 production fail-closed toggle: standard profile skips the scan and
+    # proceeds (availability first); production refuses to update at all
+    # without a working scanner, rather than apply an image whose security
+    # state is unknown.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      echo "  ✗  Trivy is not available, and DEPLOYMENT_PROFILE=production requires a" >&2
+      echo "     completed vulnerability scan before any image is applied. Refusing to" >&2
+      echo "     update. Install Trivy (apk add trivy, or see setup_trivy) and retry," >&2
+      echo "     or re-run under DEPLOYMENT_PROFILE=standard for a lab install." >&2
+      return 1
+    fi
     echo "  ⚠  Trivy not available — skipping vulnerability scan"
     return 0
   fi
@@ -4859,6 +5105,16 @@ scan_image() {
         sed 's/^/       /' "${_trivy_err}" >&2 || true
       fi
       rm -f "${_trivy_err}"
+      # v8 production fail-closed toggle: in production an incomplete scan is
+      # not an operator judgement call — the update is refused. Standard
+      # profile keeps the prompt so a lab install isn't blocked by a scanner
+      # outage.
+      if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+        echo "  ✗  DEPLOYMENT_PROFILE=production requires a COMPLETED scan. Refusing to" >&2
+        echo "     update on an unknown security state. Investigate the scanner failure" >&2
+        echo "     above and retry." >&2
+        return 1
+      fi
       ask_yn "  Proceed with update WITHOUT a completed scan? (not recommended)" || {
         echo "  Update aborted. Investigate the scanner failure and retry."
         return 1
@@ -5786,7 +6042,11 @@ do_cs_update() {
 
 show_status() {
   echo ""; echo "── Status ─────────────────────────────────────────────────────"
-  podman ps --format "  {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | column -t || true
+  # v7-16: was piped through `column -t`, but `column` (util-linux) isn't on
+  # stock Alpine — it printed "column: not found" and dropped the alignment.
+  # podman's own `table` format directive aligns the columns natively with no
+  # external tool; sed just re-indents to match the rest of this block.
+  podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | sed 's/^/  /' || true
   echo ""
   echo "  Firewall : $(nft list tables 2>/dev/null | grep -c table) nft tables"
   echo "  Bouncer  : $(rc-service cs-firewall-bouncer status 2>/dev/null | head -1)"
@@ -5896,11 +6156,304 @@ show_check_summary() {
   echo "╚══════════════════════════════════════════════════════════╝"
   echo ""
   echo "  update.sh all                  — update everything (asks before each change)"
+  echo "  update.sh versions             — check the registry for newer RELEASES"
+  echo "  update.sh upgrade              — guided move to newer releases (all components)"
   echo "  update.sh wp|db|crowdsec [VER] — update one component (asks first)"
   echo "  update.sh digest-check         — refresh any component whose tag got rebuilt"
   echo "  update.sh os                   — Alpine package updates"
   echo "  update.sh trivy                — CVE scan of the images actually running"
+  echo ""
+  echo "  Two different questions this tool answers:"
+  echo "   • 'all' / 'digest-check' track newer DIGESTS under the tag you're already"
+  echo "     on (e.g. a same-version security rebuild of ${PINNED_WP_VER:-the current tag}). They never"
+  echo "     jump to a new version on their own, so an unattended update can't swap in"
+  echo "     a new major WordPress or a new MariaDB line."
+  echo "   • 'versions' / 'upgrade' find and move to newer RELEASES (e.g. WordPress"
+  echo "     6.9.4 -> 6.9.5 for a CVE fix). Run 'update.sh versions' to see what's out,"
+  echo "     then 'update.sh upgrade' (guided, with candidate-test + rollback) or name"
+  echo "     one directly: update.sh wp <version>."
   show_status
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VERSION DISCOVERY (v8) — find newer RELEASES, not just rebuilt digests.
+# ═══════════════════════════════════════════════════════════════════════════
+# digest-check answers "has the tag I'm on been rebuilt?" (same version, new
+# digest). This answers a different question: "has a newer VERSION been
+# published?" — e.g. you're pinned to WordPress 6.9.4 and 6.9.5 is out with a
+# security fix. It lists available tags from the registry (Skopeo list-tags),
+# filters to the real release tags for each image, and compares versions so
+# you can SEE a newer release and choose to move the pin to it. `upgrade` then
+# walks all three components and, for each newer release, runs the ordinary
+# update path (candidate test on loopback, digest re-pin, rollback on
+# failure, GeoIP layer rebuilt if it was active) — so version bumps get the
+# exact same safety as a normal update.
+
+# _ver_cmp A B — compare dotted numeric versions. Echoes 1 if A>B, -1 if A<B,
+# 0 if equal. Missing trailing fields count as 0 (so 6.9 == 6.9.0). Pure
+# POSIX; does not rely on `sort -V`, which BusyBox sort may not support.
+_ver_cmp() {
+  _a="$1"; _b="$2"
+  while [ -n "$_a" ] || [ -n "$_b" ]; do
+    _af="${_a%%.*}"; _bf="${_b%%.*}"
+    case "$_a" in *.*) _a="${_a#*.}" ;; *) _a="" ;; esac
+    case "$_b" in *.*) _b="${_b#*.}" ;; *) _b="" ;; esac
+    [ -n "$_af" ] || _af=0
+    [ -n "$_bf" ] || _bf=0
+    case "$_af" in *[!0-9]*) _af=0 ;; esac
+    case "$_bf" in *[!0-9]*) _bf=0 ;; esac
+    if [ "$_af" -gt "$_bf" ]; then echo 1; return; fi
+    if [ "$_af" -lt "$_bf" ]; then echo -1; return; fi
+  done
+  echo 0
+}
+
+# _max_version — reads version strings on stdin (one per line), echoes the
+# numerically largest using _ver_cmp (not lexical sort). Empty in → empty out.
+_max_version() {
+  _mv_best=""
+  while IFS= read -r _mv_v; do
+    [ -n "$_mv_v" ] || continue
+    if [ -z "$_mv_best" ] || [ "$(_ver_cmp "$_mv_v" "$_mv_best")" = "1" ]; then
+      _mv_best="$_mv_v"
+    fi
+  done
+  [ -n "$_mv_best" ] && printf '%s' "$_mv_best"
+}
+
+# _registry_tags REF — echo every tag for a registry repo, one per line.
+# Uses Skopeo list-tags + jq (jq is installed at provisioning time); falls
+# back to a crude JSON scrape if jq is somehow absent. Returns 1 (and echoes
+# nothing) if the registry can't be reached — callers treat that as "unknown".
+_registry_tags() {
+  _rt_ref="$1"
+  command -v skopeo >/dev/null 2>&1 || return 1
+  _rt_json=$(skopeo list-tags "docker://${_rt_ref}" 2>/dev/null) || return 1
+  [ -n "$_rt_json" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$_rt_json" | jq -r '.Tags[]?' 2>/dev/null
+  else
+    # jq-free safety net: isolate the content of the "Tags":[ ... ] array
+    # first (so the "Repository" value can't leak in as a bogus tag), then
+    # split on commas and strip quotes.
+    printf '%s' "$_rt_json" \
+      | tr -d '\n' \
+      | sed 's/.*"Tags"[[:space:]]*:[[:space:]]*\[//; s/\].*//' \
+      | tr ',' '\n' \
+      | grep -oE '"[^"]*"' | tr -d '"'
+  fi
+}
+
+# _wp_latest_stable VARIANT — newest stable WordPress X.Y.Z for the given
+# variant suffix (e.g. php8.3-apache). Beta/RC/cli tags are excluded by the
+# strict ^X.Y.Z-variant$ shape (they don't start with a bare version number).
+_wp_latest_stable() {
+  _wls_re=$(printf '%s' "$1" | sed 's/[.]/\\./g')
+  _registry_tags "$WP_REGISTRY" \
+    | grep -E "^[0-9]+\.[0-9]+\.[0-9]+-${_wls_re}$" \
+    | sed "s/-${_wls_re}\$//" \
+    | _max_version
+}
+
+# _cs_latest_stable — newest stable CrowdSec vX.Y.Z (echoed WITHOUT the v).
+# latest/slim/debian/-rc tags are excluded by the strict ^vX.Y.Z$ shape.
+_cs_latest_stable() {
+  _registry_tags "$CS_REGISTRY" \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sed 's/^v//' \
+    | _max_version
+}
+
+# _db_is_lts MAJOR.MINOR — true (0) if this MariaDB line is an LTS line.
+# CRITICAL: MariaDB version number alone does NOT indicate support status.
+# Rolling releases (11.5/11.6/11.7, 12.0/12.1/12.2, …) carry a SHORTER support
+# window than the LTS they follow — 12.2 reached EOL while 10.11 LTS is still
+# supported. So a production database must track LTS lines, not "highest
+# number". LTS lines historically: 10.6, 10.11, 11.4, 11.8; and from 12
+# onward the .3 release of each major is LTS (12.3, 13.3, …). This encodes
+# both, so future .3 LTS lines are recognized automatically.
+_db_is_lts() {
+  case "$1" in
+    10.6|10.11|11.4|11.8) return 0 ;;
+  esac
+  _lts_maj="${1%%.*}"; _lts_min="${1#*.}"
+  if [ "$_lts_min" = "3" ]; then
+    [ "$_lts_maj" -ge 12 ] 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# _db_newer_lts_list CURRENT — echo every LTS MAJOR.MINOR line available in
+# the registry that is strictly newer than CURRENT, oldest first (so head -1
+# is the safe next step, tail -1 is the newest LTS).
+_db_newer_lts_list() {
+  _dnl_cur="$1"
+  _registry_tags "$DB_REGISTRY" | grep -E '^[0-9]+\.[0-9]+$' | sort -u | while IFS= read -r _dnl_t; do
+    _db_is_lts "$_dnl_t" || continue
+    [ "$(_ver_cmp "$_dnl_t" "$_dnl_cur")" = "1" ] && echo "$_dnl_t"
+  done | (
+    # oldest-first order without relying on `sort -V`: bubble via _ver_cmp
+    _sorted=""
+    while IFS= read -r _line; do
+      [ -n "$_line" ] || continue
+      if [ -z "$_sorted" ]; then _sorted="$_line"; continue; fi
+      _new=""; _placed=0
+      for _e in $_sorted; do
+        if [ "$_placed" = "0" ] && [ "$(_ver_cmp "$_line" "$_e")" = "-1" ]; then
+          _new="$_new $_line"; _placed=1
+        fi
+        _new="$_new $_e"
+      done
+      [ "$_placed" = "0" ] && _new="$_new $_line"
+      _sorted="${_new# }"
+    done
+    for _e in $_sorted; do echo "$_e"; done
+  )
+}
+
+# do_versions — READ-ONLY discovery report. Queries the registry and shows,
+# per component, the pinned version vs the newest available release, plus the
+# exact command to move to it. Changes nothing.
+do_versions() {
+  echo "── Available versions (registry query — no download, nothing changed) ──"
+  if ! command -v skopeo >/dev/null 2>&1; then
+    echo "  skopeo is not installed — cannot query the registry for tags."
+    return 1
+  fi
+  echo "  Querying Docker Hub… (images with many tags can take up to a minute)"
+  echo ""
+
+  # ── WordPress ──
+  _cur_wp="${WP_TAG:-$PINNED_WP_VER}"
+  _wp_ver="${_cur_wp%%-*}"; _wp_variant="${_cur_wp#*-}"
+  echo "  WordPress   (variant: ${_wp_variant})"
+  echo "    pinned : ${_wp_ver}"
+  _newest_wp=$(_wp_latest_stable "$_wp_variant")
+  if [ -z "$_newest_wp" ]; then
+    echo "    latest : (couldn't reach the registry, or no matching tags)"
+  elif [ "$(_ver_cmp "$_newest_wp" "$_wp_ver")" = "1" ]; then
+    echo "    latest : ${_newest_wp}   <-- NEWER RELEASE AVAILABLE"
+    echo "     move  : update.sh wp ${_newest_wp}-${_wp_variant}"
+  else
+    echo "    latest : ${_newest_wp}   (up to date)"
+  fi
+  echo ""
+
+  # ── MariaDB (LTS-aware) ──
+  _cur_db="${DB_TAG:-$PINNED_DB_VER}"
+  if _db_is_lts "$_cur_db"; then _db_note="(LTS)"; else _db_note="(NOT an LTS line)"; fi
+  echo "  MariaDB     (LTS-aware — rolling releases are intentionally excluded)"
+  echo "    pinned : ${_cur_db}  ${_db_note}"
+  _newer_lts=$(_db_newer_lts_list "$_cur_db")
+  if [ -z "$_newer_lts" ]; then
+    echo "    latest : you are on the newest recognized LTS line"
+  else
+    _next_lts=$(printf '%s\n' "$_newer_lts" | head -1)
+    _top_lts=$(printf '%s\n' "$_newer_lts" | tail -1)
+    echo "    newer LTS lines: $(printf '%s' "$_newer_lts" | tr '\n' ' ')"
+    echo "     move  : update.sh db ${_next_lts}   (recommended — one LTS at a time)"
+    [ "$_next_lts" != "$_top_lts" ] && \
+      echo "             update.sh db ${_top_lts}   (newest LTS — a bigger jump; test first)"
+    echo "     note  : a higher MariaDB number is NOT always more supported — rolling"
+    echo "             releases (e.g. 11.5/11.6/11.7, 12.0/12.1/12.2) reach EOL sooner"
+    echo "             than the LTS they follow, so this stays on LTS lines only."
+  fi
+  echo ""
+
+  # ── CrowdSec ──
+  _cur_cs="${CS_TAG:-$PINNED_CS_VER}"; _cs_ver="${_cur_cs#v}"
+  echo "  CrowdSec"
+  echo "    pinned : v${_cs_ver}"
+  _newest_cs=$(_cs_latest_stable)
+  if [ -z "$_newest_cs" ]; then
+    echo "    latest : (couldn't reach the registry, or no matching tags)"
+  elif [ "$(_ver_cmp "$_newest_cs" "$_cs_ver")" = "1" ]; then
+    echo "    latest : v${_newest_cs}   <-- NEWER RELEASE AVAILABLE"
+    echo "     move  : update.sh crowdsec v${_newest_cs}"
+  else
+    echo "    latest : v${_newest_cs}   (up to date)"
+  fi
+  echo ""
+  echo "  This is a VERSION check (is a newer release published?), separate from"
+  echo "  digest-check (has the CURRENT tag been rebuilt?). To move everything that"
+  echo "  has a newer release in one guided pass, with candidate-test + rollback:"
+  echo "      update.sh upgrade"
+  echo ""
+}
+
+# do_upgrade — guided cross-component version bump. For each component with a
+# newer release, offers to move the pin to it, then runs the ordinary update
+# path for that component (do_*_update): candidate test, digest re-pin, and
+# rollback on failure. MariaDB is offered the NEXT LTS line (one step), never
+# a rolling release. Each component is confirmed separately.
+do_upgrade() {
+  echo "── Guided upgrade — move pinned versions to newer releases ──"
+  echo "  Each component you accept goes through the normal update path:"
+  echo "  a throwaway candidate is tested on loopback first, the new digest is"
+  echo "  pinned, and a failure rolls back to the current version. You confirm"
+  echo "  each one. Nothing is touched until you say yes."
+  echo ""
+  if ! command -v skopeo >/dev/null 2>&1; then
+    echo "  skopeo is not installed — cannot query the registry for tags."
+    return 1
+  fi
+  echo "  Querying Docker Hub for newer releases…"
+  echo ""
+  _upg_any=0
+
+  # WordPress
+  _cur_wp="${WP_TAG:-$PINNED_WP_VER}"; _wp_ver="${_cur_wp%%-*}"; _wp_variant="${_cur_wp#*-}"
+  _newest_wp=$(_wp_latest_stable "$_wp_variant")
+  if [ -n "$_newest_wp" ] && [ "$(_ver_cmp "$_newest_wp" "$_wp_ver")" = "1" ]; then
+    _upg_any=1
+    echo "  WordPress: ${_wp_ver} -> ${_newest_wp}   (${_wp_variant})"
+    if ask_yn "  Upgrade WordPress to ${_newest_wp}?"; then
+      do_wp_update "${_newest_wp}-${_wp_variant}" \
+        || echo "  ⚠  WordPress upgrade did not complete — production left on ${_wp_ver} (see above)."
+    else
+      echo "  Skipped WordPress."
+    fi
+    echo ""
+  fi
+
+  # MariaDB — offer the NEXT LTS line only
+  _cur_db="${DB_TAG:-$PINNED_DB_VER}"
+  _next_lts=$(_db_newer_lts_list "$_cur_db" | head -1)
+  if [ -n "$_next_lts" ]; then
+    _upg_any=1
+    echo "  MariaDB: ${_cur_db} -> ${_next_lts}   (next LTS line)"
+    echo "    A MariaDB version bump changes the on-disk format. The update path"
+    echo "    snapshots the data directory and runs mariadb-upgrade, rolling back"
+    echo "    if WordPress can't use the new database — but for a major jump, take"
+    echo "    a manual backup first (update.sh has just verified backups exist)."
+    if ask_yn "  Upgrade MariaDB to ${_next_lts} (LTS)?"; then
+      do_db_update "${_next_lts}" \
+        || echo "  ⚠  MariaDB upgrade did not complete — rolled back to ${_cur_db} (see above)."
+    else
+      echo "  Skipped MariaDB."
+    fi
+    echo ""
+  fi
+
+  # CrowdSec
+  _cur_cs="${CS_TAG:-$PINNED_CS_VER}"; _cs_ver="${_cur_cs#v}"
+  _newest_cs=$(_cs_latest_stable)
+  if [ -n "$_newest_cs" ] && [ "$(_ver_cmp "$_newest_cs" "$_cs_ver")" = "1" ]; then
+    _upg_any=1
+    echo "  CrowdSec: v${_cs_ver} -> v${_newest_cs}"
+    if ask_yn "  Upgrade CrowdSec to v${_newest_cs}?"; then
+      do_cs_update "v${_newest_cs}" \
+        || echo "  ⚠  CrowdSec upgrade did not complete (see above)."
+    else
+      echo "  Skipped CrowdSec."
+    fi
+    echo ""
+  fi
+
+  if [ "$_upg_any" = "0" ]; then
+    echo "  Everything is already on the newest recognized release. Nothing to do."
+    echo "  (Run 'update.sh digest-check' to catch same-version security rebuilds.)"
+  fi
 }
 
 # ── Update lock — prevents concurrent update.sh invocations from stepping
@@ -5967,6 +6520,8 @@ case "${1:-check}" in
   crowdsec|cs) acquire_lock || exit 1; do_cs_update "${2:-}" ;;
   all)         acquire_lock || exit 1; do_all_updates ;;
   digest-check|digest|pin) acquire_lock || exit 1; do_digest_check ;;
+  versions|check-versions|ver) do_versions ;;
+  upgrade|upgrade-all)         acquire_lock || exit 1; do_upgrade ;;
   trivy|scan)
     setup_trivy
     for img in wordpress mariadb crowdsec; do
@@ -5974,7 +6529,7 @@ case "${1:-check}" in
       [ -n "$running" ] && scan_image "$running"
     done ;;
   check|status|"") show_check_summary ;;
-  *) echo "Usage: update.sh [check|status|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all|trivy]"; exit 1 ;;
+  *) echo "Usage: update.sh [check|status|versions|upgrade|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all|trivy]"; exit 1 ;;
 esac
 UPDSCRIPT
 chmod +x /usr/local/bin/update.sh
@@ -6401,8 +6956,18 @@ cat > /usr/local/bin/wp-hardening.sh << 'HARDEN'
 # From Proxmox: qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status
 # Features: 8g  xmlrpc  uploads-php  author-enum  debug
 set -e
-[ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
-[ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+# v7-16: auto-elevate via doas instead of hard-failing (see update.sh for the
+# full rationale) — the admin can only copy/paste over SSH as the unprivileged
+# wheel user, so re-exec through doas so this works over SSH. "$@" is intact
+# here (dispatch is later), so it survives the exec.
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then
+    exec doas "$0" "$@"
+  fi
+  echo "Run as root (or install doas and run as a wheel user)" >&2
+  exit 1
+fi
+[ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 PRUN() {
   podman "$@"
 }
@@ -6653,6 +7218,31 @@ cat > /usr/local/bin/validate-wordpress.sh << 'VALSCRIPT'
 # Exit: 0 = all passed, 1 = one or more failures, 2 = warnings only
 # ============================================================================
 
+# v7-16: auto-elevate via doas. This tool reads /etc/wp-install/vars.sh (root-
+# only, 0600) and pinned.env, and inspects containers and the firewall — all
+# need root. Run as the unprivileged admin over SSH (the session where
+# copy/paste actually works; the root console via `qm terminal` can't paste)
+# it used to fail immediately with "can't open /etc/wp-install/vars.sh:
+# Permission denied", and every check that reads a vars.sh value then saw an
+# empty string and reported a FALSE result — "Digest pinning: 0/3 pinned"
+# while `update.sh` correctly showed 3/3, and "No wp-admin IP restriction
+# configured" when ADMIN_CIDR was in fact set. Re-exec through doas so the
+# tool "just works" over SSH: doas prompts for the admin password once (permit
+# persist :wheel), then everything runs as root with output in the copyable
+# SSH session. --help/--list need no privileges, so they skip elevation.
+_vwp_needs_root=1
+case " $* " in
+  *" --help "*|*" -h "*|*" --list "*|*" -l "*) _vwp_needs_root=0 ;;
+esac
+if [ "$_vwp_needs_root" = "1" ] && [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then
+    exec doas "$0" "$@"
+  fi
+  echo "This tool needs root to read vars.sh and inspect the system." >&2
+  echo "Run it as root, or as a wheel user with doas installed." >&2
+  exit 1
+fi
+
 QUIET=0
 QUICK=0
 ONLY=""
@@ -6673,7 +7263,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+[ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+# v7-16: also source pinned.env — the image digests (WP_DIGEST/DB_DIGEST/
+# CS_DIGEST) live HERE, not in vars.sh. Without this the digest-pinning check
+# below saw three empty strings and reported "0/3 pinned" as a FALSE failure,
+# while update.sh (which sources pinned.env) correctly showed 3/3. Both files
+# are 0600 root-only, so this depends on the auto-doas elevation at the top.
+[ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
 PASS=0; FAIL=0; WARN=0
 REMEDIES=""
@@ -6984,15 +7580,26 @@ else
 fi
 
 # --- wp-admin IP restriction ---
+# v7-16: check the Apache config as the SOURCE OF TRUTH, not the ADMIN_CIDR
+# variable. The old logic only looked for 'Require ip' when ${ADMIN_CIDR} was
+# non-empty — but ADMIN_CIDR was never written to vars.sh, so it was always
+# empty and this always fell through to the WARN, reporting "No wp-admin IP
+# restriction configured" even on installs that HAD one (the exact false
+# warning from the field). The enforcement lives in the Apache config, so
+# that's what we test; the variable (now also in vars.sh) is only for display.
 APACHE_CONF=/home/wpuser/wp/apache-conf/wp-security.conf
-if [ -n "${ADMIN_CIDR}${ALLOWED_ADMIN_IP}" ]; then
-  if grep -q 'Require ip' "$APACHE_CONF" 2>/dev/null; then
-    pass "wp-admin IP restriction present (${ADMIN_CIDR:-}${ALLOWED_ADMIN_IP:+ ${ALLOWED_ADMIN_IP}})"
-  else
-    fail "ADMIN_CIDR configured but no 'Require ip' rule found" \
-         "wp-admin is reachable from any source IP." \
-         "grep -n 'Require ip' ${APACHE_CONF}    # re-run provisioning if absent"
-  fi
+if grep -q 'Require ip' "$APACHE_CONF" 2>/dev/null; then
+  # Pull the actual value(s) from the config so the message is accurate even
+  # when the variable isn't set in this shell.
+  _cfg_ips=$(grep 'Require ip' "$APACHE_CONF" 2>/dev/null \
+             | sed 's/.*Require ip//' | tr -s ' ' | tr '\n' ' ' | sed 's/^ *//;s/ *$//')
+  pass "wp-admin IP restriction present (${_cfg_ips:-see ${APACHE_CONF}})"
+elif [ -n "${ADMIN_CIDR}${ALLOWED_ADMIN_IP}" ]; then
+  # Variable says one was requested, but the config doesn't have it — a real
+  # inconsistency worth failing on.
+  fail "ADMIN_CIDR is set but no 'Require ip' rule is in the Apache config" \
+       "wp-admin is reachable from any source IP despite a restriction being configured." \
+       "grep -n 'Require ip' ${APACHE_CONF}    # re-run provisioning if absent"
 else
   warn "No wp-admin IP restriction configured" \
        "wp-admin is reachable from any source address that can reach port 80." \
@@ -7217,8 +7824,13 @@ fi
 if [ -d "$BK" ]; then
   newest=$(ls -t "$BK"/wp-db-*.sql.gz 2>/dev/null | head -1)
   if [ -z "$newest" ]; then
-    fail "No backups exist in ${BK}" \
-         "Nothing to restore from." \
+    # v7-16: WARN, not FAIL. The directory exists but is empty — normal on a
+    # VM that hasn't reached its first scheduled 02:00 backup. A truly broken
+    # backup system surfaces as a FAIL via the >48h staleness check below once
+    # a backup exists, so this stays a WARN to avoid a false alarm on fresh
+    # installs while still prompting the operator to verify.
+    warn "No backups exist yet in ${BK}" \
+         "Expected on a fresh VM — the backup runs daily at 02:00. Not yet verified end-to-end." \
          "/usr/local/bin/wp-db-backup.sh    # run one now and watch for errors"
   else
     age_h=$(( ( $(date +%s) - $(date -r "$newest" +%s 2>/dev/null || echo 0) ) / 3600 ))
@@ -7254,9 +7866,13 @@ if [ -d "$BK" ]; then
     info "${cnt} backup(s) retained in ${BK}"
   fi
 else
-  fail "Backup directory ${BK} does not exist" \
-       "No backup has ever run successfully." \
-       "/usr/local/bin/wp-db-backup.sh"
+  # v7-16: WARN, not FAIL — same fresh-install reasoning as above. The daily
+  # backup creates this directory on its first run (02:00); its absence on a
+  # brand-new VM is expected, not a fault. If the backup script itself is
+  # missing that's caught as a FAIL by the "Backup script present" check above.
+  warn "Backup directory ${BK} does not exist yet" \
+       "Expected on a fresh VM — it's created by the first scheduled backup (daily 02:00)." \
+       "/usr/local/bin/wp-db-backup.sh    # run one now to create it and verify"
 fi
 fi
 
@@ -7687,6 +8303,18 @@ USE_DIGEST_PINNING=$(_vars_q "${USE_DIGEST_PINNING:-1}")
 DEPLOYMENT_PROFILE=$(_vars_q "${DEPLOYMENT_PROFILE:-standard}")
 ADMIN_USER=$(_vars_q "$ADMIN_USER")
 ADMIN_USER_CREATED=$(_vars_q "${ADMIN_USER_CREATED:-0}")
+# v7-16: persist the firewall/proxy values too. These were never written to
+# vars.sh, so every tool that sourced it saw them empty — most visibly the
+# validator, whose wp-admin check gated on ${ADMIN_CIDR} and therefore always
+# reported "No wp-admin IP restriction configured" even when one WAS set in
+# the Apache config. Writing them here lets tools display and reason about the
+# configured restrictions; the Apache/nftables configs remain the source of
+# truth that the validator cross-checks against.
+ADMIN_CIDR=$(_vars_q "${ADMIN_CIDR:-}")
+ALLOWED_ADMIN_IP=$(_vars_q "${ALLOWED_ADMIN_IP:-}")
+PROXY_IP=$(_vars_q "${PROXY_IP:-}")
+SSH_CIDR=$(_vars_q "${SSH_CIDR:-}")
+WEB_CIDR=$(_vars_q "${WEB_CIDR:-}")
 INSTALLERENV
 chmod 600 "$MNT/etc/wp-install/vars.sh"
 msg_ok "Installer vars injected (slug=${WP_ADMIN_SLUG:-default}, cs-enroll=${CROWDSEC_ENROLL_KEY:+provided}, net=${NET_MODE}, geoip=${GEOIP_ENABLED:-0}, digest-pin=${USE_DIGEST_PINNING:-1}, admin=${ADMIN_USER})"
