@@ -3,6 +3,53 @@
 # WORDPRESS VM — PROXMOX VE PROVISIONING SCRIPT  (production-ready)
 # =============================================================================
 #
+# v8-1 NOTES (on top of v8) — CHATGPT-EVALUATION FIXES. Five verified fixes from
+# a static forensic review; each was confirmed against the actual code before
+# changing, and the changed logic was mock-tested. All changes are tagged "v8-1"
+# in comments at their sites.
+#
+#   1. [HIGH] validate-wordpress.sh used BusyBox-incompatible GNU wget options
+#      (--max-redirect/--tries/--timeout) — the exact bug already fixed in
+#      wp-health-check.sh but missed here, so the validator produced false
+#      HTTP/security failures on Alpine. Replaced with the same PHP-from-
+#      container probe the health checker uses. (v8 eval finding 16)
+#   2. [HIGH] 'update.sh upgrade' could exit 0 even when a component upgrade
+#      failed — each failure was swallowed by '|| echo' and do_upgrade returned
+#      the last command's status, so cron/monitoring saw success on a partial
+#      failure. It now aggregates per-component results, prints a summary, and
+#      returns non-zero if any accepted upgrade failed. (v8 eval finding 10)
+#   3. [HIGH] MariaDB LTS logic assumed every future major.3 (13.3, 14.3, …) is
+#      LTS and still labelled 10.6 as LTS after its 2026-07-06 community EOL.
+#      Replaced the inference with explicit maintained supported/EOL allowlists;
+#      version discovery now shows supported/EOL/rolling state and warns loudly
+#      when the pinned line is EOL. (v8 eval findings 7 & 8)
+#   4. [MED] The guided MariaDB upgrade inferred the next step from sorted
+#      numbers. It now offers only a DOCUMENTED single-step LTS transition
+#      (10.6→10.11→11.4→11.8→12.3) and refuses to infer a path from an
+#      unrecognized/rolling source. (v8 eval finding 9)
+#   5. [MED] DB backups gzipped straight to the final filename, so a crash
+#      mid-gzip could leave a truncated wp-db-*.sql.gz that looks complete. The
+#      scheduled backup now stages to a hidden temp file and publishes with an
+#      atomic rename; both dumps gained --quick --hex-blob. (v8 eval finding 19)
+#
+#   COMPANION TOOL: scan-heredocs.py (ships alongside) implements the heredoc
+#   command-substitution scanner the notes referred to but hadn't shipped as
+#   identifiable code — run it before provisioning. (v8 eval finding 22)
+#
+#   DELIBERATELY DEFERRED (documented, not silently dropped): production
+#   HIGH/CRITICAL Trivy findings remain overridable via prompt rather than a
+#   root-owned digest-scoped approval file (finding 14 — adds an interactive
+#   flow that can't be tested without real hardware); candidate WordPress still
+#   uses the live production DB (finding 17 — the integration harness this was
+#   gated on now exists, but the read-only-DB-account step still needs real-HW
+#   validation); no off-VM backup gate before a major DB upgrade (finding 18 —
+#   environment-specific); egress stays open (finding 20 — enforce at the
+#   network edge); Trivy installer lacks a pinned checksum (finding 15 — needs a
+#   maintained SHA); CrowdSec enrol key still appears briefly in argv (finding
+#   21 — depends on cscli's stdin support). _ver_cmp treating a non-numeric
+#   field as 0 (finding 4) is left as-is: it fails SAFE (malformed sorts lowest)
+#   and upstream grep filtering means malformed tags never reach it.
+#
 # v8 NOTES (on top of v7-16) — VERSION DISCOVERY + PRODUCTION FAIL-CLOSED
 # TOGGLES. This release adds the future enhancements tracked in the TODO. The
 # headline feature answers a question the tool couldn't previously answer: not
@@ -5656,7 +5703,7 @@ do_db_update() {
   echo "  → Backing up to ${BACKUP_FILE}…"
   BACKUP_OK=0
   if ( umask 077; podman exec mariadb sh -c \
-       'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+       'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction --quick --hex-blob -uroot -p"$MARIADB_ROOT_PASSWORD"' \
        > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err" ); then
     if [ -s "${BACKUP_RAW}" ] && tail -c 200 "${BACKUP_RAW}" | grep -q "Dump completed"; then
       if gzip -f "${BACKUP_RAW}" && gzip -t "${BACKUP_FILE}" 2>/dev/null; then
@@ -6264,23 +6311,54 @@ _cs_latest_stable() {
     | _max_version
 }
 
-# _db_is_lts MAJOR.MINOR — true (0) if this MariaDB line is an LTS line.
+# Recognized MariaDB LTS lines, as EXPLICIT maintained allowlists.
 # CRITICAL: MariaDB version number alone does NOT indicate support status.
 # Rolling releases (11.5/11.6/11.7, 12.0/12.1/12.2, …) carry a SHORTER support
 # window than the LTS they follow — 12.2 reached EOL while 10.11 LTS is still
-# supported. So a production database must track LTS lines, not "highest
-# number". LTS lines historically: 10.6, 10.11, 11.4, 11.8; and from 12
-# onward the .3 release of each major is LTS (12.3, 13.3, …). This encodes
-# both, so future .3 LTS lines are recognized automatically.
+# supported. So a production database must track LTS lines, not "highest number".
+#
+# v8-1 (ChatGPT v8 findings 7 & 8): these were previously a single allowlist
+# {10.6,10.11,11.4,11.8} PLUS an inference that every future major.3 (13.3,
+# 14.3, …) is LTS. Two problems: (a) predicting release policy from a number
+# pattern is unsafe — an unannounced or preview .3 tag would be offered as a
+# production upgrade the moment it appeared; (b) 10.6 was labelled a current
+# LTS even though its community maintenance ended 2026-07-06. Both are now
+# explicit lists with a supported/EOL split. Update them ONLY after checking
+# MariaDB's official lifecycle page: https://mariadb.org/mariadb/all-releases/
+# (verified against the May 2026 release set: 12.3/11.8/11.4/10.11 supported,
+# 10.6 EOL 2026-07-06).
+MARIADB_LTS_SUPPORTED="10.11 11.4 11.8 12.3"
+MARIADB_LTS_EOL="10.6"
+
+# _db_lts_state MAJOR.MINOR — echoes: supported | eol | rolling
+_db_lts_state() {
+  for _l in $MARIADB_LTS_SUPPORTED; do [ "$1" = "$_l" ] && { echo supported; return; }; done
+  for _l in $MARIADB_LTS_EOL;       do [ "$1" = "$_l" ] && { echo eol;       return; }; done
+  echo rolling
+}
+
+# _db_is_lts MAJOR.MINOR — true (0) only for a SUPPORTED LTS line. EOL LTS
+# lines are deliberately NOT treated as valid upgrade targets, so version
+# discovery never offers a move onto an out-of-support branch.
 _db_is_lts() {
+  [ "$(_db_lts_state "$1")" = "supported" ]
+}
+
+# _db_next_documented_lts CURRENT — echoes the ONE documented next LTS step for
+# a recognized LTS source, or nothing. v8-1 (ChatGPT v8 finding 9): the guided
+# upgrade uses this instead of picking the numerically-oldest newer LTS, so it
+# only ever offers a transition MariaDB actually documents an upgrade guide for.
+# An unrecognized/rolling source returns nothing → the guided path refuses to
+# infer a jump. Keep in step with MARIADB_LTS_SUPPORTED and MariaDB's upgrade
+# docs (10.6→10.11→11.4→11.8→12.3).
+_db_next_documented_lts() {
   case "$1" in
-    10.6|10.11|11.4|11.8) return 0 ;;
+    10.6)  echo "10.11" ;;
+    10.11) echo "11.4"  ;;
+    11.4)  echo "11.8"  ;;
+    11.8)  echo "12.3"  ;;
+    *)     : ;;
   esac
-  _lts_maj="${1%%.*}"; _lts_min="${1#*.}"
-  if [ "$_lts_min" = "3" ]; then
-    [ "$_lts_maj" -ge 12 ] 2>/dev/null && return 0
-  fi
-  return 1
 }
 
 # _db_newer_lts_list CURRENT — echo every LTS MAJOR.MINOR line available in
@@ -6341,9 +6419,18 @@ do_versions() {
 
   # ── MariaDB (LTS-aware) ──
   _cur_db="${DB_TAG:-$PINNED_DB_VER}"
-  if _db_is_lts "$_cur_db"; then _db_note="(LTS)"; else _db_note="(NOT an LTS line)"; fi
+  case "$(_db_lts_state "$_cur_db")" in
+    supported) _db_note="(LTS, supported)" ;;
+    eol)       _db_note="(LTS, END OF LIFE)" ;;
+    *)         _db_note="(NOT an LTS line — rolling / short-support)" ;;
+  esac
   echo "  MariaDB     (LTS-aware — rolling releases are intentionally excluded)"
   echo "    pinned : ${_cur_db}  ${_db_note}"
+  if [ "$(_db_lts_state "$_cur_db")" = "eol" ]; then
+    echo "    ⚠ EOL  : MariaDB ${_cur_db} has reached community end-of-life and no"
+    echo "             longer receives security fixes. Moving to a supported LTS line"
+    echo "             below should be treated as urgent, not optional."
+  fi
   _newer_lts=$(_db_newer_lts_list "$_cur_db")
   if [ -z "$_newer_lts" ]; then
     echo "    latest : you are on the newest recognized LTS line"
@@ -6400,6 +6487,10 @@ do_upgrade() {
   echo "  Querying Docker Hub for newer releases…"
   echo ""
   _upg_any=0
+  _upg_rc=0
+  _sum_wp="no newer release found"
+  _sum_db="no newer release found"
+  _sum_cs="no newer release found"
 
   # WordPress
   _cur_wp="${WP_TAG:-$PINNED_WP_VER}"; _wp_ver="${_cur_wp%%-*}"; _wp_variant="${_cur_wp#*-}"
@@ -6408,28 +6499,53 @@ do_upgrade() {
     _upg_any=1
     echo "  WordPress: ${_wp_ver} -> ${_newest_wp}   (${_wp_variant})"
     if ask_yn "  Upgrade WordPress to ${_newest_wp}?"; then
-      do_wp_update "${_newest_wp}-${_wp_variant}" \
-        || echo "  ⚠  WordPress upgrade did not complete — production left on ${_wp_ver} (see above)."
+      if do_wp_update "${_newest_wp}-${_wp_variant}"; then
+        _sum_wp="upgraded ${_wp_ver} -> ${_newest_wp}"
+      else
+        _sum_wp="FAILED — left on ${_wp_ver} (see above)"
+        _upg_rc=1
+        echo "  ⚠  WordPress upgrade did not complete — production left on ${_wp_ver} (see above)."
+      fi
     else
+      _sum_wp="skipped (${_newest_wp} was available)"
       echo "  Skipped WordPress."
     fi
     echo ""
   fi
 
-  # MariaDB — offer the NEXT LTS line only
+  # MariaDB — offer the DOCUMENTED next LTS step only (never an inferred jump)
   _cur_db="${DB_TAG:-$PINNED_DB_VER}"
-  _next_lts=$(_db_newer_lts_list "$_cur_db" | head -1)
+  _next_lts=$(_db_next_documented_lts "$_cur_db")
+  _newer_any=$(_db_newer_lts_list "$_cur_db" | head -1)
+  if [ -z "$_next_lts" ] && [ -n "$_newer_any" ]; then
+    # Newer supported LTS lines exist, but the current line has no documented
+    # single-step path (e.g. a rolling/short-support source). Refuse to infer.
+    _upg_any=1
+    _sum_db="not offered — no documented single-step path from ${_cur_db}"
+    echo "  MariaDB: ${_cur_db} is not a recognized LTS line with a documented"
+    echo "           single-step upgrade path, so the guided upgrade will not infer"
+    echo "           one. Newer supported LTS lines exist — review 'update.sh versions',"
+    echo "           then move deliberately after checking MariaDB's upgrade guide:"
+    echo "               update.sh db <supported-LTS-line>"
+    echo ""
+  fi
   if [ -n "$_next_lts" ]; then
     _upg_any=1
-    echo "  MariaDB: ${_cur_db} -> ${_next_lts}   (next LTS line)"
+    echo "  MariaDB: ${_cur_db} -> ${_next_lts}   (documented next LTS step)"
     echo "    A MariaDB version bump changes the on-disk format. The update path"
     echo "    snapshots the data directory and runs mariadb-upgrade, rolling back"
     echo "    if WordPress can't use the new database — but for a major jump, take"
     echo "    a manual backup first (update.sh has just verified backups exist)."
     if ask_yn "  Upgrade MariaDB to ${_next_lts} (LTS)?"; then
-      do_db_update "${_next_lts}" \
-        || echo "  ⚠  MariaDB upgrade did not complete — rolled back to ${_cur_db} (see above)."
+      if do_db_update "${_next_lts}"; then
+        _sum_db="upgraded ${_cur_db} -> ${_next_lts}"
+      else
+        _sum_db="FAILED — rolled back to ${_cur_db} (see above)"
+        _upg_rc=1
+        echo "  ⚠  MariaDB upgrade did not complete — rolled back to ${_cur_db} (see above)."
+      fi
     else
+      _sum_db="skipped (${_next_lts} was available)"
       echo "  Skipped MariaDB."
     fi
     echo ""
@@ -6442,9 +6558,15 @@ do_upgrade() {
     _upg_any=1
     echo "  CrowdSec: v${_cs_ver} -> v${_newest_cs}"
     if ask_yn "  Upgrade CrowdSec to v${_newest_cs}?"; then
-      do_cs_update "v${_newest_cs}" \
-        || echo "  ⚠  CrowdSec upgrade did not complete (see above)."
+      if do_cs_update "v${_newest_cs}"; then
+        _sum_cs="upgraded v${_cs_ver} -> v${_newest_cs}"
+      else
+        _sum_cs="FAILED (see above)"
+        _upg_rc=1
+        echo "  ⚠  CrowdSec upgrade did not complete (see above)."
+      fi
     else
+      _sum_cs="skipped (v${_newest_cs} was available)"
       echo "  Skipped CrowdSec."
     fi
     echo ""
@@ -6453,7 +6575,25 @@ do_upgrade() {
   if [ "$_upg_any" = "0" ]; then
     echo "  Everything is already on the newest recognized release. Nothing to do."
     echo "  (Run 'update.sh digest-check' to catch same-version security rebuilds.)"
+    return 0
   fi
+
+  # v8-1 fix (ChatGPT v8 finding 10): aggregate per-component results and return
+  # non-zero if ANY accepted upgrade failed. Previously each failure was
+  # swallowed by '|| echo' and do_upgrade fell through returning the last
+  # command's status (usually 0), so cron or a monitoring wrapper could record
+  # a guided upgrade as fully successful when a component had actually failed
+  # and rolled back — the same defect already fixed for 'all' and 'digest-check'.
+  echo "── Upgrade summary ──"
+  echo "  WordPress : ${_sum_wp}"
+  echo "  MariaDB   : ${_sum_db}"
+  echo "  CrowdSec  : ${_sum_cs}"
+  if [ "$_upg_rc" -ne 0 ]; then
+    echo "  Overall   : FAILED — one or more accepted upgrades did not complete." >&2
+  else
+    echo "  Overall   : OK"
+  fi
+  return "$_upg_rc"
 }
 
 # ── Update lock — prevents concurrent update.sh invocations from stepping
@@ -6744,7 +6884,13 @@ BACKUP_DIR="/root/wp-db-backups"
 # on the same day as the scheduled one no longer overwrites it.
 STAMP=$(date -u +%Y%m%d-%H%M%S)
 BACKUP_FILE="${BACKUP_DIR}/wp-db-${STAMP}.sql.gz"
-BACKUP_RAW="${BACKUP_FILE%.gz}"
+# v8-1 (ChatGPT v8 finding 19): stage the dump and the compressed archive to
+# HIDDEN temp files in the same directory, then publish the verified archive
+# with a single atomic rename. A crash mid-dump or mid-gzip can then never leave
+# a truncated wp-db-*.sql.gz that looks complete to an operator, the rotation
+# below, or an external backup sync arriving before the next run.
+BACKUP_RAW="${BACKUP_DIR}/.wp-db-${STAMP}.sql.part"
+BACKUP_GZ_TMP="${BACKUP_DIR}/.wp-db-${STAMP}.sql.gz.part"
 
 install -d -m 0700 "${BACKUP_DIR}"
 BACKUP_OK=0
@@ -6757,17 +6903,22 @@ BACKUP_OK=0
 # them. --single-transaction gives a consistent snapshot without locking
 # the whole database for the duration of the dump.
 if (umask 077; podman exec mariadb sh -c \
-     'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+     'exec mariadb-dump --all-databases --routines --events --triggers --single-transaction --quick --hex-blob -uroot -p"$MARIADB_ROOT_PASSWORD"' \
      > "${BACKUP_RAW}" 2> "${BACKUP_RAW}.err"); then
   # Step 2: confirm mariadb-dump actually finished (non-empty + trailing marker).
   # An interrupted dump can still exit 0 in some connection-drop scenarios.
   if [ -s "${BACKUP_RAW}" ] && tail -c 200 "${BACKUP_RAW}" | grep -q "Dump completed"; then
-    # Step 3: compress and integrity-check the archive itself.
-    if gzip -f "${BACKUP_RAW}" && gzip -t "${BACKUP_FILE}" 2>/dev/null; then
-      chmod 600 "${BACKUP_FILE}" 2>/dev/null || true
-      BACKUP_OK=1
+    # Step 3: compress to a temp file, integrity-check it, set perms, then
+    # atomically rename it into place as the final archive (see note above).
+    if gzip -c "${BACKUP_RAW}" > "${BACKUP_GZ_TMP}" && gzip -t "${BACKUP_GZ_TMP}" 2>/dev/null; then
+      chmod 600 "${BACKUP_GZ_TMP}" 2>/dev/null || true
+      if mv -f "${BACKUP_GZ_TMP}" "${BACKUP_FILE}"; then
+        BACKUP_OK=1
+      else
+        logger -t wp-db-backup "FAILED — could not publish ${BACKUP_FILE}"
+      fi
     else
-      logger -t wp-db-backup "FAILED — gzip compress/verify of ${BACKUP_FILE}"
+      logger -t wp-db-backup "FAILED — gzip compress/verify of the staged archive"
     fi
   else
     logger -t wp-db-backup "FAILED — dump looks incomplete (empty or missing completion marker)"
@@ -6782,12 +6933,12 @@ if [ "${BACKUP_OK}" != "1" ]; then
   # anything (a monitoring script, an operator, or the rotation below).
   [ -s "${BACKUP_RAW}.err" ] && \
     logger -t wp-db-backup "stderr: $(head -c 500 "${BACKUP_RAW}.err")"
-  rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" "${BACKUP_FILE}" 2>/dev/null || true
+  rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" "${BACKUP_GZ_TMP}" "${BACKUP_FILE}" 2>/dev/null || true
   # DELIBERATE: no rotation on failure. Yesterday's good backup stays.
   exit 1
 fi
 
-rm -f "${BACKUP_RAW}.err" 2>/dev/null || true
+rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" 2>/dev/null || true
 logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
 
 # Step 4: rotate ONLY after a new backup passed all three verification
@@ -7329,10 +7480,38 @@ info() {
 
 # ── shared probes ──────────────────────────────────────────────────────────
 
-# _http_code <url> — this server's own status, no redirect following
+# _http_code <url> — this server's own status, no redirect following.
+# v8-1 fix (ChatGPT v8 finding 16): BusyBox wget on Alpine does NOT accept the
+# GNU --max-redirect/--tries/--timeout options, so the old probe errored out
+# and returned an empty code here — producing false "no response"/"blocked"
+# results even while wp-health-check.sh passed. This now uses the identical
+# PHP-from-container method as the health checker and the post-install
+# validator: follow_location=0 pins the result to the server's OWN first
+# response and ignore_errors=true lets 3xx/4xx come back as a status line
+# instead of throwing. $1 is a full 127.0.0.1 URL; we probe its path against
+# the container's own :80. The source address is the container loopback, which
+# — like the old host-published probe — is not in ADMIN_CIDR, so the login
+# paths still return 403 and the section's "cannot verify from this host"
+# warning fires exactly as before.
 _http_code() {
-  wget -S -O /dev/null --max-redirect=0 --tries=1 --timeout=8 "$1" 2>&1 \
-    | awk '/^[[:space:]]*HTTP\// {print $2}' | head -1
+  _u_path="${1#http://127.0.0.1}"
+  case "$_u_path" in ""|http*|"$1") _u_path="/" ;; esac
+  podman exec --user www-data wordpress php -r '
+    error_reporting(0);
+    $ctx = stream_context_create(["http" => [
+      "method"         => "GET",
+      "timeout"        => 8,
+      "follow_location"=> 0,
+      "ignore_errors"  => true,
+    ]]);
+    @file_get_contents("http://127.0.0.1:80'"${_u_path}"'", false, $ctx);
+    $code = "none";
+    if (isset($http_response_header[0]) &&
+        preg_match("#HTTP/[0-9.]+ ([0-9]{3})#", $http_response_header[0], $m)) {
+      $code = $m[1];
+    }
+    echo $code;
+  ' 2>/dev/null
 }
 
 _running() {
