@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+name="crowdsec-container"
+description="CrowdSec engine (Podman)"
+depend() {
+  need net wp-container
+  after sysfs wp-container
+}
+start() {
+  ebegin "Starting CrowdSec"
+  export PODMAN_IGNORE_CGROUPSV1_WARNING=1
+  if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" != "cgroup2fs" ] \
+     && [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" != "UNKNOWN" ]; then
+    mountpoint -q /sys/fs/cgroup 2>/dev/null && umount /sys/fs/cgroup 2>/dev/null
+    mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+  fi
+  mount --make-shared / 2>/dev/null || true
+  # BUG FIX (v7-5d): cs-firewall-bouncer is a SEPARATE OpenRC service that
+  # starts independently and can lose a race against CrowdSec's LAPI still
+  # coming up — confirmed in the field to recur on every reboot, not just
+  # the first install (an earlier fix only lived in the one-shot installer
+  # script, so it never helped subsequent boots). Waiting here for LAPI to
+  # actually respond, then restarting the bouncer, runs on EVERY boot that
+  # brings this service up, not just the first one.
+  podman container exists crowdsec 2>/dev/null && podman start crowdsec >/dev/null 2>&1
+  CS_START_STATUS=$?
+  if [ "$CS_START_STATUS" = "0" ]; then
+    for _i in 1 2 3 4 5 6; do
+      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && break
+      sleep 5
+    done
+    rc-service cs-firewall-bouncer restart >/dev/null 2>&1 || true
+  fi
+  eend "$CS_START_STATUS"
+}
+stop() {
+  ebegin "Stopping CrowdSec"
+  podman stop crowdsec >/dev/null 2>&1
+  eend $?
+}
