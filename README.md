@@ -1,6 +1,6 @@
 # WordPress VM Provisioner for Proxmox VE
 
-A single Bash script (`wpinstall.sh`) that creates a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, verified automated backups, and a full day-2 update/rollback/self-diagnosis toolchain baked in.
+A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, verified automated backups, and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 
 No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer around 16 interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and verified nightly backups.
 
@@ -10,17 +10,18 @@ No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmo
 | **Guest OS** | Alpine Linux — auto-detects the newest available release (3.24 → 3.21), BIOS cloud image |
 | **Container runtime** | Podman, **rootful only** |
 | **Stack** | WordPress `6.9.4-php8.3-apache` · MariaDB `11.4` · CrowdSec `v1.7.8` |
-| **Default sizing** | 2 vCPU · 4096 MB RAM · 20G disk (edit `CORES`/`RAM`/`DISK` at the top of the script to change) |
+| **Default sizing** | 2 vCPU · 4096 MB RAM · 20G disk (edit `CORES`/`RAM`/`DISK` in `lib/00-preflight.sh` to change) |
 | **Networking** | Two segmented Podman networks — `wp-front` (egress + published port) and `wp-db` (`--internal`, no egress) |
 | **Deployment profile** | `standard` (warn, don't abort, on a failed verification) or `production` (abort) — chosen at install time |
 | **Setup time** | ~15 minutes, mostly unattended after the prompts |
-| **CLI flags** | None — the script itself is fully interactive (the management scripts it installs are not — see [Day-2 Operations](#day-2-operations)) |
+| **CLI flags** | None — `install.sh` itself is fully interactive (the management scripts it installs are not — see [Day-2 Operations](#day-2-operations)) |
 
 ---
 
 ## Table of Contents
 
 - [What This Is](#what-this-is)
+- [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
 - [Features](#features)
 - [Requirements](#requirements)
@@ -45,9 +46,9 @@ No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmo
 
 ## What This Is
 
-Run the script on a Proxmox VE host as root. It will:
+Run `install.sh` on a Proxmox VE host as root. It will:
 
-1. **Ask you a series of prompts** — VM sizing lives at the top of the script as variables (not a prompt); networking, SSH access, firewall CIDRs (format-validated, re-prompting on a bad value), a custom `wp-admin` URL, CrowdSec enrolment, GeoIP filtering, image-digest pinning, and a deployment profile are all configured interactively.
+1. **Ask you a series of prompts** — VM sizing lives in `lib/00-preflight.sh` as variables (not a prompt); networking, SSH access, firewall CIDRs (format-validated, re-prompting on a bad value), a custom `wp-admin` URL, CrowdSec enrolment, GeoIP filtering, image-digest pinning, and a deployment profile are all configured interactively.
 2. **Download and verify** the newest Alpine Linux cloud image directly from Alpine's CDN, checked against a freshly fetched SHA-512 sidecar.
 3. **Inject a two-stage installer** straight into the disk image via `qemu-nbd` — no cloud-init involved (cloud-init is explicitly disabled on first boot).
 4. **Create and start the VM** in Proxmox, then wait for it to come up and report its IP.
@@ -56,6 +57,50 @@ Run the script on a Proxmox VE host as root. It will:
    - *Stage 2* — install Podman, create the two segmented container networks, stand up MariaDB → WordPress → CrowdSec, generate a syntax-checked nftables ruleset, configure hourly log rotation, install Trivy and Lynis, write out the `update.sh` / `wp-hardening.sh` / `validate-wordpress.sh` / `wp-db-backup.sh` management scripts, and run a full post-install validation suite.
 
 Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real time via `qm terminal <VMID>`.
+
+---
+
+## Repository Structure
+
+`install.sh` is a thin entry point. It sources `lib/*.sh` in numbered order to
+build and inject the VM, and copies `payload/` onto the VM disk for the
+in-VM installer to use on first boot. Nothing here is meant to be run out
+of order or in isolation — each numbered file depends on variables and
+functions earlier files set up, same as it would in one unsplit script.
+
+```
+.
+├── install.sh                 # entry point — run this
+├── lib/                       # host-side (runs on the Proxmox host), sourced in order
+│   ├── 00-preflight.sh          # colors/logging, VMID lookup, Alpine image detection, cleanup trap
+│   ├── 01-interactive-setup.sh  # every prompt (networking, SSH, firewall, GeoIP, ...)
+│   ├── 02-image-and-disk.sh     # Alpine download + SHA-512 verify + working-copy resize
+│   ├── 03-dynamic-configs.sh    # builds nftables/Apache config blocks that need your answers baked in
+│   ├── 04-nbd-mount-and-chroot.sh    # mounts the disk image, creates the admin account
+│   ├── 05-ssh-and-network-inject.sh  # SSH hardening, credentials, nftables.nft, network config
+│   ├── 06-vars-and-payload-inject.sh # vars.sh, stages payload/ onto the disk, first-boot launcher
+│   └── 07-vm-create-and-start.sh     # qm create/importdisk/start, waits for an IP, prints the summary
+├── payload/                    # copied onto the VM disk; the in-VM installer reads from here
+│   ├── install-wordpress.sh     # in-VM installer entry point (Stage 2 dispatcher)
+│   ├── stages/                  # install-wordpress.sh's own numbered stages (01-10)
+│   ├── bin/                     # update.sh, validate-wordpress.sh, wp-hardening.sh, and the rest
+│   │                             #   of the day-2 tooling — see Day-2 Operations below
+│   ├── templates/                # the 2 files needing install-time values, as __TOKEN__ templates
+│   ├── init.d/, cron/, apache-conf/, php-conf/, mariadb-conf/,
+│   │   apache-mods/, mu-plugins/, crowdsec/, etc/    # static config files, copied verbatim
+├── test/
+│   ├── test-wordpress-vm.sh     # integration test harness (see test/README.md)
+│   └── README.md
+├── CHANGELOG.md                # what changed and why, including this restructuring
+├── TODO.md                     # currently open items and why they're deferred
+└── README.md                   # this file
+```
+
+None of this changes what ends up on the VM — every path in
+[File and Directory Reference](#file-and-directory-reference) below, every
+prompt, and every default is identical to before the split. See
+`CHANGELOG.md` if you want the mechanical details of how the split was
+done and verified.
 
 ---
 
@@ -93,6 +138,8 @@ flowchart TB
 The key design decision is the **network split**. Earlier versions put WordPress and MariaDB on one flat network with a route to the internet — "no host port" kept MariaDB safe from *inbound* scans, but a compromised WordPress container still had a clear L2 path to the database subnet, which itself could still reach out. `wp-db` is created with `--internal`, so Podman/netavark never configures a route out of it at all, regardless of nftables state — MariaDB (and WordPress's second leg) has no egress, full stop. `mariadb` is also given an explicit `--network-alias` on `wp-db`, so DNS resolution of the hostname `mariadb` doesn't depend on it happening to be the container's `--name`.
 
 One consequence of running container-to-container DNS over a bridge gateway is worth calling out explicitly, because it caused a real install failure in the field: Podman's DNS resolver (aardvark-dns) runs *on the host*, bound to each network's gateway IP. A container's DNS query is therefore a packet hitting the host's own input chain, not the forward chain — so the host firewall has to explicitly permit it, or WordPress can never resolve `mariadb` even though MariaDB itself is perfectly healthy. The generated nftables ruleset now carries that accept rule (and the equivalent for DHCP) for both subnets, and it's syntax-checked with `nft -c` before it's ever loaded, so a malformed rule can't half-load and leave the firewall broken.
+
+The other standing design decision is **rootful, not rootless, Podman** (see [Known Limitations](#known-limitations) for why rootless was removed). Every container still gets `--cap-drop ALL` plus only what it specifically needs: MariaDB adds back 5 capabilities and is isolated to `wp-db` (`--internal`, no host port, no egress); WordPress adds back 6, including `NET_BIND_SERVICE` — needed because Apache binds port 80 inside the container's own network namespace even with `-p 80:80` (Podman's host-side port publish and Apache's in-netns bind are separate things); CrowdSec runs `--network host` with minimal capabilities and `--read-only`, because it needs the host network namespace to see syslog and write nftables rules directly.
 
 ---
 
@@ -150,6 +197,7 @@ One consequence of running container-to-container DNS over a bridge gateway is w
 ## Requirements
 
 - A Proxmox VE host you can reach as **root** (SSH, or the Proxmox web shell / `qm terminal`).
+- `git`, to clone this repository.
 - `qm`, `pvesm`, `pvesh` — ship with Proxmox VE.
 - `qemu-nbd`, `qemu-img` — `apt install qemu-utils` if missing.
 - `openssl`, `curl`.
@@ -163,15 +211,21 @@ One consequence of running container-to-container DNS over a bridge gateway is w
 
 ## Quick Start
 
-Paste this into a root shell on your Proxmox host — either the web UI (select your node → **Shell**) or SSH:
+On your Proxmox host, as root — either the web UI (select your node → **Shell**) or SSH:
 
 ```bash
-curl -fsSL -O https://raw.githubusercontent.com/RothITguy-jitsi/alpine-vm-wordpress/refs/heads/main/wpinstall.sh
-chmod +x wpinstall.sh
-./wpinstall.sh
+git clone https://github.com/RothITguy-jitsi/alpine-vm-wordpress.git
+cd alpine-vm-wordpress
+./install.sh
 ```
 
-There are no command-line flags — everything is prompted for interactively, with sensible defaults shown in brackets that you can accept by pressing Enter. Resource sizing (2 vCPU / 4096 MB / 20G by default) is set at the top of the script in `CORES`, `RAM`, and `DISK` if you want different defaults before running it.
+`install.sh` needs its sibling `lib/` and `payload/` directories, so run it
+from a full clone (not a single downloaded file). There are no command-line
+flags — everything is prompted for interactively, with sensible defaults
+shown in brackets that you can accept by pressing Enter. Resource sizing (2
+vCPU / 4096 MB / 20G by default) is set in `lib/00-preflight.sh` in
+`CORES`, `RAM`, and `DISK` if you want different defaults before running
+it.
 
 ---
 
@@ -424,7 +478,7 @@ No — the script builds the VM from a freshly downloaded Alpine cloud image and
 
 ## Known Limitations
 
-This script has been through several rounds of independent security review and real-world field fixes. In the interest of setting accurate expectations before you point it at a client's production site, here's an honest breakdown of what's already solid, what's a deliberate tradeoff rather than an oversight, and what genuinely isn't addressed yet.
+This project has been through several rounds of independent security review and real-world field fixes. In the interest of setting accurate expectations before you point it at a client's production site, here's an honest breakdown of what's already solid, what's a deliberate tradeoff rather than an oversight, and what genuinely isn't addressed yet. **`TODO.md`** tracks the currently-open items in more detail, including why each is deferred rather than dropped.
 
 **Already addressed**
 - WordPress updates use a candidate/cutover pattern — a freshly pulled image is booted read-only against production's real data and database on a loopback-only port and health-checked *before* production is touched, closing what used to be a guaranteed port-80 collision on every `update.sh wp`.
@@ -456,10 +510,14 @@ This script has been through several rounds of independent security review and r
 
 ## Changelog Highlights
 
-Full line-by-line notes for every fix live in the script's own header comments (`v2` through `v7-1` were pruned from the header after they'd been stable for a long time — this table is a summary, not a substitute for reading them if you're deciding whether to trust this on a production box).
+Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script's own header comment block; it's a real file now, same content). This table is a summary, not a substitute for reading it if you're deciding whether to trust this on a production box.
 
 | Version(s) | Theme |
 |---|---|
+| Unreleased | Repository restructuring: the single 8,694-line script became `install.sh` + `lib/` + `payload/` (see [Repository Structure](#repository-structure)); every heredoc that generated an executable script is now a real file; `scan-heredocs.py` retired (see below) |
+| v8-1 | Static-review fixes: `validate-wordpress.sh`'s BusyBox-incompatible wget options, `update.sh upgrade`'s swallowed exit status, MariaDB LTS/EOL allowlists, and atomic backup publication |
+| v8 | Version discovery (`update.sh versions`), a guided cross-component `update.sh upgrade`, MariaDB LTS-awareness, and the `production` fail-closed nftables dependency |
+| v7-16 | Post-install field-bug sweep after the v7-15 fixes reached real hardware |
 | v7-15 | Fixed a real-world install failure where WordPress could never resolve `mariadb` (the host firewall silently dropped container DNS at the input chain); log rotation moved to hourly so the size cap is real; verified backups now include routines/events/triggers; the nftables ruleset is syntax-checked before load; CIDR/IP prompts validated at input time |
 | v7-14 | Custom `/wp-admin` slug made functionally real (it was previously cosmetic and could even lock you out); unbounded log growth fixed with logrotate + container log caps; `validate-wordpress.sh` rewritten with copy-paste remediation and `--section` scoping; WordPress HTTP health check hardened against offsite redirects and hangs |
 | v7-13 | Response to an independent security audit: per-component update reporting instead of stopping at the first failure; verified daily backups (`wp-db-backup.sh`); Trivy supply-chain hardening (commit-pinned installer, real scan-failure-vs-finding distinction); read-only candidate mounts; the `standard`/`production` deployment profile toggle introduced |
@@ -468,6 +526,8 @@ Full line-by-line notes for every fix live in the script's own header comments (
 | v7-9 – v7-10 | MariaDB update path hardened end-to-end: verified backups, filesystem-level data snapshots, `mariadb-upgrade` exit status checked, WordPress re-verified against the new database before the rollback path is discarded |
 | v7-6 – v7-8 | Network segmentation introduced (`wp-front` / `wp-db`, the latter `--internal`); rootless Podman support removed in favor of a single, better-tested rootful path; dedicated non-root SSH admin account; SHA256 digest pinning via Skopeo; WordPress candidate/cutover update pattern |
 | v7-3 – v7-5 | Custom `wp-admin` slug and GeoIP country filtering introduced; Alpine SHA-512 image verification added; CrowdSec bumped for a WAF-bypass CVE |
+
+**A note on `scan-heredocs.py`:** earlier revisions shipped this as a companion static check. It caught one specific bug shape — a heredoc meant to write a literal, executable script file left with an unquoted delimiter, so its `$(...)`/backticks fired immediately instead of staying literal for the script to run later. That shape needs a heredoc whose body becomes an executable script; after this restructuring, no such heredoc exists anywhere in the repository (every one of those bodies is a real file under `payload/` now), so the tool was retired rather than kept as a check that can only ever pass. See `CHANGELOG.md` and `test/README.md` for the full reasoning.
 
 ---
 
@@ -485,6 +545,6 @@ Full line-by-line notes for every fix live in the script's own header comments (
 
 ## License
 
-[MIT](LICENSE) — Copyright © 2026 RothITguy.
+[MIT](LICENSE) — Copyright © 2026 RothITguy-jitsi.
 
 ---
