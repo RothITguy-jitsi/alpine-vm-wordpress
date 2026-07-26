@@ -1,0 +1,42 @@
+# WordPress VM log rotation — installed by create-wordpress-vm.sh
+# copytruncate is mandatory: Apache runs in a container holding an open fd
+# on these bind-mounted files. See the note in the provisioning script.
+# NOTE: no `create` directive — with copytruncate the original file stays
+# in place (it's truncated, not moved), so create has no effect and mixing
+# the two is fragile across logrotate versions. su sets the rotation user.
+
+/home/wpuser/wp/logs/*.log {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+/var/log/crowdsec/*.log {
+    daily
+    rotate 7
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+/var/log/wp-*.log {
+    weekly
+    rotate 8
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
