@@ -56,12 +56,6 @@ cleanup() {
   if (( _DESTROY_VM )) && [[ -n "$VMID" ]] && qm status "$VMID" &>/dev/null 2>&1; then
     qm stop "$VMID" --skiplock 2>/dev/null; qm destroy "$VMID" --purge 2>/dev/null
   fi
-  # Self-bootstrap cleanup (install.sh, run standalone): remove the
-  # temp-extracted repo copy on every exit path, success or failure alike
-  # -- nothing from a curl-one-liner run is meant to persist on the host.
-  # Never touches a real git clone: _WPVM_BOOTSTRAP_DIR is only ever set
-  # when install.sh had to fetch the repo itself in the first place.
-  [[ -n "${_WPVM_BOOTSTRAP_DIR:-}" ]] && rm -rf "$_WPVM_BOOTSTRAP_DIR"
 }
 trap cleanup EXIT
 
@@ -72,3 +66,4 @@ command -v qm        &>/dev/null || msg_error "'qm' not found."
 command -v qemu-nbd  &>/dev/null || msg_error "'qemu-nbd' not found — apt install qemu-utils"
 command -v qemu-img  &>/dev/null || msg_error "'qemu-img' not found — apt install qemu-utils"
 command -v openssl   &>/dev/null || msg_error "'openssl' not found."
+
