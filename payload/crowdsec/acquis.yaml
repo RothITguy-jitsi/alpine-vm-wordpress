@@ -1,0 +1,9 @@
+filenames:
+  - /var/log/wordpress/access.log
+labels:
+  type: apache2
+---
+filenames:
+  - /var/log/host/messages
+labels:
+  type: syslog
