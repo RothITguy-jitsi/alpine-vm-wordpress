@@ -6,6 +6,105 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Forensic audit fixes + curl-based single-command install
+
+An independent security evaluation was run against the just-restructured
+repository. Every claim in it was checked directly against the code before
+acting on it — four of its Critical/High findings turned out to be
+re-discoveries of items this project already had tracked in `TODO.md` as
+deliberately deferred (candidate DB isolation, off-VM backup gate, Trivy
+findings override, Trivy installer checksum); those are noted as
+corroborated, not re-explained here. What follows is what was actually new
+and has been fixed, plus one bug found independently of either audit. Full
+detail, including what's still open and why, is in `TODO.md`'s
+"Independent re-audit" section.
+
+**Fixed:**
+
+- **Root SSH login no longer re-enables itself.** It used to fall back to
+  enabling root over SSH if creating the dedicated admin account failed.
+  Console access (`qm terminal <vmid>`) already covers that recovery case
+  — the root password is set unconditionally specifically for it — so the
+  fallback was trading a working recovery path for a worse one it didn't
+  need. Root SSH now stays disabled unconditionally, in
+  `lib/04-nbd-mount-and-chroot.sh` and `lib/05-ssh-and-network-inject.sh`.
+- **The CrowdSec firewall bouncer failing no longer passes silently in
+  production mode.** CrowdSec's engine only *detects* and decides bans;
+  the bouncer is what *enforces* them via nftables. A bouncer that never
+  starts used to just print a warning and continue — meaning a "clean"
+  install could have detection with no enforcement behind it, in every
+  deployment profile. `DEPLOYMENT_PROFILE=production` now fails closed
+  here, matching the pattern already used for Alpine image verification
+  and digest pinning elsewhere in this same install.
+  (`payload/stages/09-crowdsec-and-backup.sh`)
+- **The `uploads-php` debug escape hatch now expires automatically.**
+  Temporarily allowing PHP execution in `wp-content/uploads` (via
+  `wp-hardening.sh enable uploads-php`) had no time limit — exactly the
+  kind of thing that gets left open and forgotten, in exactly the
+  directory an attacker who can upload a file would want PHP to run in.
+  It now writes a timestamp marker on open, and a new cron entry
+  (`wp-hardening.sh check-expiry`, every 15 min) auto re-blocks it after
+  one hour if it hasn't been closed manually.
+- **CrowdSec's IPv6 setting was internally contradictory** —
+  `disable_ipv6: false` alongside `nftables.ipv6.enabled: false`. This
+  deployment's firewall has no IPv6 rules at all; the bouncer config now
+  says `disable_ipv6: true` to match, instead of implying IPv6 decisions
+  were being enforced when they never were.
+- **CSP's `unsafe-eval` no longer applies site-wide.** It's genuinely
+  needed for the WordPress block editor in `/wp-admin/`, not for most
+  themes' public-facing pages. Scoped to a `<LocationMatch>` for
+  `/wp-admin/` and `/wp-login.php` (this also correctly covers requests
+  arriving through the custom admin slug, which are internally rewritten
+  to those real paths before Apache serves them); the site-wide default
+  keeps `unsafe-inline` (far more commonly needed) but drops `unsafe-eval`.
+- **The integration test harness's SSH host-key trust was pure
+  network-path TOFU.** `ssh-keyscan` + `accept-new` can't detect a MITM on
+  the *first* connection, only a *later* key change — and the harness's
+  own prior comment already named the right fix without building it.
+  It now cross-checks the network-observed key fingerprint against one
+  fetched via the Proxmox guest agent (a genuinely separate channel from
+  the network path SSH uses), falling back to the original TOFU behavior
+  with a loud warning if the agent doesn't answer.
+- **`README.md` linked to a `LICENSE` file that didn't exist.** Added
+  (MIT, matching what was already claimed).
+- **A real bug, found independently of either audit:** `install-wordpress.sh`'s
+  `DEPLOYMENT_PROFILE=production` digest-pinning fail-closed path called
+  `msg_error`, a host-side-only function that was never in scope inside
+  the VM's own install process. Checked empirically — `set -e` still
+  caught the resulting "command not found" and aborted the install, so
+  this was never a silent bypass — but the operator got a bare error
+  instead of the detailed, actionable message the code was written to
+  show them. Added a real VM-side `err()` helper and fixed the call site.
+- Added brief rationale comments for two already-reasonable, already-safe
+  tradeoffs the audit flagged without full context: MariaDB's
+  `innodb_flush_log_at_trx_commit=2` (durability/throughput tradeoff,
+  appropriate for this project's target of a single self-hosted site) and
+  the existing PHP/logrotate settings (already documented at point of use).
+
+**New: single-command install, no `git` required.**
+`install.sh` can now be fetched and run entirely on its own:
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/RothITguy-jitsi/alpine-vm-wordpress/refs/heads/main/install.sh
+chmod +x install.sh
+./install.sh
+```
+
+Proxmox doesn't ship `git`, and the goal was to avoid installing it just to
+fetch a script. `install.sh` now detects whether it's running from a full
+checkout (sibling `lib/`/`payload/` present) or standalone, and if
+standalone, fetches the rest of the repository itself as a
+GitHub-generated tarball — a plain HTTPS download, not a `git clone` — into
+a temp directory that the existing `cleanup()` trap removes when the run
+ends, success or failure alike. A full `git clone` still works exactly as
+before and skips this step entirely, since it already has everything
+`install.sh` needs sitting right next to it. See README's
+["Verifying what you run"](README.md#verifying-what-you-run) for the trust
+model this implies (the same one every single-file `curl | bash` installer
+has) and how to pin a specific commit instead of always fetching `main`.
+
+---
+
 ## Unreleased — Repository restructuring (split from the monolithic script)
 
 This release contains **no functional or behavioral changes** to the
