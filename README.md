@@ -26,6 +26,7 @@ No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmo
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
+  - [Verifying what you run](#verifying-what-you-run)
 - [Interactive Setup Walkthrough](#interactive-setup-walkthrough)
 - [What Gets Created](#what-gets-created)
 - [Security Model](#security-model)
@@ -68,6 +69,12 @@ in-VM installer to use on first boot. Nothing here is meant to be run out
 of order or in isolation — each numbered file depends on variables and
 functions earlier files set up, same as it would in one unsplit script.
 
+Run standalone (the curl one-liner in [Quick Start](#quick-start)) with no
+`lib/`/`payload/` next to it, `install.sh` fetches them itself — a
+GitHub-generated tarball of this repo, into a temp directory removed when
+the run finishes. Run from a full clone, it finds them right next to itself
+and skips that step. Either way this is what actually gets used:
+
 ```
 .
 ├── install.sh                 # entry point — run this
@@ -93,6 +100,7 @@ functions earlier files set up, same as it would in one unsplit script.
 │   └── README.md
 ├── CHANGELOG.md                # what changed and why, including this restructuring
 ├── TODO.md                     # currently open items and why they're deferred
+├── LICENSE                     # MIT
 └── README.md                   # this file
 ```
 
@@ -211,7 +219,17 @@ The other standing design decision is **rootful, not rootless, Podman** (see [Kn
 
 ## Quick Start
 
-On your Proxmox host, as root — either the web UI (select your node → **Shell**) or SSH:
+On your Proxmox host, as root — either the web UI (select your node → **Shell**) or SSH. Proxmox doesn't ship `git`, so the default path doesn't need it:
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/RothITguy-jitsi/alpine-vm-wordpress/refs/heads/main/install.sh
+chmod +x install.sh
+./install.sh
+```
+
+`install.sh` notices it's on its own (no sibling `lib/`/`payload/`) and fetches the rest of the repository itself — a GitHub-generated tarball, not a `git clone`, so no `git` install is required on the host. That copy lives in a temp directory for the life of the install and is removed automatically when it finishes, same as every other temp file this creates. See [Verifying what you run](#verifying-what-you-run) below for the trust model and how to pin a specific commit instead of always fetching the latest `main`.
+
+If you already have `git`, or want the full commit history for your own review, cloning works exactly the same way and skips the self-fetch entirely:
 
 ```bash
 git clone https://github.com/RothITguy-jitsi/alpine-vm-wordpress.git
@@ -219,13 +237,19 @@ cd alpine-vm-wordpress
 ./install.sh
 ```
 
-`install.sh` needs its sibling `lib/` and `payload/` directories, so run it
-from a full clone (not a single downloaded file). There are no command-line
-flags — everything is prompted for interactively, with sensible defaults
-shown in brackets that you can accept by pressing Enter. Resource sizing (2
-vCPU / 4096 MB / 20G by default) is set in `lib/00-preflight.sh` in
-`CORES`, `RAM`, and `DISK` if you want different defaults before running
-it.
+Either way, there are no command-line flags — everything is prompted for interactively, with sensible defaults shown in brackets that you can accept by pressing Enter. Resource sizing (2 vCPU / 4096 MB / 20G by default) is set in `lib/00-preflight.sh` in `CORES`, `RAM`, and `DISK` if you want different defaults before running it.
+
+### Verifying what you run
+
+The one-liner above downloads over HTTPS, which rules out tampering in transit, from whichever ref `install.sh` is told to fetch — `main` by default, i.e. whatever is on that branch right now. That's the right default for "always get the latest fixes," but it means a future compromise of this repo would be fetched by every install run from that point on, with nothing in the script itself to catch it — the same trust model as any other single-file `curl | bash` installer (Docker's, rustup's, Homebrew's all work the same way). No checksum published in this repo could change that, since a checksum sitting next to the code it's meant to verify only checks the repo against itself.
+
+If you want a fixed, reviewable reference instead of "whatever `main` is today," pin to a specific commit SHA from this repo's own history:
+
+```bash
+WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
+```
+
+(if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
 
 ---
 
@@ -514,6 +538,7 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| Unreleased | Forensic audit fixes (root-SSH fallback removed, CrowdSec bouncer + CSP + IPv6 config hardening, `uploads-php` auto-expiry, a VM-side error-handling bug) and a `git`-free single-command install via a self-fetching `install.sh` — see below and TODO.md |
 | Unreleased | Repository restructuring: the single 8,694-line script became `install.sh` + `lib/` + `payload/` (see [Repository Structure](#repository-structure)); every heredoc that generated an executable script is now a real file; `scan-heredocs.py` retired (see below) |
 | v8-1 | Static-review fixes: `validate-wordpress.sh`'s BusyBox-incompatible wget options, `update.sh upgrade`'s swallowed exit status, MariaDB LTS/EOL allowlists, and atomic backup publication |
 | v8 | Version discovery (`update.sh versions`), a guided cross-component `update.sh upgrade`, MariaDB LTS-awareness, and the `production` fail-closed nftables dependency |
