@@ -595,12 +595,46 @@ run_ssh_doas_check() {
       _skip "ssh doas elevation" "--ssh-key '$SSH_KEY' is not owned by $(id -un) — refusing to use it"; return
     fi
   fi
-  # v2 (ChatGPT harness finding 13): do NOT disable host-key checking. Seed a
-  # throwaway known_hosts with the VM's current key (accept-new) so a CHANGED key
-  # on a recycled IP still trips a failure within a run. Verifying this
-  # fingerprint out-of-band (Proxmox console / guest agent) would be stronger.
+  # FORENSIC FIX (new-audit Medium finding, confirmed accurate — and the
+  # comment directly above already named the right fix without building
+  # it): ssh-keyscan alone is trust-on-first-use over the same network path
+  # an attacker would need to control to matter, so accept-new on its
+  # output can't detect a MITM'd *first* connection, only a *later* key
+  # change. Guest-exec goes over QEMU's own guest-agent channel, not the
+  # network path SSH uses, so cross-checking against it closes that gap:
+  # an attacker able to intercept the TCP path to $SSH_HOST does not
+  # thereby gain the guest-agent channel too. If the agent doesn't answer
+  # (checked elsewhere as its own prerequisite), this falls back to the
+  # original accept-new behavior with a loud warning rather than blocking
+  # the whole check on a channel this harness already treats as optional
+  # in other sections.
   local kh; kh=$(mktemp)
   ssh-keyscan -T 10 "$SSH_HOST" >"$kh" 2>/dev/null || true
+  if [ -s "$kh" ] && agent_up; then
+    local scanned_fps guest_fps match=0
+    scanned_fps=$(ssh-keygen -lf "$kh" 2>/dev/null | awk '{print $2}')
+    vm_exec 'for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f" 2>/dev/null; done'
+    guest_fps=$(printf '%s' "$VM_OUT" | awk '{print $2}')
+    if [ -n "$scanned_fps" ] && [ -n "$guest_fps" ]; then
+      while IFS= read -r sfp; do
+        [ -n "$sfp" ] || continue
+        printf '%s\n' "$guest_fps" | grep -qxF "$sfp" && { match=1; break; }
+      done <<EOF
+$scanned_fps
+EOF
+      if [ "$match" = "1" ]; then
+        ok "SSH host key matches the guest-agent-reported fingerprint (not just network TOFU)"
+      else
+        warn "SSH host key seen over the network does NOT match any host key reported via the guest agent — possible MITM on the network path, or a genuinely rekeyed host. Proceeding per accept-new, but treat this VM's SSH as unverified until confirmed by hand."
+      fi
+    else
+      warn "Could not compare SSH host key against the guest agent (empty scan or guest response) — falling back to network-only TOFU for this run"
+    fi
+  fi
+  # v2 (ChatGPT harness finding 13): do NOT disable host-key checking. Seed a
+  # throwaway known_hosts with the VM's current key (accept-new) so a CHANGED key
+  # on a recycled IP still trips a failure within a run. The block above adds
+  # an out-of-band cross-check (guest agent) on top of this.
   # v2 (ChatGPT harness finding 14): assemble ssh args as an array — a key path
   # with spaces or a leading '-' can no longer split or be read as an option.
   local ssh_args
