@@ -1,0 +1,73 @@
+#!/sbin/openrc-run
+name="mariadb-container"
+description="MariaDB for WordPress (rootful Podman, internal wp-db)"
+# Install-time snapshot — used only as a fallback if /etc/wp-install/
+# pinned.env can't be read when this service needs to recreate the
+# container from scratch (see start(), below).
+DB_IMAGE="__DB_IMAGE__"
+
+depend() {
+  need net
+  # v7-15: start AFTER nftables. /etc/nftables.nft does a full ruleset flush,
+  # which wipes ALL tables including the netavark table that provides
+  # container NAT and the DNS path to aardvark-dns. If nftables started
+  # (or restarted) after netavark had already configured this container's
+  # networking, it would silently tear down that networking. Ordering the
+  # container services after nftables makes the sequence deterministic:
+  # firewall first, then containers, then netavark lays its table on top
+  # and nothing flushes it afterward.
+  # v8: the nftables dependency below is "use" under the standard profile
+  # (soft — availability first) and "need" under production (hard — the
+  # stack stays down rather than run unprotected if the firewall fails).
+  after sysfs qemu-guest-agent nftables
+  __NFT_SVC_DEP__
+}
+
+start() {
+  ebegin "Starting MariaDB"
+  export PODMAN_IGNORE_CGROUPSV1_WARNING=1
+  lsmod | grep -q '^overlay' || modprobe overlay 2>/dev/null || true
+  lsmod | grep -q '^fuse'    || modprobe fuse    2>/dev/null || true
+  if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" != "cgroup2fs" ] \
+     && [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" != "UNKNOWN" ]; then
+    mountpoint -q /sys/fs/cgroup 2>/dev/null && umount /sys/fs/cgroup 2>/dev/null
+    mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+  fi
+  mount --make-shared / 2>/dev/null || true
+  podman network exists wp-db 2>/dev/null || podman network create --internal --subnet 10.89.20.0/24 --gateway 10.89.20.1 wp-db 2>/dev/null || true
+  if podman container exists mariadb 2>/dev/null; then
+    podman start mariadb >/dev/null 2>&1
+  else
+    podman rm -f mariadb 2>/dev/null || true
+    # Prefer the live pin over the install-time DB_IMAGE snapshot above:
+    # update.sh keeps /etc/wp-install/pinned.env current after every update
+    # but (by design, under the new pinned.env model) no longer rewrites
+    # this file's baked-in DB_IMAGE the way older versions did.
+    _DB_RUN_IMAGE="$DB_IMAGE"
+    if [ -f /etc/wp-install/pinned.env ]; then
+      . /etc/wp-install/pinned.env
+      [ -n "$DB_DIGEST" ] && _DB_RUN_IMAGE="docker.io/mariadb@${DB_DIGEST}"
+    fi
+    podman run -d --name mariadb --network wp-db --ip 10.89.20.2 --network-alias mariadb --restart always \
+      --label io.containers.autoupdate=image \
+      --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
+      --cap-add DAC_OVERRIDE --cap-add FOWNER \
+      --security-opt no-new-privileges:true \
+      --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
+      --pids-limit 100 --memory=512m --cpu-shares=512 \
+      --env-file /etc/wordpress/env \
+      -v /home/wpuser/wp/mysql:/var/lib/mysql \
+      -v /home/wpuser/wp/mariadb-conf/wp.cnf:/etc/mysql/conf.d/wp.cnf:ro \
+      --health-cmd "healthcheck.sh --connect --innodb_initialized" \
+      --health-interval 5s --health-timeout 5s --health-retries 24 \
+      --health-start-period 30s \
+      "$_DB_RUN_IMAGE" >/dev/null 2>&1
+  fi
+  eend $?
+}
+
+stop() {
+  ebegin "Stopping MariaDB"
+  podman stop mariadb >/dev/null 2>&1
+  eend $?
+}
