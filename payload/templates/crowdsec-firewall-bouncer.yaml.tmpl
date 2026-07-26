@@ -1,0 +1,23 @@
+mode: nftables
+pid_dir: /var/run/
+update_frequency: 10s
+daemonize: true
+log_mode: file
+log_dir: /var/log/
+log_level: info
+api_url: http://127.0.0.1:8080/
+api_key: __BOUNCER_KEY__
+disable_ipv6: false
+deny_action: DROP
+deny_log: false
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+    priority: -10
+  ipv6:
+    enabled: false
+nftables_hooks:
+  - input
