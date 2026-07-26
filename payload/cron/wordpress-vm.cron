@@ -1,0 +1,11 @@
+# Weekly container image update check (Sunday 04:00 UTC — dry run only)
+0 4 * * 0 podman auto-update --dry-run 2>&1 | logger -t podman-autoupdate
+# WordPress system cron — replaces unreliable WP-Cron (which only fires on
+# page loads). DISABLE_WP_CRON=true is set in WORDPRESS_CONFIG_EXTRA.
+# Runs every 5 min; WordPress schedules (backups, updates, email) fire on time.
+*/5 * * * * /usr/local/bin/wp-cron-run.sh >/dev/null 2>&1
+# Daily MariaDB backup — verified logical dump (v7-13, was pipe-to-gzip).
+# Now runs a dedicated script that checks mariadb-dump's own exit status,
+# confirms the dump completed to its own marker, verifies the gzip
+# archive, and rotates old backups ONLY after all three checks pass.
+0 2 * * * /usr/local/bin/wp-db-backup.sh
