@@ -1,0 +1,26 @@
+# MariaDB 11.4 configuration for WordPress
+# Use [mariadbd] (not [mysqld]) — MariaDB 11.x canonical section name.
+# [mysqld] still works for compat but [mariadbd] avoids deprecation warnings.
+[mariadbd]
+# InnoDB: cap buffer pool to prevent OOM on a 4 GB VM shared with WordPress
+# and CrowdSec. innodb_log_file_size removed — deprecated in 11.x, now
+# controlled by innodb_redo_log_capacity (default is fine for WP workloads).
+innodb_buffer_pool_size        = 256M
+# innodb_log_file_size is the correct MariaDB variable (innodb_redo_log_capacity
+# is MySQL 8.0.30+ syntax and does NOT exist in MariaDB — using it crashes mariadbd)
+innodb_log_file_size           = 64M
+innodb_flush_log_at_trx_commit = 2
+# Suppress io_uring probe: MariaDB 11.x tries io_uring first, falls back to
+# libaio when blocked by seccomp (our --cap-drop ALL). The fallback works fine
+# but generates noisy log lines. Disable the probe entirely.
+innodb_use_native_aio         = OFF
+# Charset: utf8mb4 required for WordPress emoji and 4-byte Unicode support
+character_set_server          = utf8mb4
+collation_server              = utf8mb4_unicode_ci
+# Connection limits
+max_connections               = 100
+max_allowed_packet            = 64M
+# Slow query log for MSP performance diagnostics
+slow_query_log                = 1
+slow_query_log_file           = /var/lib/mysql/slow.log
+long_query_time               = 2
