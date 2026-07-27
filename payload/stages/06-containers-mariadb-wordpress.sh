@@ -260,6 +260,31 @@ else
 fi
 
 WP_VOL_ARGS="-v /home/wpuser/wp/html:/var/www/html"
+# ── SMTP transport mu-plugin (NEW) ───────────────────────────────────────────
+# REGRESSION FIX (caught by the new mail validation section on a real
+# install): this was originally installed inside the `if [ -n "$WP_ADMIN_SLUG" ]`
+# block further down, because that is where the other mu-plugin lives and
+# where MU_DIR is defined. With no custom slug -- the default -- that whole
+# block is skipped, so the SMTP transport was never installed and wp_mail()
+# silently fell back to PHP mail() with no sendmail present. Mail transport
+# has nothing to do with the login slug, so it gets its own unconditional
+# block with its own MU_DIR.
+#
+# Installed even when no relay is configured: the mu-plugin checks for its
+# config file and returns early if absent, so it is inert until
+# `wp-mail.sh setup` writes one -- which means enabling mail later needs no
+# container rebuild.
+SMTP_MU_DIR="/home/wpuser/wp/html/wp-content/mu-plugins"
+mkdir -p "${SMTP_MU_DIR}"
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/01-wpvm-smtp.php" "${SMTP_MU_DIR}/01-wpvm-smtp.php"
+chown 33:33 "${SMTP_MU_DIR}/01-wpvm-smtp.php" 2>/dev/null || true
+# Verify rather than assume -- this is the exact failure that shipped.
+if [ -r "${SMTP_MU_DIR}/01-wpvm-smtp.php" ]; then
+  ok "SMTP transport mu-plugin installed"
+else
+  warn "SMTP transport mu-plugin FAILED to install — wp_mail() will fail silently"
+fi
+
 WP_EXTRA_VOLS="-v /home/wpuser/wp/secrets:/var/www/private:ro"
 WP_VOL_ARGS="${WP_VOL_ARGS} ${WP_EXTRA_VOLS}"
 
@@ -425,8 +450,6 @@ if [ -n "${WP_ADMIN_SLUG}" ]; then
   # heredoc body is quoted and the one dynamic value is injected via sed
   # afterwards — avoids any chance of PHP's $ syntax being mangled by shell
   # expansion inside the heredoc.
-install -m 0644 "${PAYLOAD_DIR}/mu-plugins/01-wpvm-smtp.php" "${MU_DIR}/01-wpvm-smtp.php"
-chown 33:33 "${MU_DIR}/01-wpvm-smtp.php" 2>/dev/null || true
 install -m 0644 "${PAYLOAD_DIR}/mu-plugins/00-wpvm-login-slug.php" "${MU_DIR}/00-wpvm-login-slug.php"
 
   # Inject the actual slug. Using a delimiter that cannot appear in the

@@ -6,6 +6,79 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — First real `update.sh` run: candidate could not start
+
+`update.sh` had never been exercised on hardware -- `TODO.md` has carried
+"full candidate/cutover/rollback coverage" as deferred precisely because it
+needed a real VM. The first run found a latent bug in the candidate path.
+
+```
+(13)Permission denied: AH00091: apache2: could not open error log file
+    /var/log/apache2/error.log
+```
+
+**Cause.** The candidate mounted `/var/log/apache2` as a bare `--tmpfs`,
+which is root-owned. Apache in this image runs as **www-data**, not root --
+which is exactly why the candidate must be granted `NET_BIND_SERVICE` to bind
+:80 in the first place -- so it could not create `error.log` and refused to
+start. Production has always worked because it bind-mounts
+`/home/wpuser/wp/logs`, which stage 04 chowns to `33:33`. The candidate never
+mirrored that.
+
+**Fixed** by giving the candidate its own `logs-candidate` directory, owned
+`33:33`, cleared before each run -- the same arrangement production has been
+proving correct since the beginning, rather than a second mechanism with
+different ownership semantics.
+
+**A second reason this was hard to find, now also fixed.** A tmpfs is
+destroyed with its container, so `podman rm -f` on the failed candidate
+deleted the one log that explained the failure. The bind mount survives, and
+the failure path now prints both `podman logs` and the candidate Apache
+`error.log` inline instead of discarding them.
+
+Everything downstream in that run -- "PHP did not execute", "mariadb hostname
+does not resolve", "DB check did not run" -- was the health check probing a
+container that had already exited, not four separate faults.
+
+**Correct behavior worth noting:** production was never touched. The
+candidate/cutover design did its job; only the candidate itself was broken.
+
+---
+
+## Unreleased — GeoIP working end to end; SMTP mu-plugin install fixed
+
+**GeoIP now works completely.** From the field log: `Smoke test passed -
+Apache loads mod_maxminddb in the new image`, then `WordPress responding and
+healthy with GeoIP active`. Every fix in the chain landed -- libmaxminddb
+carried into the final image, the build-time `ldd` gate, `<RequireAll>` inside
+`<Location />`, the RFC1918/loopback exemption, and full mount parity in the
+smoke test.
+
+**Install validation is clean:** `15 checks passed, 0 failed`. Post-install:
+`43 passed, 0 warnings, 1 failed`.
+
+**That one failure was the new mail section catching a real bug of mine.**
+`SMTP mu-plugin is missing` -- because I had installed it inside
+`if [ -n "$WP_ADMIN_SLUG" ]`, which is where the *other* mu-plugin lives and
+where `MU_DIR` is defined. With no custom slug (the default) that block is
+skipped entirely, so mail transport was never installed and `wp_mail()` fell
+back to PHP `mail()` with no sendmail present -- failing silently, which is
+the precise thing this feature exists to prevent.
+
+Fixed: its own unconditional block with its own directory variable, plus a
+post-install verification, since assuming is what failed. It installs even
+with no relay configured -- the mu-plugin returns early without its config
+file, so `wp-mail.sh setup` can enable mail later with no container rebuild.
+
+**Check added** (`test/check-install-conditionals.py`): flags any
+must-always-install payload file sitting inside a conditional. Verified by
+re-introducing the exact bug -- it reports it. Also added
+`test/run-all-checks.sh` to run every static check and both syntax sweeps in
+one command, with a note in its header that these are necessary and not
+sufficient.
+
+---
+
 ## Unreleased — Smoke test mount parity, mail validation, plugin CVE answer
 
 **The health check passes.** `HTTP response: 302`, `ALL CRITICAL CHECKS

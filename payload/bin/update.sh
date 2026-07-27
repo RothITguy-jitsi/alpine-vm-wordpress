@@ -673,8 +673,9 @@ do_wp_update() {
   #     init, the write itself will EACCES — which is the CORRECT signal:
   #     that plugin behavior would corrupt production either way, catching
   #     it against a throwaway is far cheaper than catching it live.
-  #   • /var/log/apache2 mounted as a tmpfs (candidate's own throwaway
-  #     logs). Production's real access log is no longer written to by
+  #   • /var/log/apache2 bind-mounted to its own logs-candidate directory,
+  #     owned 33:33 like production's (a tmpfs here is root-owned and Apache
+  #     runs as www-data, so it could not create error.log at all)
   #     the candidate, and there's nothing to clean up after — the tmpfs
   #     disappears with the container.
   #   • The production .htaccess is mounted :ro rather than :rw. v7-13
@@ -715,6 +716,26 @@ do_wp_update() {
   local candidate_ok=0 i
   podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
 
+  # FIX (first real `update.sh` run): the candidate used a bare
+  #     --tmpfs /var/log/apache2:size=32M,noexec,nosuid,nodev
+  # and Apache died on startup with
+  #     (13)Permission denied: AH00091: could not open error log file
+  # Apache in this image runs as www-data, not root -- which is precisely why
+  # the candidate has to be granted NET_BIND_SERVICE to bind :80 at all -- so
+  # it cannot create error.log in a root-owned tmpfs. Production has always
+  # worked because it bind-mounts /home/wpuser/wp/logs, which stage 04 chowns
+  # to 33:33. The candidate now mirrors that known-good arrangement with its
+  # own directory rather than relying on tmpfs ownership semantics.
+  #
+  # A bind mount is also strictly better here for a second reason: a tmpfs is
+  # destroyed with the container, so `podman rm -f` on a failed candidate
+  # deleted the very log explaining the failure. That is why this took a real
+  # deployment to surface. The log now survives and is printed below.
+  mkdir -p /home/wpuser/wp/logs-candidate
+  chown 33:33 /home/wpuser/wp/logs-candidate 2>/dev/null || true
+  chmod 750 /home/wpuser/wp/logs-candidate 2>/dev/null || true
+  rm -f /home/wpuser/wp/logs-candidate/*.log 2>/dev/null || true
+
   echo "  → Starting a validation candidate on 127.0.0.1:${WP_CANDIDATE_PORT} (production stays up on :80)…"
   # No --ip on wp-front (or on the wp-db connect below): production's own
   # wordpress container is still fully up and may hold a fixed address on
@@ -734,7 +755,7 @@ do_wp_update() {
     -e WP_ENVIRONMENT_TYPE=staging \
     -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
     -v /home/wpuser/wp/html:/var/www/html:ro \
-    --tmpfs /var/log/apache2:size=32M,noexec,nosuid,nodev \
+    -v /home/wpuser/wp/logs-candidate:/var/log/apache2 \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
     -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
     -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
@@ -744,6 +765,16 @@ do_wp_update() {
     podman network connect wp-db "$WP_CANDIDATE" >/dev/null 2>&1 || true
   else
     echo "✗  Candidate failed to start — production WordPress was never touched."
+    # Surface the reason rather than making the operator go hunting. Both
+    # sources matter: podman logs catches an entrypoint/exec failure, and the
+    # Apache error log catches a config or permissions failure inside it.
+    echo "   ── podman logs (candidate) ─────────────────────────────"
+    podman logs --tail 25 "$WP_CANDIDATE" 2>&1 | sed 's/^/   /' || true
+    if [ -s /home/wpuser/wp/logs-candidate/error.log ]; then
+      echo "   ── candidate Apache error.log ──────────────────────────"
+      tail -25 /home/wpuser/wp/logs-candidate/error.log 2>/dev/null | sed 's/^/   /'
+    fi
+    echo "   ────────────────────────────────────────────────────────"
     podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
     return 1
   fi
