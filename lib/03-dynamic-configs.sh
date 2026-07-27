@@ -351,15 +351,24 @@ Header always set X-Content-Type-Options  "nosniff"
 Header always set X-Frame-Options         "SAMEORIGIN"
 Header always set Referrer-Policy         "strict-origin-when-cross-origin"
 Header always unset X-Powered-By
-# Content-Security-Policy — 'unsafe-inline' and 'unsafe-eval' are required
-# by WordPress admin panels (inline JS/CSS is core to WP admin UX).
-# Tighten these on the front-end only if your theme does not use inline scripts.
-Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; frame-ancestors 'self'"
+# FORENSIC FIX (new-audit High finding, confirmed accurate): 'unsafe-eval'
+# used to apply site-wide. It's genuinely needed for wp-admin (the block
+# editor's bundled JS uses eval() in places) but the public-facing site
+# rarely does. Default now drops unsafe-eval; the LocationMatch below adds
+# it back only for wp-admin and the login page (this also covers requests
+# arriving through the custom slug above -- those are internally rewritten
+# to the real /wp-admin/... and /wp-login.php paths before Apache serves
+# them, which is what LocationMatch matches against). 'unsafe-inline' stays
+# site-wide -- far more commonly needed by ordinary theme/plugin behavior
+# (inline critical CSS, small inline scripts) than eval() is.
+Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; frame-ancestors 'self'"
 Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+<LocationMatch "^/(wp-admin/|wp-login\.php)">
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; frame-ancestors 'self'"
+</LocationMatch>
 APACHEEOF
 )
 msg_ok "Apache security config built (wp-admin: ${ADMIN_CIDR:-open}, extra-ip: ${ALLOWED_ADMIN_IP:-none}, proxy: ${PROXY_IP:-none}, slug: ${WP_ADMIN_SLUG:-default})"
 
 # ── Build the installer ───────────────────────────────────────────────────────
 TMPDIR=$(mktemp -d)
-
