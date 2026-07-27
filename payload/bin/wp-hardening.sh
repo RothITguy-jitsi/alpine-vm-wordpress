@@ -23,6 +23,19 @@ PRUN() {
 HTACCESS="/home/wpuser/wp/htaccess/.htaccess"
 APACHE_CONF="/home/wpuser/wp/apache-conf/wp-security.conf"
 TRIVY_CACHE_DIR="/var/cache/trivy"
+# FORENSIC FIX (new-audit High finding, confirmed accurate): "enable
+# uploads-php" (i.e. open the PHP-execution block) had no automatic
+# expiration — a real risk since wp-content/uploads is exactly where an
+# attacker who can get a file onto the server would want PHP to execute.
+# Left open and forgotten, it's a standing hole with no timer on it. This
+# marker file's mtime is the timer: written when opened, checked by a cron
+# entry (see payload/cron/wordpress-vm.cron) that re-blocks automatically
+# after UPLOADS_PHP_MAX_OPEN_SECS, and removed by any re-block (manual or
+# automatic) so the timer can't double-fire. Persistent under
+# /etc/wp-install/ (not /var/run) so a reboot while open doesn't reset the
+# clock — the whole point is a bound on how long this stays open.
+UPLOADS_PHP_MARKER="/etc/wp-install/uploads-php-opened-at"
+UPLOADS_PHP_MAX_OPEN_SECS=3600
 
 restart_wp() { PRUN restart wordpress >/dev/null 2>&1 && echo "  ✔  WordPress restarted" || true; }
 
@@ -66,7 +79,9 @@ enable_feature() {
       restart_wp ;;
     uploads-php)
       sed -i '/<DirectoryMatch.*uploads/,/<\/DirectoryMatch>/d' "$APACHE_CONF" 2>/dev/null
-      echo "✔ PHP in uploads unblocked  ⚠ security risk — re-block when done"
+      mkdir -p "$(dirname "$UPLOADS_PHP_MARKER")"
+      date +%s > "$UPLOADS_PHP_MARKER"
+      echo "✔ PHP in uploads unblocked  ⚠ security risk — auto re-blocks in $((UPLOADS_PHP_MAX_OPEN_SECS/60)) min (or run: wp-hardening.sh disable uploads-php)"
       restart_wp ;;
     debug)
       PRUN exec wordpress sh -c \
@@ -97,6 +112,7 @@ disable_feature() {
     </FilesMatch>
 </DirectoryMatch>
 B
+      rm -f "$UPLOADS_PHP_MARKER"
       echo "✔ PHP in uploads blocked"; restart_wp ;;
     debug)
       PRUN exec wordpress sh -c \
@@ -111,6 +127,23 @@ case "${1:-status}" in
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;
   restart-wp)  restart_wp ;;
+  check-expiry)
+    # Called every 15 min from cron (payload/cron/wordpress-vm.cron). Not a
+    # user-facing command, but harmless if run by hand. No-ops silently
+    # unless the marker exists AND is older than UPLOADS_PHP_MAX_OPEN_SECS —
+    # both the common "not open" case and "open but still within budget"
+    # case produce no output, so this doesn't spam cron's mail/log output
+    # every 15 minutes for the entire life of the VM.
+    if [ -f "$UPLOADS_PHP_MARKER" ]; then
+      opened_at=$(cat "$UPLOADS_PHP_MARKER" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      case "$opened_at" in ''|*[!0-9]*) opened_at=0 ;; esac
+      age=$((now - opened_at))
+      if [ "$age" -ge "$UPLOADS_PHP_MAX_OPEN_SECS" ]; then
+        echo "wp-hardening: uploads-php was open ${age}s (limit ${UPLOADS_PHP_MAX_OPEN_SECS}s) — auto re-blocking" | logger -t wp-hardening
+        disable_feature uploads-php >/dev/null 2>&1 || true
+      fi
+    fi ;;
   trivy-scan)
     echo "Scanning running containers for vulnerabilities..."
     for img in $(PRUN ps --format "{{.Image}}"); do
