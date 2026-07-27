@@ -6,6 +6,49 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — REGRESSION FIX 2: broke the WordPress run command
+
+The GeoIP fix from the previous round shipped with a bug of mine that stopped
+the installer dead:
+
+```
+Error: requires at least 1 arg(s), only received 0
+```
+
+**Cause.** To stop stage 06 and `wp-geoip-setup.sh` from drifting apart, I
+made stage 06 record the container config to a file. I inserted that write
+*into the middle of the multi-line `podman run` command* — after
+`-e WORDPRESS_DEBUG="" \`. A trailing backslash continues onto the next line,
+and the next line was a comment, so `#` swallowed the remainder of the
+logical line: the image argument was never passed. Podman received flags and
+no image and refused, and `set -e` ended the install.
+
+**Both `bash -n` and `sh -n` passed on this**, because it is perfectly valid
+shell. It is only semantically wrong. Syntax checking cannot catch this class
+of error, and I had been treating a clean syntax sweep as sufficient evidence.
+
+**Fixed:** the record is written before the run command begins.
+
+**Two checks added** (`test/check-line-continuations.py`, and a semantic pass):
+
+- **Line-continuation integrity** — a line ending in `\` must not be followed
+  by a comment (which truncates the command) or by a bare statement (which
+  splits it). Verified by re-injecting the exact bug into a copy: the check
+  catches it while `sh -n` still reports the broken file as fine.
+- **Every `podman run` must end with an image argument** — joins each
+  invocation across its continuations and checks the final token.
+
+**The second check immediately found a third instance of the same drift.**
+The `wp-container` OpenRC service — the thing that starts WordPress on
+*every boot* — was a third place constructing the container, with its own
+hardcoded config and volume list. A site address or SMTP relay configured at
+install would have worked until the first reboot and then silently vanished.
+It now sources the same record, so all three paths share one definition. The
+historical literal survives only as a fallback for a service file written
+before this change.
+
+---
+
 ## Unreleased — GeoIP root cause: missing runtime library
 
 The GeoIP build log identified it precisely. `mod_maxminddb.so` is linked
