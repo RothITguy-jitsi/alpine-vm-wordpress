@@ -1,0 +1,58 @@
+#!/bin/sh
+# 08-update-tooling.sh — part of install-wordpress.sh (Stage 2 on the VM).
+# Installs wp-cron-run.sh and the update.sh update/upgrade utility.
+# Sourced by install-wordpress.sh in order -- do not run this file directly;
+# it depends on variables and helper functions (ts/ok/warn/PRUN, vars.sh
+# contents, PAYLOAD_DIR, etc.) that the dispatcher and earlier stages set up.
+
+ts "Installing update script"
+install -m 0755 "${PAYLOAD_DIR}/bin/update.sh" /usr/local/bin/update.sh
+chmod +x /usr/local/bin/update.sh
+ok "update.sh installed (wp / db / crowdsec / os / digest-check / all)"
+ok "  Concurrent runs are now blocked by an exclusive lock at /run/lock/wordpress-update.lock"
+ok "  Container swaps (wp/db/crowdsec) now check every rename/start instead of discarding the result — a silent failure here used to be able to delete a still-healthy container"
+ok "  WordPress updates now validate the pulled image on a loopback candidate (127.0.0.1:18080) before cutting production over on :80"
+ok "  MariaDB updates now verify the backup dump itself, snapshot the data directory before the swap, and confirm WordPress can use the new database before mariadb-old is ever deleted"
+ok "  MariaDB updates now also check mariadb-upgrade's own exit status and roll back instead of continuing past a failure"
+ok "  pinned.env is now written atomically (temp file + rename) and re-validated on load — a truncated or hand-edited file can no longer feed an unvalidated image reference into a pull or run"
+
+
+# ── WordPress-level update visibility (NEW) ──────────────────────────────────
+# update.sh above covers the CONTAINER IMAGE. Plugins and themes live in the
+# mounted wp-content volume and are untouched by an image update -- and they
+# are where roughly 91% of WordPress vulnerabilities are found (Patchstack,
+# "State of WordPress Security in 2026": ~11,334 disclosed in 2025, ~91% in
+# plugins, ~9% in themes, about six in core). wp-plugins.sh is the visibility
+# for that layer.
+ts "Installing WordPress plugin/theme update visibility"
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-mail.sh" /usr/local/bin/wp-mail.sh
+
+# Pull the official wp-cli image now, so the tool works on a VM that later
+# has no registry access, and so its digest is recorded alongside the other
+# three images rather than being resolved at first use. Non-fatal: a
+# registry hiccup here should not fail an otherwise-good install, and
+# wp-plugins.sh degrades to a clear error rather than misbehaving.
+WPCLI_IMAGE_REF="docker.io/library/wordpress:cli"
+if podman pull "$WPCLI_IMAGE_REF" >/dev/null 2>&1; then
+  if [ "${USE_DIGEST_PINNING:-1}" = "1" ] && command -v skopeo >/dev/null 2>&1; then
+    _wpcli_dig=$(skopeo inspect --format '{{.Digest}}' "docker://${WPCLI_IMAGE_REF}" 2>/dev/null || echo "")
+    case "$_wpcli_dig" in
+      sha256:*) WPCLI_IMAGE_REF="docker.io/library/wordpress@${_wpcli_dig}"
+                ok "wp-cli image pinned to ${_wpcli_dig}" ;;
+      *)        warn "wp-cli image digest lookup failed — using the floating tag" ;;
+    esac
+  fi
+  printf 'WPCLI_IMAGE=%s\n' "$WPCLI_IMAGE_REF" >> /etc/wp-install/pinned.env
+  ok "wp-plugins.sh installed (status / check / update-plugins / update-themes)"
+  ok "wp-mail.sh installed (status / test / setup / doctor / log)"
+  ok "  Reports by default, never auto-updates: ~46% of disclosed plugin CVEs have no patch"
+  ok "  at disclosure, and plugin auto-update has itself been a supply-chain vector."
+else
+  warn "Could not pull ${WPCLI_IMAGE_REF} — wp-plugins.sh is installed but will not run"
+  warn "  until the image is available: podman pull ${WPCLI_IMAGE_REF}"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# CROWDSEC
+# ════════════════════════════════════════════════════════════════════════════
