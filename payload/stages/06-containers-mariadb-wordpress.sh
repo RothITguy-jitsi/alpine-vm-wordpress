@@ -260,7 +260,8 @@ else
 fi
 
 WP_VOL_ARGS="-v /home/wpuser/wp/html:/var/www/html"
-WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/secrets:/var/www/private:ro"
+WP_EXTRA_VOLS="-v /home/wpuser/wp/secrets:/var/www/private:ro"
+WP_VOL_ARGS="${WP_VOL_ARGS} ${WP_EXTRA_VOLS}"
 WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/logs:/var/log/apache2"
 WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro"
 WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro"
@@ -303,6 +304,21 @@ podman run -d \
   --env-file /etc/wordpress/env \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
+# REGRESSION FIX (found in a real deployment): wp-geoip-setup.sh rebuilds
+# the WordPress container from scratch with its OWN hardcoded env and volume
+# list. Anything added here and not mirrored there is silently discarded the
+# moment GeoIP runs -- which is exactly what happened to the site-address
+# config (WP_HOME/WP_SITEURL/proxy) and the SMTP credential mount. Rather
+# than duplicate them into a second place and create the same trap again,
+# write them once here and have wp-geoip-setup.sh source this file. One
+# definition, so the two paths cannot drift apart.
+mkdir -p /etc/wp-install
+{
+  printf 'WP_CONFIG_EXTRA=%s\n' "$(printf '%s' "$WP_CONFIG_EXTRA" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")"
+  printf 'WP_EXTRA_VOLS=%s\n'   "$(printf '%s' "${WP_EXTRA_VOLS:-}" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")"
+} > /etc/wp-install/wp-run-extra.env
+chmod 600 /etc/wp-install/wp-run-extra.env
+
   -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
   ${WP_VOL_ARGS} \
   "${WP_IMAGE}"
@@ -509,8 +525,23 @@ if [ "${GEOIP_ENABLED:-0}" = "1" ] && [ -n "${MAXMIND_ACCOUNT_ID}" ] && [ -n "${
   else
     warn "GeoIP setup failed — full detail in /var/log/wp-geoip.log"
     warn "  Fix credentials/network, then re-run: /usr/local/bin/wp-geoip-setup.sh"
+    # The rebuild replaces the running WordPress container, so a failure here
+    # can leave the site down rather than merely leaving GeoIP off. Report
+    # that plainly instead of continuing as if only a feature were missing.
+    if ! PRUN ps --filter 'name=^wordpress$' --filter status=running --format '{{.Names}}' 2>/dev/null | grep -qx wordpress; then
+      warn "  WordPress is NOT running after the GeoIP rebuild — the site is DOWN."
+      warn "  Check: podman logs --tail 50 wordpress"
+    fi
+    # Same fail-closed rule this profile already applies to image
+    # verification, digest pinning, the CrowdSec bouncer and sysctls: a
+    # requested security control that did not actually take effect is a
+    # failed production install, not a warning. Country filtering silently
+    # inactive means every request is being allowed through -- precisely the
+    # false sense of protection this profile exists to prevent.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      err "GeoIP country filtering was requested but is not active, and the WordPress container may be unhealthy. Refusing to finish under DEPLOYMENT_PROFILE=production. See /var/log/wp-geoip.log and 'podman logs wordpress'. Re-run under standard if an install without country filtering is acceptable."
+    fi
   fi
 elif [ "${GEOIP_ENABLED:-0}" = "1" ]; then
   warn "GeoIP was enabled but MaxMind credentials are missing — skipping GeoIP setup"
 fi
-
