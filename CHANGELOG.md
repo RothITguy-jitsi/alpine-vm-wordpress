@@ -6,6 +6,99 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Outbound email (SMTP relay)
+
+WordPress could not send mail on this VM, and did so silently. The official
+container has no `sendmail`, so PHP `mail()` had nothing to hand a message
+to; `wp_mail()` returned without a visible error and the UI reported success.
+Password resets, notifications, contact forms and WooCommerce receipts were
+all being dropped with nothing in any log. No security evaluation caught it,
+because it isn't a vulnerability — it's a functional gap that only shows up
+when someone needs a password reset.
+
+**Direct-to-relay rather than relaying through the Proxmox host.** PVE's
+Postfix is `loopback-only` by default, so using it would have meant binding
+it to the bridge and adding the guest to `mynetworks` — reopening a
+guest→host capability immediately after adding a rule to block this VM from
+the hypervisor's management plane, and creating something a PVE upgrade can
+silently revert. A dedicated per-site app password keeps blast radius to one
+revocable credential and leaves hypervisor alerting untouched.
+
+- **Interactive prompts** with an explanation of *why* mail fails silently,
+  why a dedicated credential matters, and what the port choices mean. Blank
+  skips, with a warning naming the consequence.
+- **`payload/mu-plugins/01-wpvm-smtp.php`** hooks `phpmailer_init`. Sets a
+  10s timeout instead of PHPMailer's 300s default (an unreachable relay
+  otherwise hangs registration and password-reset requests for five minutes
+  each), sets the envelope sender for SPF alignment, and forces
+  `wp_mail_from`/`_from_name` so WordPress stops sending as the usually
+  unauthorized `wordpress@<domain>` — which under DMARC `reject` is the same
+  silent-drop failure. Certificate verification is left on and deliberately
+  not exposed as a toggle.
+- **Credentials outside the docroot**: `0400`, uid 33, mounted read-only at
+  `/var/www/private/`. Not a container env var, since `podman inspect`
+  prints those. Values are escaped for PHP single-quoted context, so an app
+  password containing a quote or backslash survives intact.
+- **`payload/bin/wp-mail.sh`** — `status`, `test <addr>`, `setup`, `doctor`,
+  `log`. `test` goes through `wp_mail()` itself rather than swaks or
+  `openssl s_client`: testing the relay another way would prove the relay
+  works while saying nothing about whether WordPress can use it.
+- **nftables rate limit** on outbound submission (30 new connections/hour,
+  burst 10, throttled logging). Stated honestly in the docs as a
+  connection-level throttle and tripwire, not a per-message cap.
+- **Harness section 9** verifies configuration, file mode/ownership,
+  docroot exclusion, mu-plugin presence, read-only mount, and the live
+  firewall rule — without sending a live message, since that is a side
+  effect a default test run should not have.
+
+---
+
+## Unreleased — REGRESSION FIX: installer was broken by the monolith split
+
+**This one was mine, and it broke the installer outright.** A real deployment
+failed at:
+
+```
+chmod: cannot access '/tmp/tmp.XXXXXXXX/install-wordpress.sh': No such file or directory
+```
+
+**Cause.** In the monolith, `install-wordpress.sh` was *generated* in place by a
+~5,880-line quoted heredoc spanning original lines 2294–8175. The split
+replaced that heredoc with a `cp` from `payload/`. But `lib/03` ends at
+original line 2293 and `lib/04` begins at 8176, so the heredoc's opening line
+landed in the **gap between two output files** — and the split tooling only
+emitted a replacement when it encountered the opener *inside* the range it was
+currently building. The `cp` was dropped silently. The `chmod +x` that had sat
+on the far side of the heredoc survived into `lib/04` and pointed at a file
+nothing ever created.
+
+**Why the original verification missed it.** The post-split check proved that
+every non-replaced line of the original was present, in order, byte-identical —
+and that was true, which is exactly why it was misleading. It verified *nothing
+was lost from the original*. It never verified *everything intended to be added
+was actually added*. Those are different claims, and only the first was tested.
+
+**Fixed:** the copy is restored at the top of `lib/04`, now with an explicit
+readable-source check so a missing or half-fetched `payload/` fails with a
+sentence naming the cause instead of an error about a temp path.
+
+**Checks added, so this class of bug can't recur silently:**
+
+- **Producer-before-consumer** for host-side artifacts: every `${TMPDIR}/…`
+  path must be created by some earlier line than the one that reads,
+  `chmod`s, or copies it. Run against all eight `lib/` files in sourcing
+  order; this is precisely the check that would have caught the failure.
+- **Payload reference resolution**: every `${PAYLOAD_DIR}/…` referenced by any
+  stage must resolve to a file that exists (21 references, all resolving).
+- **No orphaned tooling**: every script in `payload/bin/` must be installed by
+  some stage.
+
+All three pass. Worth stating plainly: the split's line-preservation proof was
+sound and still shipped a broken installer, because it answered a narrower
+question than the one that mattered.
+
+---
+
 ## Unreleased — WordPress plugin/theme update visibility (`wp-plugins.sh`)
 
 A gap found by looking at what the project *doesn't* cover rather than
