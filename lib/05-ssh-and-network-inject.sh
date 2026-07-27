@@ -12,10 +12,18 @@ grep -q "$HN" "$MNT/etc/hosts" 2>/dev/null || echo "127.0.1.1  $HN" >> "$MNT/etc
 SSHCFG="$MNT/etc/ssh/sshd_config"; mkdir -p "$MNT/etc/ssh"
 [[ $DISABLE_PW_AUTH -eq 1 ]] && _PWAUTH="no" || _PWAUTH="yes"
 
+# FORENSIC FIX (new-audit Critical finding, confirmed accurate): root SSH
+# login used to re-enable itself as a "fallback" when admin-account
+# creation failed (ADMIN_USER_CREATED=0). Removed: PermitRootLogin is now
+# unconditionally "no". Recovery when the admin account is missing is via
+# the Proxmox console (`qm terminal <vmid>`, which uses the ROOT_PASS set
+# unconditionally in 04-nbd-mount-and-chroot.sh) — not by exposing root
+# over the network, which is a worse trade for a rare failure case.
+_ROOTLOGIN="no"
+
 if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
-  # Normal path: root SSH is fully disabled — the admin account (wheel +
-  # doas, created in the chroot above) is the only way in.
-  _ROOTLOGIN="no"
+  # Normal path: the admin account (wheel + doas, created in the chroot
+  # above) is the only way in.
   ADMIN_HASHED=$(openssl passwd -6 "$ADMIN_PASS")
   sed -i "s|^${ADMIN_USER}:[^:]*:|${ADMIN_USER}:${ADMIN_HASHED}:|" "$MNT/etc/shadow"
   if [[ -n "$SSH_KEYS" ]]; then
@@ -27,13 +35,15 @@ if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
   fi
 else
   # FALLBACK — should be rare, adduser is a simple local-filesystem
-  # operation with no network dependency. If the admin account genuinely
-  # couldn't be created, root SSH is re-enabled as a safety net rather than
-  # leaving the VM completely unreachable over SSH after first boot. This
-  # is a degraded state, not a final one — flagged loudly here and again in
-  # the closing summary; fix by hand after boot: adduser, addgroup <user>
-  # wheel, apk add doas, echo 'permit persist :wheel' > /etc/doas.d/doas.conf.
-  [[ $DISABLE_PW_AUTH -eq 1 ]] && _ROOTLOGIN="prohibit-password" || _ROOTLOGIN="yes"
+  # operation with no network dependency. Root SSH stays disabled either
+  # way now, so there's nothing useful to do with an operator-supplied SSH
+  # key here — it would sit on an account (root) that SSH can never reach.
+  # This is a degraded state, not a final one — flagged loudly here and
+  # again in the closing summary; fix by hand after boot via the console
+  # (`qm terminal <vmid>`): adduser, addgroup <user> wheel, apk add doas,
+  # echo 'permit persist :wheel' > /etc/doas.d/doas.conf, then copy the
+  # intended key into that account's ~/.ssh/authorized_keys yourself.
+  :
 fi
 
 cat > "$SSHCFG" << SSHEOF
@@ -46,28 +56,22 @@ LoginGraceTime 20
 ClientAliveInterval 300
 ClientAliveCountMax 2
 AllowTcpForwarding no
+AllowAgentForwarding no
 X11Forwarding no
 PermitTunnel no
 IgnoreRhosts yes
 HostbasedAuthentication no
+AllowUsers ${ADMIN_USER}
 Ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-ctr
 KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 SSHEOF
 chmod 600 "$SSHCFG"
 
-if [[ "$ADMIN_USER_CREATED" -ne 1 && -n "$SSH_KEYS" ]]; then
-  # Only reached in the fallback branch above — normal path puts the key on
-  # the admin account instead (see the ADMIN_USER_CREATED block above).
-  mkdir -p "$MNT/root/.ssh"
-  echo "$SSH_KEYS" > "$MNT/root/.ssh/authorized_keys"
-  chmod 700 "$MNT/root/.ssh"; chmod 600 "$MNT/root/.ssh/authorized_keys"
-fi
-
 if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
   msg_ok "SSH: ${ADMIN_USER} ($([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')), root login disabled"
 else
-  msg_warn "SSH: FALLBACK — root login (${_ROOTLOGIN}), admin account unavailable"
+  msg_warn "SSH: no admin account — SSH has no usable login until you create one (root login stays disabled; see console-recovery instructions above)"
 fi
 
 # ─ Admin credentials note (only what the operator doesn't already know) ──────
