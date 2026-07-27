@@ -6,7 +6,101 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
-## Unreleased — Outbound email (SMTP relay)
+## Unreleased — GeoIP root cause: missing runtime library
+
+The GeoIP build log identified it precisely. `mod_maxminddb.so` is linked
+against libmaxminddb (`-lmaxminddb` in the link line). The builder stage gets
+`libmaxminddb0` as a dependency of `libmaxminddb-dev` — the apt output lists
+it under *"The following NEW packages will be installed"*, proving the base
+image does not have it. But the final stage starts fresh from that base image
+and copied **only the module**. The result was a `.so` with an unsatisfiable
+runtime dependency: `LoadModule`'s `dlopen()` failed with
+`libmaxminddb.so.0: cannot open shared object file`, Apache refused to start,
+and the container exited instantly — after the working container had already
+been destroyed.
+
+The build *succeeded*. That is what made it quiet: a green build producing an
+image that cannot start.
+
+**Three fixes, at three different depths:**
+
+1. **The bug** — the builder now stages `libmaxminddb.so.0*` into `/tmp/deps`
+   and the final image copies it to `/usr/local/lib` (on Debian's default
+   `ld.so` path) then runs `ldconfig`.
+2. **The check that was missing** — the build now runs `ldd` on the module and
+   *fails the build* if anything is unresolved. A structurally broken image
+   can no longer be produced at all.
+3. **The systemic gap** — `wp-geoip-setup.sh` destroyed the running container
+   before proving the replacement worked. Every other risky swap here
+   validates a candidate first (update.sh's loopback-candidate pattern); this
+   one didn't. It now runs `apache2ctl configtest` against the new image in a
+   throwaway container **before** `podman rm -f`, and aborts with the site
+   still running if that fails.
+
+**Also fixed: remediation commands that send you down a blind alley.** The
+validator prints `podman logs --tail 50 wordpress` as the fix-it command. Run
+from the admin account — which is non-root by design — that invokes *rootless*
+Podman against an empty container store, so it reports subuid warnings and no
+logs, while the real rootful container sits untouched. Every such command now
+says `doas podman`. (This is precisely what happened when diagnosing this
+failure: the output looked like a Podman configuration problem and said
+nothing at all about WordPress.)
+
+---
+
+## Unreleased — GeoIP rebuild fixes (from a second real deployment)
+
+A second field install got much further — the previous regression is fixed and
+the installer ran end to end — but finished with WordPress `exited` and
+`mod_maxminddb is not loaded`. Three separate problems, one of them mine.
+
+**1. My bug: enabling GeoIP silently reverted two features.**
+`wp-geoip-setup.sh` rebuilds the WordPress container from scratch with its
+own hardcoded env and volume list. I added the site-address config
+(`WP_HOME`/`WP_SITEURL`/proxy scheme handling) and the SMTP credential mount
+to stage 06 without mirroring them there, so the moment GeoIP ran, both were
+discarded — outbound mail would have stopped working with no error anywhere.
+
+Fixed by removing the duplication rather than adding to it: stage 06 records
+the wp-config extras and extra mounts once to
+`/etc/wp-install/wp-run-extra.env` (0600), and `wp-geoip-setup.sh` sources
+that file. Two paths, one definition, so they cannot drift again. Verified
+the record round-trips byte-identically, including PHP `$_SERVER` references
+and embedded quotes.
+
+**2. GeoIP reported success while leaving the site down.** Its health loop
+failed all 12 attempts, printed a warning, then fell through to `exit 0` —
+and stage 06 tests that exit status, so the installer announced "GeoIP
+filtering active" while the container it had just rebuilt was failing to
+start. It now exits non-zero on an unhealthy rebuild and prints the specific
+diagnostic and recovery commands (including how to restore a working site
+without GeoIP). No automatic rollback: reconstructing the pre-GeoIP run
+command is exactly the duplication that caused problem 1.
+
+**3. Production profile now fails closed on inactive GeoIP.** Consistent with
+image verification, digest pinning, the CrowdSec bouncer and sysctls — a
+requested control that did not take effect is a failed production install.
+Country filtering silently inactive means every request is allowed through,
+which is the false sense of protection that profile exists to prevent. Stage
+06 also now reports explicitly when the container is not running after the
+rebuild, rather than describing it as a missing feature.
+
+**Corrected one of my own diagnoses:** I initially suspected the
+`/etc/init.d/wp-container` image was left stale because `wp-geoip-setup.sh`
+patches it before stage 07 creates it. On reading the code, stage 06 already
+re-reads the effective image from the running container, so the service is
+written correctly. No change made — recorded here because it was wrong.
+
+**Not yet diagnosed:** *why* `mod_maxminddb` fails to load. That needs
+`podman logs --tail 50 wordpress` and `/var/log/wp-geoip.log` from the failed
+VM. Also unexplained: `/` returned HTTP 403 to the in-container health check
+for 23 consecutive retries *before* GeoIP ran, while PHP, DNS and the
+database all passed — the container was healthy and something in the Apache
+config was refusing that specific request.
+
+---
+
+
 
 WordPress could not send mail on this VM, and did so silently. The official
 container has no `sendmail`, so PHP `mail()` had nothing to hand a message
