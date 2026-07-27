@@ -2,6 +2,28 @@
 # wp-db-backup.sh — verified daily MariaDB backup. Called from cron.
 # Design mirrors do_db_update()'s in-flight backup step in update.sh.
 set -eu
+# FORENSIC FIX (new-audit Medium finding, confirmed reasonable): no lock
+# existed, so a manual run while the scheduled 2am run was still going (or
+# any other double-invocation) could overlap two mariadb-dump processes
+# against the same instance. Same mkdir-based convention as update.sh and
+# wp-cron-run.sh's own locks -- not a new pattern, the third use of the
+# same one. A concurrent run just skips (exit 0): yesterday's good backup
+# is still safe either way, and the next scheduled run will simply try again.
+LOCK_DIR="/run/lock/wp-db-backup.lock"
+mkdir -p /run/lock
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
+  trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
+else
+  _lock_pid=$(cat "${LOCK_DIR}/pid" 2>/dev/null || echo "")
+  if [ -n "$_lock_pid" ] && kill -0 "$_lock_pid" 2>/dev/null; then
+    logger -t wp-db-backup "skipped — another backup (pid ${_lock_pid}) is still running"
+    exit 0
+  fi
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null && printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
+  trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
+fi
 BACKUP_DIR="/root/wp-db-backups"
 # v7-15 (audit #14): timestamp includes time, not just date — a manual run
 # on the same day as the scheduled one no longer overwrites it.
