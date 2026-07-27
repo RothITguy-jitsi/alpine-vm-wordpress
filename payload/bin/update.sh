@@ -763,7 +763,7 @@ do_wp_update() {
         candidate_ok=1; break
       fi
     else
-      if wget -qO- "http://127.0.0.1:${WP_CANDIDATE_PORT}/" >/dev/null 2>&1; then
+      if wget -qO- -U "wp-health-check/1.0" "http://127.0.0.1:${WP_CANDIDATE_PORT}/" >/dev/null 2>&1; then
         podman exec --user www-data "$WP_CANDIDATE" php -r \
           '$c=@mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"));exit($c?0:1);' \
           >/dev/null 2>&1 && { candidate_ok=1; break; }
@@ -857,7 +857,7 @@ do_wp_update() {
           HEALTHY=1; break
         fi
       else
-        wget -qO- "http://127.0.0.1:80/" >/dev/null 2>&1 && { HEALTHY=1; break; }
+        wget -qO- -U "wp-health-check/1.0" "http://127.0.0.1:80/" >/dev/null 2>&1 && { HEALTHY=1; break; }
       fi
       sleep 5
     done
@@ -1318,7 +1318,7 @@ do_db_update() {
               WP_RECONNECT_OK=1; break
             fi
           else
-            if wget -qO- "http://127.0.0.1:80/" >/dev/null 2>&1; then
+            if wget -qO- -U "wp-health-check/1.0" "http://127.0.0.1:80/" >/dev/null 2>&1; then
               podman exec --user www-data wordpress php -r \
                 '$c=@mysqli_connect(getenv("WORDPRESS_DB_HOST"),getenv("WORDPRESS_DB_USER"),getenv("WORDPRESS_DB_PASSWORD"),getenv("WORDPRESS_DB_NAME"));exit($c?0:1);' \
                 >/dev/null 2>&1 && { WP_RECONNECT_OK=1; break; }

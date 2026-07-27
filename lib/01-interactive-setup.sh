@@ -459,10 +459,43 @@ read -rp "  Enable GeoIP country filtering? [y/N] : " GEOIP_ENABLE
 GEOIP_ENABLED=0 GEOIP_MODE="" GEOIP_WHITELIST="" GEOIP_BLOCKLIST=""
 MAXMIND_ACCOUNT_ID="" MAXMIND_LICENSE_KEY=""
 if [[ "${GEOIP_ENABLE:-N}" =~ ^[Yy] ]]; then
-  read -rp "  MaxMind Account ID  : " MAXMIND_ACCOUNT_ID
-  read -rsp "  MaxMind License Key : " MAXMIND_LICENSE_KEY; echo
+  # UX FIX (from a field install): the License Key prompt is a no-echo read,
+  # so a paste that silently failed to register looks exactly like typing it
+  # correctly. Previously a blank key printed one warning and moved straight
+  # on into the digest-pinning explainer, which scrolled it off screen -- the
+  # operator answered "y" to GeoIP, saw the summary say "disabled", and had
+  # no obvious way to tell why. Re-prompt instead of degrading silently, the
+  # same way the production profile re-prompts for a missing SSH key, and
+  # make declining an explicit choice rather than an accident.
+  while :; do
+    read -rp  "  MaxMind Account ID  : " MAXMIND_ACCOUNT_ID
+    read -rsp "  MaxMind License Key : " MAXMIND_LICENSE_KEY; echo
+    if [[ -n "$MAXMIND_ACCOUNT_ID" && -n "$MAXMIND_LICENSE_KEY" ]]; then
+      # Confirm what was actually captured -- length only, never the value.
+      msg_ok "  Credentials captured (account ${MAXMIND_ACCOUNT_ID}, key ${#MAXMIND_LICENSE_KEY} chars)"
+      break
+    fi
+    echo ""
+    if [[ -z "$MAXMIND_ACCOUNT_ID" && -z "$MAXMIND_LICENSE_KEY" ]]; then
+      msg_warn "  Neither value was entered."
+    elif [[ -z "$MAXMIND_LICENSE_KEY" ]]; then
+      msg_warn "  The License Key came back EMPTY. That prompt does not echo, so a"
+      msg_warn "  paste that did not register looks identical to typing it correctly."
+    else
+      msg_warn "  The Account ID came back empty."
+    fi
+    msg_warn "  Get both at: https://www.maxmind.com/en/accounts/current/license-key"
+    read -rp "  Try again? [Y/n] (n = continue without GeoIP filtering) : " _GEO_RETRY
+    if [[ "${_GEO_RETRY:-Y}" =~ ^[Nn] ]]; then
+      MAXMIND_ACCOUNT_ID="" MAXMIND_LICENSE_KEY=""
+      break
+    fi
+  done
+  unset _GEO_RETRY
   if [[ -z "$MAXMIND_ACCOUNT_ID" || -z "$MAXMIND_LICENSE_KEY" ]]; then
-    msg_warn "Both Account ID and License Key are required — GeoIP filtering will be skipped"
+    msg_warn "GeoIP filtering will be SKIPPED — no MaxMind credentials."
+    msg_warn "  You can enable it later on the VM, no reinstall needed:"
+    msg_warn "    doas /usr/local/bin/wp-geoip-setup.sh"
   else
     echo ""
     echo "  Whitelist mode : ONLY listed countries can reach the site (strict)"

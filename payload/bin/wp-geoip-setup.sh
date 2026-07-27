@@ -354,7 +354,7 @@ for i in $(seq 1 12); do
       GEOIP_WP_READY=1; break
     fi
   else
-    wget -qO- "http://127.0.0.1:${WEB_CHECK_PORT}/" >/dev/null 2>&1 && { GEOIP_WP_READY=1; break; }
+    wget -qO- -U "wp-health-check/1.0" "http://127.0.0.1:${WEB_CHECK_PORT}/" >/dev/null 2>&1 && { GEOIP_WP_READY=1; break; }
   fi
   sleep 5
 done

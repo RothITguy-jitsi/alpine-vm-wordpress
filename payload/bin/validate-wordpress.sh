@@ -162,6 +162,7 @@ _http_code() {
       "timeout"        => 8,
       "follow_location"=> 0,
       "ignore_errors"  => true,
+    "header"         => "User-Agent: wp-health-check/1.0\r\n",
     ]]);
     @file_get_contents("http://127.0.0.1:80'"${_u_path}"'", false, $ctx);
     $code = "none";

@@ -6,6 +6,72 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — MaxMind credential prompt no longer degrades silently
+
+Answering `y` to GeoIP and then getting `GeoIP: disabled` in the summary, with
+no `/var/log/wp-geoip.log` to explain it, was a UX failure rather than a bug:
+the License Key had come back empty, so `GEOIP_ENABLED=0` and
+`wp-geoip-setup.sh` was never run.
+
+Why that was easy to miss: the License Key prompt is a no-echo read, so a
+paste that failed to register looks identical to typing it correctly. The old
+code printed one warning and continued straight into the digest-pinning
+explainer, which pushed it off screen within a second.
+
+Now it re-prompts rather than degrading silently -- the same pattern the
+production profile already uses for a missing SSH key -- says specifically
+*which* field was empty and that the key prompt does not echo, links the
+MaxMind page, and requires an explicit `n` to continue without GeoIP. On
+success it confirms what was captured (account ID, and the key's **length**
+only, never its value) so a bad paste is visible immediately. The skip path
+now also points at `wp-geoip-setup.sh`, which can enable GeoIP later with no
+reinstall.
+
+---
+
+## Unreleased — ROOT CAUSE of the persistent 403: the WAF blocked our own probe
+
+The install now completes: 14 of 15 post-install checks pass, the container
+is up, port 80 listens, and the validator's own HTTP check reports a non-error
+response. The single remaining failure was the 403 that has appeared in every
+field log since the beginning — and the contradiction in this run is what
+isolated it, since GeoIP was disabled, so GeoIP was not the cause.
+
+**The 8G firewall this project installs contains, deliberately:**
+
+```apache
+RewriteCond %{HTTP_USER_AGENT} ^$ [NC]
+RewriteRule .* - [F,L]
+```
+
+That 403s any request with an empty `User-Agent`, which is a sound rule --
+it is a common scanner signature. But `wp-health-check.sh` probes the site
+with PHP's HTTP stream wrapper, which sends the `user_agent` ini value, and
+that is **empty by default** in the official WordPress image.
+
+So the site's own WAF had been blocking the installer's own health check on
+every request, for the entire life of this project. It explains the exact
+signature seen every time: PHP passes, DNS passes, the database query
+passes, and HTTP returns 403 through all 24 retries while the container is
+demonstrably healthy.
+
+**Fixed** by having the probes identify themselves (`User-Agent:
+wp-health-check/1.0`) rather than by weakening the rule. This is also better
+practice independently: health probes are now distinguishable in the access
+log instead of looking like anonymous scanner traffic.
+
+Applied to every in-container probe, not just the one that surfaced:
+`wp-health-check.sh`, `validate-wordpress.sh`, `update.sh` (three candidate
+and cutover probes) and `wp-geoip-setup.sh`. The BusyBox `wget` probes send a
+UA of their own today, so they were not failing -- they are set explicitly so
+a future BusyBox change cannot reintroduce this silently.
+
+Verified that the chosen string matches none of the six 8G user-agent
+patterns, and restricted it to `[A-Za-z0-9./_-]` so it cannot trip a future
+rule either.
+
+---
+
 ## Unreleased — GeoIP config context + local-address exemption
 
 The libmaxminddb fix worked: the build's new `ldd` gate passed, the module

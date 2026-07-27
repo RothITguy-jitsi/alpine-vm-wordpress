@@ -46,11 +46,24 @@ _fail() { echo "  ✗  $*" >&2; FAIL=1; }
 # bounds a hung socket so a half-open connection can't stall an update.
 HTTP_CODE=$(podman exec --user www-data "$CONTAINER" php -r '
   error_reporting(0);
+  // ROOT CAUSE OF THE PERSISTENT 403 (found from field logs): the 8G
+  // firewall this project installs contains, by design,
+  //     RewriteCond %{HTTP_USER_AGENT} ^$ [NC]
+  // which 403s any request with an empty User-Agent -- a good rule, since
+  // that is a common scanner signature. PHP's HTTP stream wrapper sends the
+  // "user_agent" ini value, which is EMPTY by default in the official
+  // WordPress image. So this health check was tripping the site's own WAF
+  // on every single request: PHP, DNS and the database all passed while
+  // HTTP returned 403 forever, and the install could never reach a healthy
+  // state. Identify the probe instead -- it is both the fix and better
+  // practice, since these requests now show up distinguishably in the
+  // access log rather than looking like an anonymous bot.
   $ctx = stream_context_create(["http" => [
     "method"         => "GET",
     "timeout"        => 8,
     "follow_location"=> 0,
     "ignore_errors"  => true,
+    "header"         => "User-Agent: wp-health-check/1.0\r\n",
   ]]);
   @file_get_contents("http://127.0.0.1:'"${HTTP_PORT}"'/", false, $ctx);
   $code = "none";
