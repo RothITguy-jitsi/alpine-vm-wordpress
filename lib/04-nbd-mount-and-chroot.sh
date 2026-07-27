@@ -112,6 +112,16 @@ fi
 # "admin account missing" or vice versa). grep's non-match is a real
 # possible outcome here, not a bug, so this is an explicit if — under
 # set -e a bare failing grep outside a conditional would abort the script.
+#
+# FORENSIC FIX (new-audit Critical finding, confirmed accurate): this used
+# to re-enable root SSH login as a "fallback" when admin-account creation
+# failed. That traded one recovery path for a worse one it didn't need:
+# ROOT_PASS is set unconditionally above specifically for local console
+# access (Proxmox `qm terminal <vmid>` / serial0), which needs no network,
+# no SSH, and isn't gated on this chroot succeeding at all. Root SSH is
+# now ALWAYS disabled, regardless of ADMIN_USER_CREATED — the fallback
+# path is "log in via qm terminal and fix it by hand," not "expose root
+# over the network instead." See 05-ssh-and-network-inject.sh.
 ADMIN_USER_CREATED=0
 ADMIN_UID="" ADMIN_GID=""
 if grep -q "^${ADMIN_USER}:" "$MNT/etc/passwd" 2>/dev/null; then
@@ -120,7 +130,9 @@ if grep -q "^${ADMIN_USER}:" "$MNT/etc/passwd" 2>/dev/null; then
   ADMIN_GID=$(grep "^${ADMIN_USER}:" "$MNT/etc/passwd" | cut -d: -f4)
   msg_ok "Admin account: ${ADMIN_USER} (uid ${ADMIN_UID}), wheel + doas configured"
 else
-  msg_warn "Admin account creation failed — root SSH will be used as a fallback (see summary)"
+  msg_warn "Admin account creation failed — root SSH stays disabled (by design)."
+  msg_warn "  Recover via the Proxmox console instead: qm terminal <vmid>"
+  msg_warn "  then create the account by hand (adduser, addgroup <user> wheel, apk add doas)."
 fi
 
 # ─ Hostname ───────────────────────────────────────────────────────────────────
