@@ -29,6 +29,7 @@ A note on how to read that sentence, and this README generally: "integrity-check
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
+- [Outbound Email](#outbound-email)
 - [WordPress Site Address](#wordpress-site-address)
 - [Interactive Setup Walkthrough](#interactive-setup-walkthrough)
 - [What Gets Created](#what-gets-created)
@@ -195,6 +196,7 @@ The other standing design decision is **rootful, not rootless, Podman** (see [Kn
 - Security headers via `mod_headers`: CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`.
 
 **Day-2 tooling**
+- **`wp-mail.sh`** — outbound email status, live test send, reconfiguration, and diagnostics. See [Outbound Email](#outbound-email).
 - **`wp-plugins.sh`** — WordPress-level update visibility: plugins, themes, and core. This covers a different layer than `update.sh`, and the difference matters. `update.sh` and Trivy cover the **container image** (OS packages, PHP, WordPress core). Plugins and themes live in the mounted `wp-content` volume, so an image update never touches them — and per Patchstack's *State of WordPress Security in 2026*, of the 11,334 vulnerabilities disclosed in 2025, roughly **91% were in plugins and 9% in themes, with about six in core**. `wp-plugins.sh status` shows what's out of date (including inactive plugins, whose code is still on disk and still reachable); a weekly cron reports pending updates via syslog. It **never auto-updates** — see [Known Limitations](#known-limitations) for why that's deliberate. Runs the official `wordpress:cli` image, digest-pinned like the other three.
 - `update.sh` — per-component updates, Trivy pre-scan, an exclusive lock, and a candidate/cutover pattern for WordPress so production never loses port 80 mid-update. `all` and `digest-check` now run every component regardless of an earlier one failing, and print a per-component OK/FAILED summary at the end instead of stopping silently partway through.
 - `wp-hardening.sh` — toggle 8G Firewall / xmlrpc / uploads-PHP-execution / `WP_DEBUG`, callable remotely via `qm guest exec`.
@@ -254,6 +256,37 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 ```
 
 (if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
+
+---
+
+## Outbound Email
+
+**WordPress cannot send mail without this, and it fails silently.** The official WordPress container has no `sendmail` binary, so PHP's `mail()` has nothing to hand a message to. `wp_mail()` returns without a visible error and the admin UI reports success. Password resets, new-user notifications, comment alerts, contact-form submissions and WooCommerce receipts all vanish. The usual way people discover this is a locked-out administrator whose reset email never arrives.
+
+The installer asks for an SMTP relay (optional — blank keeps the previous behavior). Afterwards, manage it on the VM with `wp-mail.sh`:
+
+```sh
+wp-mail.sh status                    # what's configured (password redacted)
+wp-mail.sh test you@example.com      # send a real message, report the result
+wp-mail.sh setup                     # (re)configure interactively
+wp-mail.sh doctor                    # DNS, port reachability, mount, mu-plugin
+wp-mail.sh log                       # recent wp_mail failures
+```
+
+**Use a dedicated mailbox or app password for each site.** The credential is stored on the VM, so if the site is ever compromised you want to revoke exactly one credential without disturbing anything else that sends mail.
+
+How it's handled:
+
+| | |
+|---|---|
+| **Credential location** | `/home/wpuser/wp/secrets/smtp.php`, mode `0400`, owned by uid 33, mounted **read-only** at `/var/www/private/` — deliberately outside the web root, so no URL maps to it even if PHP execution breaks and Apache starts serving `.php` as plain text. Not passed as a container env var either, since `podman inspect` prints those. |
+| **Transport** | A mu-plugin (`01-wpvm-smtp.php`) hooking `phpmailer_init`. WordPress bundles PHPMailer with SMTP support, so no third-party plugin is needed. mu-plugins can't be deactivated from wp-admin and survive core updates. |
+| **TLS** | Certificate verification stays on and is not exposed as a toggle. The usual reason to disable it is a self-signed cert, and accepting those hands the relay password to anyone on-path. |
+| **Timeout** | 10s, not PHPMailer's 300s default — otherwise an unreachable relay hangs user-visible requests like registration for five minutes each. |
+| **From address** | Set explicitly, including the envelope sender. WordPress otherwise sends as `wordpress@<domain>`, which is usually not SPF-authorized — and under a DMARC policy of `quarantine`/`reject` that means silent non-delivery, the same invisible failure again. |
+| **Rate limit** | nftables caps outbound submission at 30 new connections/hour (burst 10), logging `nft-smtp-ratelimit`. A compromised site spamming through an authenticated relay damages your sending domain's reputation, and that outlasts the compromise. Enforced at the packet layer because the application layer is what the attacker already controls. |
+
+One honest limitation: the rate limit bounds *connections*, not messages — one SMTP connection can carry many recipients. It's a meaningful throttle and a good tripwire, not a hard per-message cap. Pair it with a per-account sending limit on the relay.
 
 ---
 
