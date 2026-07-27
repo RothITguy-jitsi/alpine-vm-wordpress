@@ -338,7 +338,7 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
     # DEPLOYMENT_PROFILE's own definition at prompt time for the full
     # rationale on why this is a per-install choice, not a hardcoded policy.
     if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      msg_error "Digest pinning: ${DIGEST_PIN_SUMMARY} — refusing to continue under DEPLOYMENT_PROFILE=production. Every image must resolve to a real @sha256: digest before the install proceeds. See ${DIGEST_PIN_LOG} for exactly which lookups failed and why. Retry once registry access recovers, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where tag-only fallback is acceptable."
+      err "Digest pinning: ${DIGEST_PIN_SUMMARY} — refusing to continue under DEPLOYMENT_PROFILE=production. Every image must resolve to a real @sha256: digest before the install proceeds. See ${DIGEST_PIN_LOG} for exactly which lookups failed and why. Retry once registry access recovers, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where tag-only fallback is acceptable."
     fi
     warn "Digest pinning: ${DIGEST_PIN_SUMMARY} — see ${DIGEST_PIN_LOG} for exactly why the rest fell back to tag-only"
   fi
@@ -391,4 +391,3 @@ PINNEDENV
 chmod 600 "$_PINNEDENV_TMP"
 mv -f "$_PINNEDENV_TMP" /etc/wp-install/pinned.env
 ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}"
-
