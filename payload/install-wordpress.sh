@@ -15,6 +15,20 @@ exec >> "$LOG" 2>&1
 ts()   { echo; echo "=== [$(date '+%H:%M:%S')] $* ==="; }
 ok()   { echo "  ✔  $*"; }
 warn() { echo "  ⚠  $*"; }
+# FORENSIC FIX (found during independent review, not in the uploaded audit):
+# stage 02's DEPLOYMENT_PROFILE=production digest-pinning gate calls
+# `msg_error`, which is a HOST-side function (defined in lib/00-preflight.sh)
+# that was never in scope here — install-wordpress.sh runs as its own
+# process on the VM, inheriting none of the host script's shell functions.
+# Confirmed empirically: under `set -e`, the resulting "command not found"
+# (exit 127) still aborts the install, so this was never a silent
+# fail-open — but the operator got a bare "msg_error: not found" instead of
+# the detailed, actionable message the code was written to show them,
+# exactly when a production install is failing for a reason they need to
+# understand. err() gives every VM-side stage a real fail-closed helper
+# instead of leaning on an undefined-command crash to (accidentally) get
+# the right exit behavior.
+err()  { echo "  ✗  $*" >&2; exit 1; }
 
 # ── Pinned image versions ─────────────────────────────────────────────────────
 # BUG FIX: mariadb:11.4-lts does NOT exist on Docker Hub.
