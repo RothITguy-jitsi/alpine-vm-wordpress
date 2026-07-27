@@ -247,6 +247,75 @@ echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache 
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
 
+# ── Outbound email / SMTP relay (NEW) ─────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Outbound email (SMTP relay)${CL}"
+echo -e "  ${YW}WordPress cannot send mail on this VM without this. The official${CL}"
+echo -e "  ${YW}WordPress container has no sendmail binary, so PHP's mail() has${CL}"
+echo -e "  ${YW}nothing to hand messages to. Every password reset, new-user${CL}"
+echo -e "  ${YW}notification, comment alert, contact-form submission and${CL}"
+echo -e "  ${YW}WooCommerce receipt then fails SILENTLY -- WordPress reports${CL}"
+echo -e "  ${YW}success in the UI and nothing is written to any log. Locked-out${CL}"
+echo -e "  ${YW}admins with no reset email is the usual way people find out.${CL}"
+echo ""
+echo -e "  ${YW}Use a DEDICATED mailbox or app password for this site, not your${CL}"
+echo -e "  ${YW}normal account: it is stored on the VM (0400, root-owned, mounted${CL}"
+echo -e "  ${YW}read-only into the container, outside the web root), and if the${CL}"
+echo -e "  ${YW}site is ever compromised you want to revoke exactly one${CL}"
+echo -e "  ${YW}credential without disturbing anything else that sends mail.${CL}"
+echo ""
+echo -e "  ${YW}Outbound sends are rate-limited by the firewall (30 new${CL}"
+echo -e "  ${YW}connections/hour, burst 10). A compromised site spamming through${CL}"
+echo -e "  ${YW}an authenticated relay damages your sending domain's reputation,${CL}"
+echo -e "  ${YW}and that outlasts the compromise itself.${CL}"
+echo ""
+SMTP_HOST=""; SMTP_PORT="587"; SMTP_USER=""; SMTP_PASS=""
+SMTP_FROM=""; SMTP_FROM_NAME=""; SMTP_ENCRYPTION="tls"
+read -rp "  Configure outbound email now? [y/N] : " _WANT_SMTP
+case "${_WANT_SMTP}" in
+  y|Y|yes|YES)
+    while :; do
+      read -rp "  SMTP server hostname (e.g. mail.example.com) : " SMTP_HOST
+      SMTP_HOST=$(printf '%s' "$SMTP_HOST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -n "$SMTP_HOST" ] && break
+      msg_warn "  A hostname is required (or answer N to skip email entirely)."
+    done
+    echo -e "  ${YW}587 = submission with STARTTLS (the standard, and the default).${CL}"
+    echo -e "  ${YW}465 = implicit TLS, encrypted from connect. Both are fine.${CL}"
+    echo -e "  ${YW}25 is deliberately not offered: it is for server-to-server${CL}"
+    echo -e "  ${YW}relay, is widely blocked outbound, and is unauthenticated.${CL}"
+    read -rp "  SMTP port [587] : " _SP
+    case "${_SP:-587}" in
+      465) SMTP_PORT="465"; SMTP_ENCRYPTION="ssl" ;;
+      *)   SMTP_PORT="587"; SMTP_ENCRYPTION="tls" ;;
+    esac
+    read -rp "  SMTP username (the full mailbox address) : " SMTP_USER
+    while :; do
+      read -rsp "  SMTP password / app password : " SMTP_PASS; echo
+      [ -n "$SMTP_PASS" ] && break
+      msg_warn "  Password cannot be empty — authenticated submission is required."
+    done
+    echo -e "  ${YW}The From address matters more than it looks. WordPress otherwise${CL}"
+    echo -e "  ${YW}sends as wordpress@<your-domain>, which is usually not a real${CL}"
+    echo -e "  ${YW}mailbox and usually not a sender your SPF record authorizes --${CL}"
+    echo -e "  ${YW}under a DMARC policy of quarantine or reject that means silent${CL}"
+    echo -e "  ${YW}non-delivery, which is the same invisible failure again. Use an${CL}"
+    echo -e "  ${YW}address on a domain whose SPF/DKIM covers this relay.${CL}"
+    read -rp "  From address [${SMTP_USER}] : " SMTP_FROM
+    SMTP_FROM="${SMTP_FROM:-$SMTP_USER}"
+    read -rp "  From name [${WP_SITE_TITLE:-WordPress}] : " SMTP_FROM_NAME
+    SMTP_FROM_NAME="${SMTP_FROM_NAME:-${WP_SITE_TITLE:-WordPress}}"
+    msg_ok "SMTP: ${SMTP_USER}@${SMTP_HOST}:${SMTP_PORT} (${SMTP_ENCRYPTION}), from ${SMTP_FROM}"
+    msg_info "  Verify delivery after install with:  wp-mail.sh test you@example.com"
+    ;;
+  *)
+    msg_warn "Outbound email not configured — WordPress will be UNABLE to send mail."
+    msg_warn "  Password resets and notifications will fail silently. Configure later:"
+    msg_warn "  wp-mail.sh setup   (on the VM, after install)"
+    ;;
+esac
+unset _WANT_SMTP _SP
+
 # ── WordPress site identity (NEW) ─────────────────────────────────────────────
 # Why this is asked at install time rather than left to the browser wizard:
 # WordPress stores its canonical URL in the DATABASE (wp_options.siteurl and
