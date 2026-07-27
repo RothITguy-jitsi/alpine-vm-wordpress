@@ -438,3 +438,4 @@ msg_ok "Apache security config built (wp-admin: ${ADMIN_CIDR:-open}, extra-ip: $
 
 # ── Build the installer ───────────────────────────────────────────────────────
 TMPDIR=$(mktemp -d)
+

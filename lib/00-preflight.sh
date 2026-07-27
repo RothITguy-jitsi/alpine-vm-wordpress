@@ -107,3 +107,4 @@ command -v qm        &>/dev/null || msg_error "'qm' not found."
 command -v qemu-nbd  &>/dev/null || msg_error "'qemu-nbd' not found — apt install qemu-utils"
 command -v qemu-img  &>/dev/null || msg_error "'qemu-img' not found — apt install qemu-utils"
 command -v openssl   &>/dev/null || msg_error "'openssl' not found."
+
