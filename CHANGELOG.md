@@ -6,6 +6,188 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — WordPress plugin/theme update visibility (`wp-plugins.sh`)
+
+A gap found by looking at what the project *doesn't* cover rather than
+auditing what it does — and none of the three security evaluations caught it,
+because each reviewed the code as written rather than its coverage.
+
+Everything here defended the **container**: digest-pinned images, Trivy
+scanning, fail-closed production gates, `update.sh` for image swaps. But
+`trivy image` scans the image's OS packages and PHP libraries, and plugins and
+themes aren't in the image — they're in the mounted `wp-content` volume,
+installed after deployment. Nothing scanned them, nothing reported them going
+stale, and a container-image update only ever updated WordPress **core**.
+
+The proportions make that lopsided. Per Patchstack's *State of WordPress
+Security in 2026*, of 11,334 vulnerabilities disclosed in 2025 roughly **91%
+were in plugins and 9% in themes — core accounted for about six**. Around 43%
+require no authentication, and disclosure-to-exploitation is often measured in
+hours. So the existing hardening comprehensively addressed the ~6 while the
+~11,300 had no coverage at all.
+
+**New: `payload/bin/wp-plugins.sh`**
+
+- `status` — core, plugin, and theme updates available, plus inactive plugins
+  (whose code is still on disk and still reachable, a routine entry point).
+- `check` — the cron entry point. Silent when everything is current, so a
+  weekly job doesn't become noise; reports via syslog with the specific plugin
+  names when something is pending.
+- `update-plugins` / `update-themes` — explicit, optionally per-slug.
+- `update-core` — warns first that `update.sh wp` is the preferred path on
+  this VM (pinned, Trivy-scanned image with the candidate/cutover and rollback
+  machinery) and that writing core into the volume diverges from the image.
+- `doctor` — image, volume, container state, wp-cli self-check, DB reachability.
+
+Wired into stage 08 with a weekly cron report (Mondays 07:00 UTC).
+
+**Design decisions worth stating explicitly:**
+
+- **Reports, never auto-updates.** ~46% of disclosed plugin vulnerabilities
+  have no patch at disclosure, so blanket updating cannot close that window;
+  plugin auto-update has itself been a supply-chain delivery mechanism; and an
+  unattended update that breaks a live site does so unobserved. This matches
+  the existing container-layer posture, where cron runs `podman auto-update
+  --dry-run` rather than an actual swap.
+- **Uses the official `wordpress:cli` image, digest-pinned** alongside the
+  other three. Downloading `wp-cli.phar` at runtime would have been simpler
+  and would have added precisely the unverified supply-chain dependency this
+  project refuses elsewhere (see the Trivy installer checksum item in
+  `TODO.md`).
+- **Shares the running container's network namespace**
+  (`--network container:wordpress`) rather than re-attaching `wp-front` and
+  `wp-db` by hand, so it resolves `mariadb` and reaches api.wordpress.org
+  exactly as WordPress does, with no duplicated network wiring to drift out of
+  sync.
+- **Runs as uid 33 (www-data)**, so anything written into the shared volume
+  lands with the ownership WordPress expects rather than root-owned files
+  WordPress then can't modify.
+- **Non-fatal image pull at install.** A registry hiccup shouldn't fail an
+  otherwise-good install; the tool degrades to a clear error naming the pull
+  command.
+
+---
+
+## Unreleased — WordPress site address configured at install time
+
+An independent improvement rather than an audit response. Previously the
+installer configured the infrastructure thoroughly but left WordPress itself
+unconfigured: the VM came up, and whoever first browsed to it completed the
+setup wizard, at which point **the VM's raw IP became the site's permanent
+identity** — written into `wp_options.siteurl`/`.home`, and from there into
+permalinks, emails, password-reset links, and serialized plugin/theme option
+arrays. Moving to the real domain afterwards then needs a `wp-cli
+search-replace` (a plain SQL find-and-replace corrupts serialized data,
+because it doesn't fix the embedded string lengths).
+
+**New prompts** (all optional; blank keeps the previous IP-based behavior, so
+a lab VM is unaffected):
+
+- **Site domain** — validated as an RFC 1123 hostname. Accepts a pasted
+  `https://example.com/` and strips it back to the hostname, but rejects an
+  internal-space typo like `exa mple.com` rather than silently deploying under
+  a domain nobody typed.
+- **Scheme** — defaults to `https` when a reverse proxy IP was given (the
+  common NPM/Caddy/nginx arrangement) and `http` otherwise, since nothing in
+  this VM terminates TLS on its own.
+- **Site title** and **admin email**, asked only when a domain is set.
+
+**What this generates**, in `wp-config.php` via `WORDPRESS_CONFIG_EXTRA`:
+
+- `WP_HOME` **and** `WP_SITEURL`, always both. Setting only `WP_HOME` is a
+  known misconfiguration, not merely an incomplete one: `WP_SITEURL` then
+  still resolves from the stale database value, which
+  `wp-login.php?action=logout&redirect_to=…` can be used to disclose
+  (typically the raw VM IP). Because constants take precedence over the
+  database, the site is also now portable — changing domains is a config edit
+  and a restart, not a data migration.
+- **`X-Forwarded-Proto` handling, but only when a trusted proxy is
+  configured.** With TLS terminated upstream, PHP sees plain HTTP and
+  `is_ssl()` returns false, producing the classic infinite redirect loop.
+  WordPress core has declined to fix this for over a decade (Trac #15733) and
+  its own documentation says to handle it in `wp-config.php`. The catch is
+  that `X-Forwarded-Proto` is an ordinary request header — anything that can
+  reach port 80 directly can set it — so trusting it unconditionally would
+  let a direct caller assert "this was HTTPS" and defeat `FORCE_SSL_ADMIN` for
+  their own session. It is therefore gated on `PROXY_IP`, the same trust
+  signal `mod_remoteip` already uses for `X-Forwarded-For`. The leftmost value
+  of the header is used, since a multi-hop request yields a comma-separated
+  list whose first entry is the original client's scheme.
+- **`FORCE_SSL_ADMIN`** alongside that — but deliberately *not* when `https`
+  was chosen with no proxy configured, where forcing SSL on an admin panel
+  with no working HTTPS path in front of it would lock the operator out of
+  `wp-admin` rather than protect anything. That combination warns instead.
+
+Verified that setting `WP_HOME` doesn't break the install's own gate: the
+loopback health check accepts 301/302 (it deliberately doesn't follow offsite
+redirects), and its PHP-execution and database checks are independent of the
+HTTP status, so a redirect to the configured domain still passes.
+
+---
+
+## Unreleased — Third-party evaluation round (hash-verified, 46 files)
+
+An independent file-by-file security evaluation published a SHA-256 for every
+file; all of them matched this repository exactly, confirming the review ran
+against current code. Its overall verdict — *"strong security engineering
+foundation; not yet ready for an unattended production certification gate"* —
+is recorded as-is in `TODO.md` rather than softened. Two findings were cases
+where a fix from the previous round was real but didn't go far enough.
+
+**Fixed:**
+
+- **SSH host-key verification in the test harness is now a gate, not a
+  warning.** The previous round added a guest-agent cross-check but proceeded
+  regardless of its result. A verified key now gets `StrictHostKeyChecking=yes`
+  against a `known_hosts` holding only that key — which additionally closes a
+  TOCTOU window `accept-new` never covered — and an unverified or mismatched
+  key skips the SSH section instead, with `--allow-unverified-sshid` as an
+  explicit lab opt-out.
+- **Host-side execution context hardened before any privileged work**
+  (`lib/00-preflight.sh`): fixed `PATH` (blocks lookalike-binary substitution
+  for `qm`/`qemu-nbd`/`curl`/etc.), `umask 027`, `LC_ALL=C`, and a refusal to
+  source or copy from a group/world-writable checkout.
+- **Production profile now requires an SSH key**, re-prompting until one is
+  given, instead of silently permitting password auth on the admin account —
+  mirroring the existing digest-pinning force-enable directly above it.
+- **`AllowAgentForwarding no` and `AllowUsers <admin>`** added to the generated
+  sshd config. (The evaluation also listed TCP/X11/tunnel forwarding, but those
+  were already disabled — only these two were genuinely missing.)
+- **Scheduled-job overlap protection**: `wp-cron-run.sh` and `wp-db-backup.sh`
+  each take a `mkdir`-based lock — matching `update.sh`'s existing convention
+  rather than adding a second locking style — with stale-lock detection via
+  recorded PID plus `kill -0`, and non-zero exits logged via `logger` rather
+  than passing silently.
+- **Kernel hardening sysctls are now verified, not assumed.** Applying
+  `99-hardening.conf` discarded both sysctl's output and its exit status, then
+  printed "Sysctls applied" unconditionally — so a key this kernel rejects
+  reported success anyway. Every key is now parsed from the file (not a
+  hardcoded list that could drift) and read back to confirm the value actually
+  took effect; production fails closed on a mismatch, standard warns and lists
+  exactly which keys didn't apply.
+- **Assurance language tightened** in `README.md` and `test/README.md`, per the
+  finding that phrases like "verified backups" can read more strongly than
+  what's implemented. Backups are now described as integrity-checked on
+  creation, explicitly *not* restore-proven; `ssh-keyscan` is named as
+  unauthenticated discovery rather than verification.
+
+**Still open — signed release manifest (High, raised against four files).**
+Nothing cryptographically proves that `lib/` and `payload/` are the published
+bytes before they run as root. The permission check added here narrows the
+window but is a weaker claim and isn't presented as equivalent. This is
+deferred rather than fixed because a signing key generated in a build sandbox
+and committed beside the code it signs would verify the repository against
+itself — the same trust circularity already documented in README's "Verifying
+what you run." `TODO.md` records the concrete implementation plan for when a
+real out-of-band signing key exists.
+
+**Deliberately not changed:** renaming `standard` → `lab` and defaulting to
+`production`. Defensible, but it silently breaks existing automation and
+documentation; appropriate for a major version boundary with a migration note,
+not a patch round.
+
+---
+
 ## Unreleased — Forensic audit fixes + curl-based single-command install
 
 An independent security evaluation was run against the just-restructured
