@@ -1,8 +1,10 @@
 # WordPress VM Provisioner for Proxmox VE
 
-A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, verified automated backups, and a full day-2 update/rollback/self-diagnosis toolchain baked in.
+A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, structurally-verified automated backups (see [Known Limitations](#known-limitations) for exactly what "verified" covers), and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 
-No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer around 16 interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and verified nightly backups.
+No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer around 16 interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and nightly database backups that are integrity-checked on creation.
+
+A note on how to read that sentence, and this README generally: "integrity-checked" means each backup's dump completion marker and gzip archive are verified before old backups are rotated — it does **not** mean the backup has been test-restored, or that a copy exists off this VM. Both of those are open items ([Known Limitations](#known-limitations), `TODO.md`). The same care applies elsewhere: the WordPress update "candidate" is isolated at the HTTP and filesystem level but shares the live database; CrowdSec provides firewall-level enforcement of ban decisions, not WAF request inspection; and rootful containers are contained primarily by the VM boundary rather than by the container runtime. Each of those is spelled out where it comes up below.
 
 | | |
 |---|---|
@@ -27,6 +29,7 @@ No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmo
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
+- [WordPress Site Address](#wordpress-site-address)
 - [Interactive Setup Walkthrough](#interactive-setup-walkthrough)
 - [What Gets Created](#what-gets-created)
 - [Security Model](#security-model)
@@ -192,6 +195,7 @@ The other standing design decision is **rootful, not rootless, Podman** (see [Kn
 - Security headers via `mod_headers`: CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`.
 
 **Day-2 tooling**
+- **`wp-plugins.sh`** — WordPress-level update visibility: plugins, themes, and core. This covers a different layer than `update.sh`, and the difference matters. `update.sh` and Trivy cover the **container image** (OS packages, PHP, WordPress core). Plugins and themes live in the mounted `wp-content` volume, so an image update never touches them — and per Patchstack's *State of WordPress Security in 2026*, of the 11,334 vulnerabilities disclosed in 2025, roughly **91% were in plugins and 9% in themes, with about six in core**. `wp-plugins.sh status` shows what's out of date (including inactive plugins, whose code is still on disk and still reachable); a weekly cron reports pending updates via syslog. It **never auto-updates** — see [Known Limitations](#known-limitations) for why that's deliberate. Runs the official `wordpress:cli` image, digest-pinned like the other three.
 - `update.sh` — per-component updates, Trivy pre-scan, an exclusive lock, and a candidate/cutover pattern for WordPress so production never loses port 80 mid-update. `all` and `digest-check` now run every component regardless of an earlier one failing, and print a per-component OK/FAILED summary at the end instead of stopping silently partway through.
 - `wp-hardening.sh` — toggle 8G Firewall / xmlrpc / uploads-PHP-execution / `WP_DEBUG`, callable remotely via `qm guest exec`.
 - `validate-wordpress.sh` (also `wp-validate`) — live functional checks across every layer, scoped to one area with `--section`, with a concrete copy-paste remediation command attached to every failure.
@@ -250,6 +254,40 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 ```
 
 (if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
+
+---
+
+## WordPress Site Address
+
+Set the site's real domain during install and WordPress is configured with it
+from first boot. This matters more than it looks: WordPress writes its
+canonical URL into the **database** the first time setup completes, so if that
+first visit is to the VM's IP, the IP becomes the site's identity — in
+permalinks, in emails, in password-reset links, and inside serialized plugin
+and theme options where a plain SQL find-and-replace will corrupt the data.
+
+The installer asks for:
+
+| Prompt | Notes |
+|---|---|
+| **Site domain** | e.g. `example.com`. Blank = use the VM's IP (fine for a lab VM). Pasting `https://example.com/` works — it's stripped back to the hostname. |
+| **Scheme** | Defaults to `https` if you gave a reverse proxy IP, `http` otherwise. |
+| **Site title** | Defaults to the domain. |
+| **Admin email** | For recovery and notifications. Optional. |
+
+Giving a domain sets both `WP_HOME` and `WP_SITEURL` as constants in
+`wp-config.php`. Because constants take precedence over the database copy,
+changing domains later is a config edit and a container restart rather than a
+database migration.
+
+**If you're behind a reverse proxy terminating TLS** (Nginx Proxy Manager,
+Caddy, nginx — the usual setup), also give the proxy's IP at the
+`mod_remoteip` prompt. That's what makes the installer trust
+`X-Forwarded-Proto` and set `FORCE_SSL_ADMIN`, which is what prevents the
+classic "too many redirects" loop where WordPress wants HTTPS, redirects, and
+the proxy forwards the next request as HTTP again. Without a proxy IP the
+header is deliberately **not** trusted, because any caller able to reach port
+80 directly could forge it.
 
 ---
 
@@ -323,7 +361,7 @@ Aliases: `cs` for `crowdsec`, `digest` or `pin` for `digest-check`, `scan` for `
 
 - **`check` / `status` / *(no args)*** — read-only. Skopeo manifest queries only, no pulls, no prompts. Shows what's running, what's pinned, and whether the registry has anything newer.
 - **`os`** — Alpine `apk upgrade`.
-- **`wp [VER]`** — pulls the new WordPress image, boots it as a throwaway `wordpress-candidate` on `127.0.0.1:18080` against the real data (read-only mount) and database, and health-checks it there. Production is only stopped and swapped over once the candidate proves out — if it doesn't, production was never touched.
+- **`wp [VER]`** — pulls the new WordPress image, boots it as a throwaway `wordpress-candidate` on `127.0.0.1:18080` with a read-only mount of production's files, but connected to the *live* production database with production credentials (see [Known Limitations](#known-limitations)) — HTTP exposure and the filesystem are isolated, the database is not — and health-checks it there. Production is only stopped and swapped over once the candidate proves out — if it doesn't, production was never touched.
 - **`db [VER]`** — takes a verified `mariadb-dump` backup (own exit status checked, completion marker confirmed, gzip integrity-checked), snapshots the data directory at the filesystem level, stops WordPress, stops MariaDB cleanly (verified stopped, not just renamed), swaps the image, checks `mariadb-upgrade`'s own exit status, re-verifies with a credentialed query + InnoDB check, restarts WordPress and confirms *it* can use the new database too — and only then discards the pre-update container and snapshot.
 - **`crowdsec [VER]`** (alias `cs`) — same stop → verify-stopped → swap pattern; confirms LAPI comes back up and restarts the firewall bouncer.
 - **`digest-check`** (aliases `digest`, `pin`) — refreshes any component whose tag was rebuilt under the same version (e.g. a same-version security rebuild). Runs all three components regardless of an earlier one failing, and prints a per-component OK/FAILED summary.
@@ -504,6 +542,8 @@ No — the script builds the VM from a freshly downloaded Alpine cloud image and
 
 This project has been through several rounds of independent security review and real-world field fixes. In the interest of setting accurate expectations before you point it at a client's production site, here's an honest breakdown of what's already solid, what's a deliberate tradeoff rather than an oversight, and what genuinely isn't addressed yet. **`TODO.md`** tracks the currently-open items in more detail, including why each is deferred rather than dropped.
 
+**On plugin updates being reported rather than applied automatically.** `wp-plugins.sh` deliberately reports and stops. Auto-updating plugins unattended looks like the safer default and mostly isn't: roughly 46% of disclosed plugin vulnerabilities had no patch available at disclosure, so blanket updating can't close that window anyway; plugin auto-update has itself been the delivery mechanism in real supply-chain incidents, where legitimate directory plugins pushed malicious updates to sites that trusted them; and an unattended update that breaks a live site breaks it with nobody watching. The same reasoning is already applied one layer down — the container-image cron runs `podman auto-update --dry-run`, never an actual unattended swap. Visibility plus a human decision is the intended posture, not an unfinished feature.
+
 **Already addressed**
 - WordPress updates use a candidate/cutover pattern — a freshly pulled image is booted read-only against production's real data and database on a loopback-only port and health-checked *before* production is touched, closing what used to be a guaranteed port-80 collision on every `update.sh wp`.
 - MariaDB updates verify the pre-update dump itself (own exit status, a completion-marker check, and a `gzip -t` integrity check — not a piped `gzip`'s exit code), take a filesystem-level snapshot of the data directory before anything is touched, check `mariadb-upgrade`'s own exit status, and re-verify that WordPress itself can use the new database — not just that MariaDB is healthy — before the rollback path is ever discarded.
@@ -529,6 +569,10 @@ This project has been through several rounds of independent security review and 
 **Not yet addressed**
 - The host's outbound (egress) firewall policy is fully open (`policy accept` on the nftables output chain) — there's no restriction on what the VM itself can initiate outbound, beyond `wp-db`'s `--internal` boundary for the containers on it.
 - The CrowdSec Console enrolment key is passed as a `podman exec` argument for the one-time enrolment call, visible in `argv`/`ps` output for the duration of that command — the same exposure MaxMind's credentials used to have before that was fixed. It isn't currently established whether `cscli` has an equivalent file-based credential input.
+- **"Verified" backups mean structurally verified, not restore-proven.** `wp-db-backup.sh`'s checks (dump exit status, completion marker, `gzip -t`) confirm the archive is a complete, uncorrupted `mariadb-dump` output — they do not restore it anywhere or confirm the data inside is what you expect. Nothing here periodically restores a backup into a disposable MariaDB instance to prove it, and nothing copies backups off the VM — a lost or destroyed VM takes its backups with it.
+- No mandatory gate requires a recent, verified off-VM backup before `update.sh db` performs a major MariaDB upgrade. The local pre-update backup and filesystem snapshot (see above) protect against a bad upgrade; they don't protect against losing the VM itself mid-upgrade.
+- The Trivy fallback installer (used if Trivy isn't already packaged) is fetched from a specific, audited commit rather than a mutable branch, but that commit's script isn't checksummed or signature-verified before it runs — commit-pinning rules out a *later* tampering of that ref, not a compromise of the delivery path itself.
+- No signed release manifest exists for this repository. `install.sh` sources every `lib/*.sh` file and copies every `payload/` file as root, trusting that the checkout on disk is what you expect it to be — beyond the group/world-writable check `lib/00-preflight.sh` now does, and pinning to a specific commit SHA instead of a floating branch (see [Verifying what you run](#verifying-what-you-run)), nothing here cryptographically verifies the content itself. See `TODO.md` for why this is a tracked, deliberately-deferred item rather than something bolted on ad hoc.
 
 ---
 
