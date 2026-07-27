@@ -6,6 +6,41 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — REGRESSION FIX 3: an apostrophe broke the health check
+
+The User-Agent fix was correct; the comment I wrote explaining it was not.
+
+```
+/usr/local/bin/wp-health-check.sh: line 54: //: Permission denied
+```
+
+The PHP probe is passed to the interpreter as a **single-quoted shell
+string**. I put the explanation inside that block, and the prose contained
+`PHP's` and `site's`. Each apostrophe terminates the string; everything after
+it is handed to the shell, which then tried to execute `//` as a command. The
+probe never ran, so HTTP reported `none` on every retry.
+
+`sh -n` passed it. The file remained valid shell -- just a completely
+different program from the intended one. (A different apostrophe placement
+*can* produce a syntax error, so this is not reliably caught either way,
+which is the point.)
+
+**Fixed** by moving all prose into shell `#` comments above the block, where
+apostrophes are harmless -- the file already contains "server's" and "can't"
+there safely. The PHP block now holds only PHP.
+
+**Check added** (`test/check-embedded-quotes.py`): finds single-quoted
+embedded code blocks (`php -r`, `perl -e`, `awk`, `python -c`) and reports
+any that get terminated mid-prose by an apostrophe. It understands the
+deliberate `'"$VAR"'` splice idiom and does not flag it, and it blanks shell
+comment lines first so a comment that merely *describes* the pattern is not
+mistaken for one (which it was, on the first attempt -- caught and fixed
+before shipping this time).
+
+Verified by re-injecting the exact bug: the checker reports it.
+
+---
+
 ## Unreleased — MaxMind credential prompt no longer degrades silently
 
 Answering `y` to GeoIP and then getting `GeoIP: disabled` in the summary, with

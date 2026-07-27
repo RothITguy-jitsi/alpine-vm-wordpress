@@ -44,20 +44,28 @@ _fail() { echo "  ✗  $*" >&2; FAIL=1; }
 # works here. ignore_errors=true makes PHP return the status line for 3xx
 # and 4xx responses instead of throwing, so we can classify them. timeout=8
 # bounds a hung socket so a half-open connection can't stall an update.
+# ROOT CAUSE OF THE PERSISTENT 403 (found from field logs): the 8G firewall
+# this project installs contains, by design,
+#     RewriteCond %{HTTP_USER_AGENT} ^$ [NC]
+# which 403s any request with an empty User-Agent -- a good rule, since that
+# is a common scanner signature. But PHP HTTP stream wrapper sends the
+# "user_agent" ini value, which is EMPTY by default in the official WordPress
+# image, so this health check was tripping the site own WAF on every request:
+# PHP, DNS and the database all passed while HTTP returned 403 forever and
+# the install could never reach a healthy state. The probe now identifies
+# itself, which is both the fix and better practice -- these requests are now
+# distinguishable in the access log instead of looking like an anonymous bot.
+#
+# NOTE FOR FUTURE EDITS: the PHP program below is passed to the interpreter
+# as a SINGLE-QUOTED shell string. An apostrophe anywhere inside it -- even
+# in a comment, even in ordinary prose like the possessive form of a noun --
+# silently terminates that string, and everything after it is executed as
+# shell instead. That is exactly how an earlier version of this very comment
+# shipped broken, producing "line 54: //: Permission denied" at runtime while
+# passing sh -n cleanly. Keep all prose up here in shell comments, where
+# apostrophes are harmless. See test/check-embedded-quotes.py.
 HTTP_CODE=$(podman exec --user www-data "$CONTAINER" php -r '
   error_reporting(0);
-  // ROOT CAUSE OF THE PERSISTENT 403 (found from field logs): the 8G
-  // firewall this project installs contains, by design,
-  //     RewriteCond %{HTTP_USER_AGENT} ^$ [NC]
-  // which 403s any request with an empty User-Agent -- a good rule, since
-  // that is a common scanner signature. PHP's HTTP stream wrapper sends the
-  // "user_agent" ini value, which is EMPTY by default in the official
-  // WordPress image. So this health check was tripping the site's own WAF
-  // on every single request: PHP, DNS and the database all passed while
-  // HTTP returned 403 forever, and the install could never reach a healthy
-  // state. Identify the probe instead -- it is both the fix and better
-  // practice, since these requests now show up distinguishably in the
-  // access log rather than looking like an anonymous bot.
   $ctx = stream_context_create(["http" => [
     "method"         => "GET",
     "timeout"        => 8,
