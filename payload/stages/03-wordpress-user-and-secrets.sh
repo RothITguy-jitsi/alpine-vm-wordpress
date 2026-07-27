@@ -71,3 +71,4 @@ ok "wp-front: 10.89.10.0/24 — WordPress egress + published port"
 PRUN network exists wp-db 2>/dev/null \
   || PRUN network create --internal --subnet 10.89.20.0/24 --gateway 10.89.20.1 wp-db
 ok "wp-db: 10.89.20.0/24 — internal (no egress), no host port for MariaDB"
+

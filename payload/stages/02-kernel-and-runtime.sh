@@ -428,3 +428,4 @@ PINNEDENV
 chmod 600 "$_PINNEDENV_TMP"
 mv -f "$_PINNEDENV_TMP" /etc/wp-install/pinned.env
 ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}"
+

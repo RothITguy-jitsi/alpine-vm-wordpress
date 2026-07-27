@@ -73,3 +73,4 @@ install -m 0755 "${PAYLOAD_DIR}/bin/mariadb-health-check.sh" /usr/local/bin/mari
 chmod +x /usr/local/bin/mariadb-health-check.sh
 ok "mariadb-health-check.sh installed — ping + root query + wpdb query + InnoDB"
 ok "  Manual use: mariadb-health-check.sh [container]"
+

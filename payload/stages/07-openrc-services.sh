@@ -89,6 +89,18 @@ start() {
         fi
         ;;
     esac
+    # REGRESSION FIX: this service is what starts WordPress on EVERY BOOT, and
+    # it used to hardcode its own copy of the wp-config extras and volume
+    # list. That made it a third place constructing the same container --
+    # after stage 06 and wp-geoip-setup.sh -- so a site address or SMTP relay
+    # configured at install worked until the first reboot and then silently
+    # disappeared. It now reads the same record stage 06 writes, so all three
+    # paths share one definition. The literal default below is the historical
+    # value, kept only so a service file written before this change still
+    # starts if the record is missing.
+    WP_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);'
+    WP_EXTRA_VOLS=""
+    [ -r /etc/wp-install/wp-run-extra.env ] && . /etc/wp-install/wp-run-extra.env
     podman run -d --name wordpress --network wp-front --ip 10.89.10.3 -p 80:80 --restart always \\
       --label io.containers.autoupdate=image \\
       --cap-drop ALL --cap-add NET_BIND_SERVICE \\
@@ -100,7 +112,8 @@ start() {
       --env-file /etc/wordpress/env \\
       -e WORDPRESS_DB_HOST=mariadb:3306 \\
       -e WORDPRESS_DEBUG="" \\
-      -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \\
+      -e WORDPRESS_CONFIG_EXTRA="\$WP_CONFIG_EXTRA" \\
+      \$WP_EXTRA_VOLS \\
       -v /home/wpuser/wp/html:/var/www/html \\
       -v /home/wpuser/wp/logs:/var/log/apache2 \\
       -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \\

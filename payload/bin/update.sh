@@ -120,6 +120,17 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 [ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+# REGRESSION FIX: update.sh rebuilds the WordPress container twice (candidate,
+# then production cutover) and used to hardcode its own copy of the wp-config
+# extras and volume list. That made it the fourth and fifth places
+# constructing the same container -- so running `update.sh wp` silently
+# dropped the site address (WP_HOME/WP_SITEURL) and the SMTP credential
+# mount, exactly like enabling GeoIP and rebooting did. All of them now read
+# the record stage 06 writes. The literal below is the historical value, kept
+# only as a fallback for a VM provisioned before that record existed.
+WP_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);'
+WP_EXTRA_VOLS=""
+[ -r /etc/wp-install/wp-run-extra.env ] && . /etc/wp-install/wp-run-extra.env
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
 
 # ── Image reference validation (v7-6d, carried forward) ────────────────────
@@ -721,7 +732,7 @@ do_wp_update() {
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     -e WP_ENVIRONMENT_TYPE=staging \
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
     -v /home/wpuser/wp/html:/var/www/html:ro \
     --tmpfs /var/log/apache2:size=32M,noexec,nosuid,nodev \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
@@ -816,7 +827,8 @@ do_wp_update() {
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
-    -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+    -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
+    ${WP_EXTRA_VOLS} \
     -v /home/wpuser/wp/html:/var/www/html \
     -v /home/wpuser/wp/logs:/var/log/apache2 \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
