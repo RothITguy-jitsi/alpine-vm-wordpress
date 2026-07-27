@@ -600,6 +600,51 @@ run_destructive() {
 # way an operator actually uses it. It needs key auth (doas would otherwise
 # prompt for a password) and network reachability to the VM.
 run_ssh_doas_check() {
+  section "9. Outbound email configuration"
+  # Config/permission checks only -- deliberately NOT a live send. Every
+  # other check here is contained to this VM; a real message leaves it and
+  # lands in someone's mailbox, which is a side effect a test suite should
+  # not have by default. `wp-mail.sh test <addr>` is the live check, run
+  # deliberately by a human. What IS verified here is everything that can be
+  # wrong without sending: whether mail is configured at all, whether the
+  # credential file is protected, whether the mu-plugin that does the work is
+  # present, and whether its mount is read-only.
+  if vm_exec 'test -r /home/wpuser/wp/secrets/smtp.php'; then
+    _pass "SMTP relay is configured"
+
+    # 0400 owned by uid 33: readable by the PHP worker, nothing else.
+    vm_exec "stat -c '%a %u' /home/wpuser/wp/secrets/smtp.php 2>/dev/null"
+    case "$VM_OUT" in
+      400\ 33*) _pass "Credential file is 0400, owned by uid 33" ;;
+      *)        _fail "Credential file mode/owner" \
+                      "got '${VM_OUT}', expected '400 33' — the relay password may be readable by other accounts on this VM" ;;
+    esac
+
+    # A secret under the docroot becomes HTTP-readable the moment PHP
+    # execution breaks, which is exactly when nobody is watching.
+    assert_rc0 "credential file is outside the web root" \
+               '! test -e /home/wpuser/wp/html/smtp.php && ! test -e /home/wpuser/wp/html/wp-content/smtp.php'
+
+    assert_rc0 "SMTP mu-plugin is installed" \
+               'test -r /home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php'
+
+    # Read-only mount: a compromised PHP process must not be able to rewrite
+    # the relay config to point at a server it controls.
+    vm_exec "podman inspect wordpress --format '{{range .Mounts}}{{.Destination}}={{.RW}} {{end}}' 2>/dev/null | tr ' ' '\\n' | grep /var/www/private"
+    case "$VM_OUT" in
+      *=false*) _pass "Credential mount is read-only inside the container" ;;
+      *=true*)  _fail "Credential mount is writable inside the container" "expected :ro" ;;
+      *)        _skip "Credential mount state" "could not determine it from podman inspect" ;;
+    esac
+
+    # The throttle is what bounds reputational damage to the sending domain
+    # if these credentials are ever used to send spam.
+    assert_rc0 "outbound SMTP rate limit is in the live ruleset" \
+               'nft list ruleset 2>/dev/null | grep -q nft-smtp-ratelimit'
+  else
+    _skip "Outbound email" "no SMTP relay configured — WordPress cannot send mail, so password resets and notifications fail silently. Configure with: wp-mail.sh setup"
+  fi
+
   section "9. wpadmin SSH + doas elevation (real path)"
   command -v ssh >/dev/null 2>&1 || { _skip "ssh doas elevation" "no ssh client on the host"; return; }
   # v2 (ChatGPT harness finding 14): validate the key file before use.
