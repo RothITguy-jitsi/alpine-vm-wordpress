@@ -121,10 +121,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /tmp/build && tar xzf /tmp/mod_maxminddb.tar.gz -C /tmp/build --strip-components=1 \
     && cd /tmp/build && ./configure --with-apxs=/usr/bin/apxs && make \
     && find /tmp/build -name 'mod_maxminddb.so' -exec cp {} /tmp/mod_maxminddb.so \; \
-    && test -s /tmp/mod_maxminddb.so || { echo "FATAL: mod_maxminddb.so not found anywhere under /tmp/build after make — the mod_maxminddb build layout may have changed upstream" >&2; exit 1; }
+    && test -s /tmp/mod_maxminddb.so || { echo "FATAL: mod_maxminddb.so not found anywhere under /tmp/build after make — the mod_maxminddb build layout may have changed upstream" >&2; exit 1; } \
+    && mkdir -p /tmp/deps \
+    && find /usr/lib -name 'libmaxminddb.so.0*' -exec cp -L {} /tmp/deps/ \; \
+    && ls /tmp/deps/libmaxminddb.so.0 >/dev/null 2>&1 || { echo 'FATAL: libmaxminddb.so.0 not found in the builder - it must be carried into the final image or Apache cannot load the module' >&2; exit 1; }
 
 FROM ${CURRENT_WP_IMAGE}
 COPY --from=builder /tmp/mod_maxminddb.so /etc/apache2/maxminddb-module/mod_maxminddb.so
+# ROOT-CAUSE FIX (found in a real deployment): mod_maxminddb.so is linked
+# against libmaxminddb (see '-lmaxminddb' in the build output). The builder
+# stage gets libmaxminddb0 as a dependency of libmaxminddb-dev, but THIS
+# stage starts fresh from the base WordPress image, which does not ship it.
+# Copying only the module produced a .so with an unsatisfiable runtime
+# dependency: Apache's LoadModule dlopen() failed with
+# "libmaxminddb.so.0: cannot open shared object file", Apache refused to
+# start, and the container exited instantly -- after the working container
+# had already been destroyed. The build itself SUCCEEDED, which is what
+# made this so quiet. /usr/local/lib is on Debian's default ld.so search
+# path, so ldconfig is all that is needed to make it resolvable.
+COPY --from=builder /tmp/deps/ /usr/local/lib/
+# Fail the BUILD rather than the site if anything is still unresolved --
+# the check whose absence let a structurally broken image reach production.
+RUN ldconfig && if ldd /etc/apache2/maxminddb-module/mod_maxminddb.so | grep 'not found'; then echo 'FATAL: mod_maxminddb.so has unresolved shared library dependencies - loading it would make Apache refuse to start' >&2; exit 1; fi
 CONTAINERFILE
 
 echo "Building ${GEOIP_IMG_TAG} — using --network host (the wp-front/wp-db-only nftables"
@@ -206,7 +224,51 @@ echo "geoip.conf written (${GEOIP_MODE}: ${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST})"
 
 WEB_CHECK_PORT=80
 
+# REGRESSION FIX: this block rebuilds the container from scratch, so it must
+# use the SAME wp-config extras and extra mounts stage 06 used -- otherwise
+# enabling GeoIP silently strips the site address (WP_HOME/WP_SITEURL, the
+# reverse-proxy scheme handling) and the SMTP credential mount, turning off
+# outbound mail with no error anywhere. Sourced rather than re-derived so
+# there is exactly one definition of them.
+WP_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);'
+WP_EXTRA_VOLS=""
+if [ -r /etc/wp-install/wp-run-extra.env ]; then
+  . /etc/wp-install/wp-run-extra.env
+  echo "Reusing wp-config extras and extra mounts recorded at install time"
+else
+  echo "WARNING: /etc/wp-install/wp-run-extra.env missing — falling back to base"
+  echo "  wp-config extras. If a site domain or SMTP relay was configured, they"
+  echo "  will NOT survive this rebuild. Re-run install or re-add them by hand."
+fi
+
 echo "Recreating WordPress container with GeoIP module + database mounted…"
+# SYSTEMIC FIX: the next line destroys the running WordPress container. If
+# the freshly built image cannot start, the working site is already gone --
+# exactly what happened in the field. Every other risky swap in this project
+# validates a candidate before cutting over (update.sh's loopback-candidate
+# pattern); this one did not. Prove the image can load its modules and parse
+# its config first, with Apache's own configtest, in a throwaway container
+# that touches nothing.
+echo "Smoke-testing the new image before touching the running container..."
+_SMOKE=$(podman run --rm \
+  -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
+  --entrypoint apache2ctl "${GEOIP_IMG_TAG}" configtest 2>&1) || true
+case "$_SMOKE" in
+  *"Syntax OK"*)
+    echo "Smoke test passed - Apache loads mod_maxminddb in the new image" ;;
+  *)
+    echo "FATAL: the new GeoIP image fails Apache's own config test, so it would"
+    echo "  exit immediately on start. The RUNNING WordPress container has NOT"
+    echo "  been touched - the site is still up and still serving."
+    echo ""
+    echo "  apache2ctl configtest said:"
+    printf '    %s\n' "$_SMOKE"
+    echo ""
+    echo "  Nothing was changed. Fix the build issue, then re-run:"
+    echo "    /usr/local/bin/wp-geoip-setup.sh"
+    exit 1 ;;
+esac
+
 podman rm -f wordpress >/dev/null 2>&1 || true
 podman run -d \
   --name wordpress --network wp-front --ip 10.89.10.3 -p 80:80 --restart always \
@@ -220,7 +282,8 @@ podman run -d \
   --env-file /etc/wordpress/env \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
-  -e WORDPRESS_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);' \
+  -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
+  ${WP_EXTRA_VOLS} \
   -v /home/wpuser/wp/html:/var/www/html \
   -v /home/wpuser/wp/logs:/var/log/apache2 \
   -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
@@ -260,7 +323,34 @@ done
 if [ "$GEOIP_WP_READY" = "1" ]; then
   echo "WordPress responding and healthy with GeoIP active"
 else
-  echo "WARNING: WordPress did not pass full health validation with GeoIP active — check: podman logs wordpress"
+  # REGRESSION FIX (found in a real deployment): this used to print a warning
+  # and then fall through to a normal exit 0. The caller in stage 06 tests
+  # this script's exit status, so a zero here made the installer report
+  # "GeoIP filtering active" while the container it had just rebuilt was
+  # exiting on startup and mod_maxminddb was not loaded at all -- the site
+  # was down and the install still declared success. A rebuild that leaves
+  # WordPress unhealthy is a failure and now exits non-zero to say so.
+  #
+  # No automatic rollback to the pre-GeoIP container: reconstructing that
+  # run command here is exactly the duplication that caused the config-drift
+  # bug fixed above, and getting it subtly wrong would swap one broken
+  # container for a differently broken one. The operator gets the state and
+  # the commands instead.
+  echo "ERROR: WordPress did not pass health validation after the GeoIP rebuild."
+  echo "  The site is very likely DOWN right now. Most common cause is that"
+  echo "  Apache cannot load mod_maxminddb, which makes it refuse to start."
+  echo ""
+  echo "  Diagnose:  podman logs --tail 50 wordpress"
+  echo "             podman exec wordpress apache2ctl -M 2>&1 | grep -i maxmind"
+  echo "             tail -40 /var/log/wp-geoip.log"
+  echo ""
+  echo "  Recover without GeoIP (restores a working site):"
+  echo "             sed -i 's/^GEOIP_ENABLED=.*/GEOIP_ENABLED=0/' /etc/wp-install/vars.sh"
+  echo "             rc-service wp-container restart"
+  echo ""
+  echo "  Then re-enable once the build issue is understood:"
+  echo "             /usr/local/bin/wp-geoip-setup.sh"
+  exit 1
 fi
 
 grep -q "GeoLite2-Country database refresh" /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root << GEOCRON
