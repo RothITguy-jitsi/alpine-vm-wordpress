@@ -395,4 +395,3 @@ if [ "${GEOIP_ENABLED:-0}" = "1" ] && [ -n "${MAXMIND_ACCOUNT_ID}" ] && [ -n "${
 elif [ "${GEOIP_ENABLED:-0}" = "1" ]; then
   warn "GeoIP was enabled but MaxMind credentials are missing — skipping GeoIP setup"
 fi
-
