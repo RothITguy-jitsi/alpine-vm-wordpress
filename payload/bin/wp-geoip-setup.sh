@@ -213,10 +213,40 @@ cat > /home/wpuser/wp/apache-conf/geoip.conf << GEOIPCONF
     MaxMindDBEnv MM_COUNTRY_CODE COUNTRY_DB/country/iso_code
 
     ${GEOIP_SETENV_LINE}
-    <RequireAll>
-        Require env MM_COUNTRY_CODE
+
+    # FIX 1: <RequireAll> is an authorization container and Apache only
+    # permits it in DIRECTORY context (<Directory>, <Location>, <Files>,
+    # .htaccess). This file is dropped into conf-enabled/, which is SERVER
+    # context, so an unwrapped <RequireAll> here is rejected outright with
+    # "AH00526: <RequireAll not allowed here" and Apache refuses to start --
+    # taking the whole site down, not just country filtering. <Location />
+    # is the correct wrapper for a site-wide rule: it is valid context and
+    # it matches every URL, including ones with no filesystem mapping.
+    <Location />
+        <RequireAny>
+            # FIX 2: private and loopback addresses have NO country in the
+            # GeoLite2 database, so they can never satisfy the country test
+            # below. Without these exemptions a whitelist install 403s:
+            #   - the in-container health check (127.0.0.1), so the install
+            #     can never see WordPress as healthy;
+            #   - the operator's own LAN access to wp-admin;
+            #   - anything else reaching the site from an RFC1918 address.
+            # This does not weaken the filter for real visitors: when a
+            # reverse proxy is in front, mod_remoteip has already replaced
+            # the connection address with the real client IP from
+            # X-Forwarded-For before authorization runs, so a remote visitor
+            # is still matched on their own address, not the proxy's.
+            Require ip 127.0.0.1
+            Require ip ::1
+            Require ip 10.0.0.0/8
+            Require ip 172.16.0.0/12
+            Require ip 192.168.0.0/16
+            <RequireAll>
+                Require env MM_COUNTRY_CODE
 ${GEOIP_REQUIRE_LINE}
-    </RequireAll>
+            </RequireAll>
+        </RequireAny>
+    </Location>
 </IfModule>
 GEOIPCONF
 chmod 644 /home/wpuser/wp/apache-conf/geoip.conf
@@ -250,8 +280,16 @@ echo "Recreating WordPress container with GeoIP module + database mounted…"
 # its config first, with Apache's own configtest, in a throwaway container
 # that touches nothing.
 echo "Smoke-testing the new image before touching the running container..."
+# The smoke test must mount EVERY file the real container will mount, or it
+# validates something the real container never runs. Mounting only
+# maxminddb.load is what let a syntactically invalid geoip.conf through: the
+# module loaded fine, configtest said Syntax OK, and then the production
+# container failed on the config file the test never saw.
 _SMOKE=$(podman run --rm \
   -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
+  -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \
+  -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
+  -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \
   --entrypoint apache2ctl "${GEOIP_IMG_TAG}" configtest 2>&1) || true
 case "$_SMOKE" in
   *"Syntax OK"*)

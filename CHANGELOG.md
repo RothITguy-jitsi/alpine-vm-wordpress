@@ -6,6 +6,52 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — GeoIP config context + local-address exemption
+
+The libmaxminddb fix worked: the build's new `ldd` gate passed, the module
+loaded, and Apache got past `LoadModule`. It then failed on the next thing:
+
+```
+AH00526: Syntax error on line 10 of /etc/apache2/conf-enabled/geoip.conf:
+<RequireAll not allowed here
+```
+
+**Two bugs, the second of which would have surfaced the moment the first was
+fixed.**
+
+1. **`<RequireAll>` in the wrong context.** It is an authorization container
+   and Apache permits it only in *directory* context (`<Directory>`,
+   `<Location>`, `<Files>`, `.htaccess`). `geoip.conf` is written into
+   `conf-enabled/`, which is *server* context, so Apache rejected it and
+   refused to start — taking the whole site down, not merely disabling
+   country filtering. Now wrapped in `<Location />`, which is valid context
+   and matches every URL including ones with no filesystem mapping.
+
+2. **Private and loopback addresses have no country.** GeoLite2 has no entry
+   for RFC1918 or `127.0.0.1`, so `Require env MM_COUNTRY_CODE` can never
+   succeed for them. With `whitelist: US` that meant the in-container health
+   check (127.0.0.1) would 403 forever — the install could never see
+   WordPress as healthy — **and the operator's own LAN access to wp-admin
+   would have been blocked**. Local and RFC1918 ranges are now exempted via
+   `<RequireAny>`. This does not weaken filtering for real visitors: where a
+   reverse proxy is in front, `mod_remoteip` has already substituted the real
+   client address from `X-Forwarded-For` before authorization runs.
+
+**Why the smoke test added last round did not catch this.** It mounted only
+`maxminddb.load` — so it validated that the *module* loads, and reported
+"Syntax OK", while the file that was actually broken was never mounted. A
+smoke test that does not mount what the real container mounts is testing a
+different container. It now mounts `geoip.conf`, `wp-security.conf` and the
+GeoIP database directory as well.
+
+**Check added:** an Apache container-nesting validator that renders
+`geoip.conf` for both whitelist and blocklist modes and fails if
+`<RequireAll>`/`<RequireAny>` appears outside directory context, or if any
+container is unbalanced. Verified against the original broken form — it flags
+it correctly.
+
+---
+
 ## Unreleased — REGRESSION FIX 2: broke the WordPress run command
 
 The GeoIP fix from the previous round shipped with a bug of mine that stopped
