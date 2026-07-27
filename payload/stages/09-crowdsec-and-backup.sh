@@ -95,9 +95,32 @@ sed "s|__BOUNCER_KEY__|${BOUNCER_KEY}|g" \
     && ok "cs-firewall-bouncer service running" \
     || warn "cs-firewall-bouncer still not started after retries — run: rc-service cs-firewall-bouncer restart"
   sleep 2
+  BOUNCER_REGISTERED=0
   PRUN exec crowdsec cscli bouncers list 2>/dev/null | grep -q firewall-bouncer \
-    && ok "Bouncer connected to LAPI" \
+    && { BOUNCER_REGISTERED=1; ok "Bouncer connected to LAPI"; } \
     || warn "Bouncer not yet showing — check rc-service cs-firewall-bouncer status"
+else
+  BOUNCER_UP=0
+  BOUNCER_REGISTERED=0
+fi
+
+# FORENSIC FIX (new-audit High finding, confirmed accurate): this used to
+# only ever `warn` when the bouncer never came up or never registered —
+# unlike the Alpine-image and digest-pinning checks elsewhere in this
+# install, which both fail closed under DEPLOYMENT_PROFILE=production.
+# CrowdSec's engine only DETECTS and decides bans; the bouncer is what
+# actually ENFORCES them via nftables. A "successful" install with the
+# engine up but no working bouncer silently downgrades the whole layer to
+# detection-only — decisions get made, nothing blocks them — which is a
+# materially different security posture than what production mode
+# promises. Standard mode keeps the original warn-and-continue (a
+# transient LAPI-registration hiccup shouldn't brick a homelab install);
+# production mode now matches the fail-closed pattern used everywhere else
+# in this codebase for the same class of "did the thing we just installed
+# actually come up" question.
+if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ] \
+   && { [ "$BOUNCER_UP" != "1" ] || [ "$BOUNCER_REGISTERED" != "1" ]; }; then
+  err "cs-firewall-bouncer is not running and registered with CrowdSec's LAPI — refusing to continue under DEPLOYMENT_PROFILE=production, since CrowdSec would be detecting bans without enforcing any of them. Check: podman logs crowdsec ; rc-service cs-firewall-bouncer status. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install."
 fi
 
 install -m 0755 "${PAYLOAD_DIR}/init.d/crowdsec-container" /etc/init.d/crowdsec-container
