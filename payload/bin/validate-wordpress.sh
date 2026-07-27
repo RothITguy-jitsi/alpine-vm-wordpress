@@ -24,6 +24,7 @@
 #   validate-wordpress.sh --list           show section names
 #   validate-wordpress.sh --quiet          only output failures/warnings
 #   validate-wordpress.sh --quick          skip slow checks (network, backups)
+#   validate-wordpress.sh --send-test-mail <addr>   also deliver a real test email
 #
 # Exit: 0 = all passed, 1 = one or more failures, 2 = warnings only
 # ============================================================================
@@ -55,15 +56,17 @@ fi
 
 QUIET=0
 QUICK=0
+SEND_TEST_MAIL=""
 ONLY=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --quiet|-q)   QUIET=1 ;;
     --quick)      QUICK=1 ;;
+    --send-test-mail) SEND_TEST_MAIL="${2:-}"; shift ;;
     --section|-s) shift; ONLY="$1" ;;
     --list|-l)
-      echo "Sections: containers database web security updates logs backups"
+      echo "Sections: containers database web security updates logs backups mail"
       exit 0 ;;
     --help|-h)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
@@ -648,6 +651,84 @@ fi
 fi
 
 # ── BACKUPS ────────────────────────────────────────────────────────────────
+if want_section mail; then
+note() { printf "     %s\n" "$1"; }
+section mail "Outbound email"
+
+# Config and wiring checks run every time -- they are free and catch the
+# failure modes that matter. A LIVE send is opt-in via --send-test-mail
+# because it leaves this VM and lands in a real mailbox: a validation command
+# someone runs repeatedly should not mail a person each time.
+SMTP_FILE=/home/wpuser/wp/secrets/smtp.php
+MU_SMTP=/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php
+if [ -r "$SMTP_FILE" ]; then
+  pass "SMTP relay is configured"
+
+  _pm=$(stat -c '%a %u' "$SMTP_FILE" 2>/dev/null)
+  case "$_pm" in
+    "400 33") pass "Credential file is 0400, owned by uid 33" ;;
+    *) fail "Credential file is '${_pm}', expected '400 33'" \
+            "The relay password may be readable by other accounts on this VM." \
+            "chmod 400 ${SMTP_FILE} ; chown 33:33 ${SMTP_FILE}" ;;
+  esac
+
+  if [ -e /home/wpuser/wp/html/smtp.php ]; then
+    fail "A copy of smtp.php exists inside the web root" \
+         "A secret under the docroot is HTTP-readable the moment PHP execution breaks." \
+         "rm -f /home/wpuser/wp/html/smtp.php"
+  else
+    pass "Credential file is outside the web root"
+  fi
+
+  if [ -r "$MU_SMTP" ]; then
+    pass "SMTP mu-plugin is installed"
+  else
+    fail "SMTP mu-plugin is missing" \
+         "wp_mail() falls back to PHP mail(), which has no sendmail in this image, so every message fails SILENTLY." \
+         "install -m 0644 -o 33 -g 33 /etc/wp-install/payload/mu-plugins/01-wpvm-smtp.php ${MU_SMTP}"
+  fi
+
+  _mnt=$(podman inspect wordpress --format '{{range .Mounts}}{{.Destination}}={{.RW}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep /var/www/private)
+  case "$_mnt" in
+    *=false) pass "Credential mount is read-only in the container" ;;
+    *=true)  fail "Credential mount is WRITABLE in the container" \
+                  "A compromised PHP process could repoint the relay at a server it controls." \
+                  "Recreate the container with :ro on the /var/www/private mount" ;;
+    *)       warn "Credential mount not found on the wordpress container" \
+                  "wp_mail() cannot read the relay settings, so mail will fail." \
+                  "rc-service wp-container restart" ;;
+  esac
+
+  if nft list ruleset 2>/dev/null | grep -q nft-smtp-ratelimit; then
+    pass "Outbound SMTP rate limit is in the live ruleset"
+  else
+    warn "Outbound SMTP rate limit is not in the live ruleset" \
+         "A compromised site could send unbounded mail through your relay, harming the sending domain's reputation." \
+         "rc-service nftables restart"
+  fi
+
+  if [ "$SEND_TEST_MAIL" != "" ]; then
+    # The live check goes through wp_mail() itself, which is what every plugin
+    # and core feature calls -- testing the relay any other way would prove the
+    # relay works while saying nothing about whether WordPress can use it.
+    if /usr/local/bin/wp-mail.sh test "$SEND_TEST_MAIL" >/dev/null 2>&1; then
+      pass "Live test message accepted by the relay (sent to ${SEND_TEST_MAIL})"
+    else
+      fail "Live test message was NOT accepted by the relay" \
+           "Credentials, TLS, DNS or reachability. Delivery beyond the relay is a separate question (SPF/DKIM)." \
+           "wp-mail.sh doctor ; wp-mail.sh test ${SEND_TEST_MAIL}"
+    fi
+  else
+    note "Live send not attempted — add --send-test-mail <addr> to actually deliver one"
+  fi
+else
+  warn "No SMTP relay configured — WordPress cannot send mail" \
+       "Password resets, new-user notices and WooCommerce receipts fail SILENTLY: the UI reports success and nothing is logged." \
+       "wp-mail.sh setup"
+fi
+
+fi
+
 if want_section backups; then
 section backups "Backups"
 

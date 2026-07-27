@@ -6,6 +6,34 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Smoke test mount parity, mail validation, plugin CVE answer
+
+**The health check passes.** `HTTP response: 302`, `ALL CRITICAL CHECKS
+PASSED`. The User-Agent root cause is closed.
+
+**The smoke test did its job.** It rejected a bad GeoIP image and left the
+running container untouched -- "the site is still up and still serving" --
+which is exactly the systemic gap it was added to close.
+
+**But the failure it reported was its own.** `Invalid command 'Header'` is
+mod_headers not being enabled, because the smoke test mounted
+`wp-security.conf` without `headers.load`. The comment above that block said
+the test "must mount EVERY file the real container will mount", and then
+hand-maintained a second list anyway -- twice now (first geoip.conf, then
+headers.load). Fixed structurally: one `GEOIP_VOL_ARGS` list is built once
+and used by both the smoke test and the real run, including the conditional
+`remoteip.conf`, so they cannot drift.
+
+**New: `validate-wordpress.sh` mail section.** Runs on every validation:
+relay configured, credential file `0400`/uid 33, file outside the docroot,
+mu-plugin present, mount read-only, firewall rate limit live. A real delivery
+is opt-in via `--send-test-mail <addr>` -- a command people run repeatedly
+should not mail a person every time -- and it goes through `wp_mail()`
+itself, since testing the relay another way proves the relay works while
+saying nothing about whether WordPress can use it.
+
+---
+
 ## Unreleased — REGRESSION FIX 3: an apostrophe broke the health check
 
 The User-Agent fix was correct; the comment I wrote explaining it was not.

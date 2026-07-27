@@ -280,16 +280,31 @@ echo "Recreating WordPress container with GeoIP module + database mounted…"
 # its config first, with Apache's own configtest, in a throwaway container
 # that touches nothing.
 echo "Smoke-testing the new image before touching the running container..."
-# The smoke test must mount EVERY file the real container will mount, or it
-# validates something the real container never runs. Mounting only
-# maxminddb.load is what let a syntactically invalid geoip.conf through: the
-# module loaded fine, configtest said Syntax OK, and then the production
-# container failed on the config file the test never saw.
-_SMOKE=$(podman run --rm \
-  -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
-  -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \
-  -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
-  -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \
+# The smoke test must mount EVERY file the real container mounts, or it
+# validates a container that does not exist. Maintaining a second hand-written
+# list is how that goes wrong: the first version mounted only maxminddb.load
+# and passed an invalid geoip.conf; the second added geoip.conf and
+# wp-security.conf but omitted headers.load, so configtest failed on
+# "Invalid command 'Header'" -- a mod_headers directive with the module not
+# enabled. Both were faults in the TEST, not the image.
+#
+# So the list is built once, here, and used for both the smoke test and the
+# real run below. Optional files are added only when present, exactly as the
+# real run does.
+GEOIP_VOL_ARGS="-v /home/wpuser/wp/html:/var/www/html"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/logs:/var/log/apache2"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw"
+GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro"
+# mod_remoteip config is only present when a reverse proxy was configured.
+[ -f /home/wpuser/wp/apache-mods/remoteip.conf ] && \
+  GEOIP_VOL_ARGS="${GEOIP_VOL_ARGS} -v /home/wpuser/wp/apache-mods/remoteip.conf:/etc/apache2/mods-enabled/remoteip.conf:ro"
+
+_SMOKE=$(podman run --rm ${GEOIP_VOL_ARGS} ${WP_EXTRA_VOLS} \
   --entrypoint apache2ctl "${GEOIP_IMG_TAG}" configtest 2>&1) || true
 case "$_SMOKE" in
   *"Syntax OK"*)
@@ -322,15 +337,7 @@ podman run -d \
   -e WORDPRESS_DEBUG="" \
   -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
   ${WP_EXTRA_VOLS} \
-  -v /home/wpuser/wp/html:/var/www/html \
-  -v /home/wpuser/wp/logs:/var/log/apache2 \
-  -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
-  -v /home/wpuser/wp/apache-conf/geoip.conf:/etc/apache2/conf-enabled/geoip.conf:ro \
-  -v /home/wpuser/wp/php-conf/security.ini:/usr/local/etc/php/conf.d/wp-security.ini:ro \
-  -v /home/wpuser/wp/apache-mods/headers.load:/etc/apache2/mods-enabled/headers.load:ro \
-  -v /home/wpuser/wp/apache-mods/maxminddb.load:/etc/apache2/mods-enabled/maxminddb.load:ro \
-  -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw \
-  -v /home/wpuser/wp/geoip-db:/usr/share/GeoIP:ro \
+  ${GEOIP_VOL_ARGS} \
   "${GEOIP_IMG_TAG}"
 podman network connect --ip 10.89.20.3 wp-db wordpress
 sed -i "s|WP_IMAGE=.*|WP_IMAGE=\"${GEOIP_IMG_TAG}\"|" /etc/init.d/wp-container 2>/dev/null || true
