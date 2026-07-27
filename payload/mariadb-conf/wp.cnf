@@ -9,6 +9,14 @@ innodb_buffer_pool_size        = 256M
 # innodb_log_file_size is the correct MariaDB variable (innodb_redo_log_capacity
 # is MySQL 8.0.30+ syntax and does NOT exist in MariaDB — using it crashes mariadbd)
 innodb_log_file_size           = 64M
+# FORENSIC NOTE (new-audit Medium finding): =2 fsyncs once per second rather
+# than on every commit (=1, the fully-durable default) — on an unclean
+# power loss, up to ~1s of the most recent commits could be lost, in
+# exchange for meaningfully better write throughput on a small shared VM.
+# Deliberate for this project's target (a single self-hosted WordPress
+# site, not a transactional system where that window is unacceptable). If
+# your compliance/durability requirements don't allow any loss window, set
+# this to 1 and expect a write-latency cost.
 innodb_flush_log_at_trx_commit = 2
 # Suppress io_uring probe: MariaDB 11.x tries io_uring first, falls back to
 # libaio when blocked by seccomp (our --cap-drop ALL). The fallback works fine
