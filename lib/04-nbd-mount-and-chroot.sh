@@ -6,6 +6,25 @@
 # that install.sh and earlier lib files set up.
 
 
+# ── Stage the in-VM installer into TMPDIR ─────────────────────────────────────
+# In the pre-split monolith this file was GENERATED here, by a ~5,880-line
+# quoted heredoc. It's now a real file in payload/, so it's copied instead.
+#
+# REGRESSION FIX: this copy went missing in the monolith->repo split and
+# broke the installer outright ("chmod: cannot access
+# '/tmp/tmp.XXXX/install-wordpress.sh'"). The heredoc's opening line fell in
+# the gap between the last line of lib/03 and the first line of lib/04, and
+# the split tooling only emitted a replacement when it encountered the
+# opener *inside* a file's line range -- so the replacement was dropped
+# silently while the chmod immediately below it, which had been on the far
+# side of the heredoc, survived and pointed at a file nothing created.
+# The verification at the time proved no original line was LOST; it never
+# checked that every intended REPLACEMENT was actually PRESENT. See
+# CHANGELOG for the check added to close that asymmetry.
+[[ -r "${REPO_DIR}/payload/install-wordpress.sh" ]] \
+  || msg_error "payload/install-wordpress.sh not found under ${REPO_DIR} — incomplete checkout or failed self-bootstrap."
+cp "${REPO_DIR}/payload/install-wordpress.sh" "${TMPDIR}/install-wordpress.sh"
+
 chmod +x "${TMPDIR}/install-wordpress.sh"
 INST_LINES=$(wc -l < "${TMPDIR}/install-wordpress.sh")
 (( INST_LINES > 100 )) || msg_error "Installer truncated (${INST_LINES} lines)"
