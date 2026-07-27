@@ -124,7 +124,12 @@ echo   "  ╠══════════════════════�
 if [[ "${ADMIN_USER_CREATED:-0}" -eq 1 ]]; then
   _SSH_DESC="${ADMIN_USER} — $([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password'), root SSH disabled"
 else
-  _SSH_DESC="FALLBACK: root SSH ($([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')) — admin account failed"
+  _SSH_DESC="NO SSH LOGIN — root SSH stays disabled, use: qm terminal ${VMID}"
+fi
+if [[ -n "${WP_DOMAIN:-}" ]]; then
+  printf "  ║  Site URL :  %-47s║\n" "${WP_SCHEME}://${WP_DOMAIN}"
+else
+  printf "  ║  Site URL :  %-47s║\n" "http://<vm-ip>/  (no domain configured)"
 fi
 printf "  ║  SSH      :  %-47s║\n" "$_SSH_DESC"
 [[ "${ADMIN_USER_CREATED:-0}" -eq 0 ]] && printf "  ║  ${RD}⚠ Admin account was NOT created — see install log, create by hand${CL}  ║\n"
@@ -163,4 +168,3 @@ echo   "  ╠══════════════════════�
 echo   "  ╚══════════════════════════════════════════════════════════════╝"
 printf "${CL}"
 echo ""
-
