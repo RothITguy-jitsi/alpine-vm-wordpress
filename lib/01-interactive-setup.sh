@@ -246,6 +246,103 @@ echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the prox
 echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache trusts${CL}"
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
+
+# ── WordPress site identity (NEW) ─────────────────────────────────────────────
+# Why this is asked at install time rather than left to the browser wizard:
+# WordPress stores its canonical URL in the DATABASE (wp_options.siteurl and
+# .home) the moment you first complete setup. If that first visit is to the
+# VM's raw IP, the IP becomes the site's identity -- baked into permalinks,
+# emails, password-reset links, and (worst) into serialized PHP arrays in
+# plugin/theme options, where a naive SQL find-and-replace corrupts the data
+# because it doesn't fix the embedded string lengths. Moving to the real
+# domain afterwards then needs wp-cli search-replace or a migration plugin.
+#
+# Setting WP_HOME/WP_SITEURL as constants avoids the whole problem: constants
+# take precedence over the database values, so the site is born knowing its
+# own name and the DB copy never matters. It also makes the URL a
+# config-file change (one restart) rather than a database migration if the
+# domain ever moves.
+echo ""
+echo -e "  ${BLD}WordPress site address${CL}"
+echo -e "  ${YW}The domain this site will actually be served on. Set it now and${CL}"
+echo -e "  ${YW}WordPress is configured with it from first boot -- no browser setup${CL}"
+echo -e "  ${YW}wizard writing the VM's IP into the database as the permanent site${CL}"
+echo -e "  ${YW}URL, and no search-replace migration later to undo that.${CL}"
+echo -e "  ${YW}Leave blank to use the VM's IP address (fine for a lab/test VM).${CL}"
+WP_DOMAIN=""
+while :; do
+  read -rp "  Site domain (e.g. example.com, blank = use IP) : " _WPD
+  # Trim leading/trailing whitespace only -- deliberately NOT `tr -d` on all
+  # whitespace, which would silently turn a fat-fingered "exa mple.com" into
+  # the valid-but-different "example.com" and deploy the site under a domain
+  # the operator never typed. Internal whitespace fails the pattern below
+  # and gets a re-prompt, which is the correct outcome for a typo.
+  _WPD=$(printf '%s' "${_WPD}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+  # Strip anything the operator pasted that isn't the hostname itself --
+  # a scheme, a trailing slash, or a path. Asking for "just the domain"
+  # and then silently accepting "https://example.com/" would produce
+  # "https://https://example.com//" in the constants below.
+  _WPD=${_WPD#http://}; _WPD=${_WPD#https://}; _WPD=${_WPD%%/*}
+  [ -z "$_WPD" ] && { msg_info "No domain set — WordPress will use the VM's IP address."; break; }
+  # RFC 1123 hostname: labels of alphanumerics and hyphens, not starting or
+  # ending with a hyphen, at least one dot (a bare label like "wordpress"
+  # is a valid hostname but never a usable public site address, and is far
+  # more likely to be a typo than intent).
+  if printf '%s' "$_WPD" | grep -qE '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+    WP_DOMAIN="$_WPD"; msg_ok "Site domain: ${WP_DOMAIN}"; break
+  fi
+  msg_warn "  '${_WPD}' doesn't look like a domain name (expected something like example.com)."
+done
+unset _WPD
+
+WP_SCHEME="http"
+if [[ -n "$WP_DOMAIN" ]]; then
+  # Default to https when a reverse proxy was configured, since that's the
+  # overwhelmingly common arrangement (NPM/Caddy/nginx terminating TLS and
+  # forwarding plain HTTP inward) and getting it wrong causes either mixed
+  # content or a redirect loop. Direct-access installs default to http
+  # because nothing in this VM terminates TLS on its own.
+  if [[ -n "$PROXY_IP" ]]; then
+    echo -e "  ${YW}A reverse proxy is configured, so TLS is presumably terminated there${CL}"
+    echo -e "  ${YW}and visitors reach the site over https.${CL}"
+    read -rp "  Site scheme? [https/http] (default: https) : " _WPS
+    case "${_WPS:-https}" in http|HTTP) WP_SCHEME="http" ;; *) WP_SCHEME="https" ;; esac
+  else
+    echo -e "  ${YW}No reverse proxy was configured. Nothing in this VM terminates TLS,${CL}"
+    echo -e "  ${YW}so choose https only if something in front of it will.${CL}"
+    read -rp "  Site scheme? [http/https] (default: http) : " _WPS
+    case "${_WPS:-http}" in https|HTTPS) WP_SCHEME="https" ;; *) WP_SCHEME="http" ;; esac
+  fi
+  unset _WPS
+  msg_ok "Site address: ${WP_SCHEME}://${WP_DOMAIN}"
+  if [[ "$WP_SCHEME" = "https" && -z "$PROXY_IP" ]]; then
+    msg_warn "  https with no reverse proxy IP set: WordPress will build https:// URLs,"
+    msg_warn "  but this VM only serves plain HTTP on port 80. Make sure whatever"
+    msg_warn "  fronts it terminates TLS, or the site will not load correctly."
+  fi
+fi
+
+# Site title and admin email are cosmetic-but-annoying-to-change-later
+# details that the browser wizard would otherwise ask for. Collected here
+# only when a domain was given, since an IP-addressed lab VM is usually
+# throwaway and doesn't benefit from the extra prompts.
+WP_SITE_TITLE=""
+WP_ADMIN_EMAIL=""
+if [[ -n "$WP_DOMAIN" ]]; then
+  read -rp "  Site title [${WP_DOMAIN}] : " WP_SITE_TITLE
+  WP_SITE_TITLE="${WP_SITE_TITLE:-$WP_DOMAIN}"
+  while :; do
+    read -rp "  Admin email for WordPress (recovery/notifications, blank = skip) : " WP_ADMIN_EMAIL
+    [ -z "$WP_ADMIN_EMAIL" ] && break
+    # Deliberately permissive: enough to catch a typo like a missing @ or a
+    # stray space, without pretending to implement RFC 5322.
+    if printf '%s' "$WP_ADMIN_EMAIL" | grep -qE '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'; then
+      break
+    fi
+    msg_warn "  '${WP_ADMIN_EMAIL}' doesn't look like an email address."
+  done
+fi
+
 echo ""
 echo -e "  ${BLD}Security features${CL}"
 echo -e "  ${YW}Custom wp-admin slug: moves the login page to a secret URL and blocks${CL}"
@@ -389,6 +486,36 @@ if [ "$DEPLOYMENT_PROFILE" = "production" ]; then
     msg_warn "  Digest pinning was answered [n] but production profile requires it — enabling."
     USE_DIGEST_PINNING=1
   fi
+  # FORENSIC FIX (new-audit Medium finding, confirmed reasonable): the same
+  # logic applies to SSH. Root login is unconditionally disabled either
+  # way, but a production box with no admin SSH key falls back to
+  # password auth on that account -- exposed to credential stuffing and
+  # online guessing exactly where SSH_CIDR determines how broad that
+  # exposure is. Same pattern as digest pinning above: re-ask rather than
+  # silently degrade, since the operator already answered this before
+  # they'd chosen a profile.
+  if [ "$DISABLE_PW_AUTH" != "1" ]; then
+    msg_warn "  No SSH key was set, but production profile requires key-only SSH."
+    while [ "$DISABLE_PW_AUTH" != "1" ]; do
+      echo "  Paste your public key (starts with ssh-ed25519 or ssh-rsa),"
+      read -rp "  or a path to a .pub file (required for production) : " _PROD_KEY_INPUT
+      if [ -n "$_PROD_KEY_INPUT" ]; then
+        if [ -f "$_PROD_KEY_INPUT" ]; then
+          SSH_KEYS=$(cat "$_PROD_KEY_INPUT")
+        else
+          SSH_KEYS="$_PROD_KEY_INPUT"
+        fi
+      fi
+      if [ -n "$SSH_KEYS" ]; then
+        DISABLE_PW_AUTH=1
+        ADMIN_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 24)
+        msg_ok "  SSH key set — password login disabled for ${ADMIN_USER}."
+      else
+        msg_warn "  Still no key. Production profile can't proceed with password-only SSH."
+      fi
+    done
+  fi
+  unset _PROD_KEY_INPUT
 else
   msg_ok "Deployment profile: standard — verification failures will warn but not abort"
 fi
@@ -415,6 +542,7 @@ printf  "  %-18s Alpine %s (auto)\n"   "OS:"          "$ALPINE_VER"
 printf  "  %-18s %s\n"  "SSH:"         "${ADMIN_USER} — $([[ $DISABLE_PW_AUTH -eq 1 ]] && echo 'key-only' || echo 'password')  (root SSH disabled)"
 printf  "  %-18s nft SSH=%-15s  nft Web=%s\n"   "L1 Firewall:"  "${SSH_CIDR:-any}" "${WEB_CIDR:-any}"
 printf  "  %-18s admin-cidr=%-18s  allowed-ip=%s\n" "L2 wp-admin:" "${ADMIN_CIDR:-none}" "${ALLOWED_ADMIN_IP:-none}"
+printf  "  %-18s %s\n"  "Site address:" "$([[ -n "$WP_DOMAIN" ]] && echo "${WP_SCHEME}://${WP_DOMAIN}" || echo "(none — will use the VM IP)")"
 printf  "  %-18s %s\n"  "Proxy IP:"    "${PROXY_IP:-direct (no proxy)}"
 printf  "  %-18s %s\n"  "Admin slug:"  "${WP_ADMIN_SLUG:+/${WP_ADMIN_SLUG} (custom)}${WP_ADMIN_SLUG:-/wp-admin (default)}"
 printf  "  %-18s %s\n"  "CS enrolment:" "${CROWDSEC_ENROLL_KEY:+key provided (auto-enrol)}${CROWDSEC_ENROLL_KEY:-manual (after install)}"
@@ -427,5 +555,4 @@ printf  "  %-18s %s\n"  "Digest pinning:" "$([[ $USE_DIGEST_PINNING -eq 1 ]] && 
 echo ""
 read -rp "  Proceed? [Y/n] : " yn
 [[ "${yn:-Y}" =~ ^[Yy] ]] || { echo "Aborted."; _DESTROY_VM=0; exit 0; }
-
 
