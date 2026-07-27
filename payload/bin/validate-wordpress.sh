@@ -308,10 +308,10 @@ case "$code" in
             "Test from an allowed client IP. To inspect: tail -20 /home/wpuser/wp/logs/access.log" ;;
   "")  fail "No HTTP response on :80" \
             "Apache is not answering at all." \
-            "podman logs --tail 50 wordpress ; netstat -tlnp | grep ':80 '" ;;
+            "doas podman logs --tail 50 wordpress ; netstat -tlnp | grep ':80 '" ;;
   *)   fail "Unexpected HTTP ${code} on :80" \
             "A working WordPress front page returns 200, 301, or 302." \
-            "podman logs --tail 50 wordpress ; tail -30 /home/wpuser/wp/logs/error.log" ;;
+            "doas podman logs --tail 50 wordpress ; tail -30 /home/wpuser/wp/logs/error.log" ;;
 esac
 
 if [ "$(_running wordpress)" = "running" ]; then
@@ -320,7 +320,7 @@ if [ "$(_running wordpress)" = "running" ]; then
   else
     fail "PHP does not execute" \
          "The container is up but the PHP binary is not usable." \
-         "podman logs --tail 50 wordpress"
+         "doas podman logs --tail 50 wordpress"
   fi
 
   # Apache's own config parser is the authority on whether wp-security.conf
