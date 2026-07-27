@@ -1,3 +1,8 @@
+# FORENSIC FIX (new-audit Medium finding): wp-cron-run.sh and
+# wp-db-backup.sh below each now hold their own mkdir-based lock (matching
+# update.sh's existing convention) before doing anything state-changing,
+# so a slow run no longer overlaps with the next scheduled tick of itself.
+#
 # Weekly container image update check (Sunday 04:00 UTC — dry run only)
 0 4 * * 0 podman auto-update --dry-run 2>&1 | logger -t podman-autoupdate
 # WordPress system cron — replaces unreliable WP-Cron (which only fires on
@@ -14,3 +19,8 @@
 # wp-hardening.sh's UPLOADS_PHP_MARKER / check-expiry). Silent no-op unless
 # it's actually open past the limit, so this doesn't add routine noise.
 */15 * * * * /usr/local/bin/wp-hardening.sh check-expiry >/dev/null 2>&1
+# WordPress plugin/theme/core update check (Monday 07:00 UTC). Reports via
+# syslog only when something is actually pending, so it doesn't become noise
+# the operator learns to ignore. Never auto-updates -- see wp-plugins.sh for
+# why that's deliberate rather than an omission.
+0 7 * * 1 /usr/local/bin/wp-plugins.sh check >/dev/null 2>&1
