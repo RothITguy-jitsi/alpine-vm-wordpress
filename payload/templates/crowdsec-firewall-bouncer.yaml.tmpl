@@ -7,7 +7,14 @@ log_dir: /var/log/
 log_level: info
 api_url: http://127.0.0.1:8080/
 api_key: __BOUNCER_KEY__
-disable_ipv6: false
+# FORENSIC FIX (new-audit Medium finding, confirmed accurate): this said
+# disable_ipv6: false (IPv6 nominally "on") while nftables.ipv6.enabled was
+# false (IPv6 enforcement actually off) — an internally inconsistent pair.
+# The base nftables ruleset this VM installs (see lib/03-dynamic-configs.sh)
+# has no ip6 rules at all — this deployment is IPv4-only, full stop — so
+# disable_ipv6 now says that plainly instead of leaving a half-on setting
+# that implies IPv6 decisions are being enforced when they never were.
+disable_ipv6: true
 deny_action: DROP
 deny_log: false
 nftables:
