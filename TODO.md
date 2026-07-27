@@ -64,3 +64,79 @@ A second, independent evaluation was run against the split repository (`install.
 | No signed/checksummed release manifest for repo content sourced or copied as root | Tracked below | Directly relevant to the curl-based installer bootstrap being built now — see that section rather than duplicating the reasoning here |
 | Rootful Podman as a category of risk | Not a bug | Already a documented, deliberate architecture choice (see README's Architecture section) — rootless was tried and removed in v7-6d for reliability reasons. Restated by the audit, not newly found |
 | Unverified Alpine image allowed to continue under `standard` profile | Not a bug | This is the literal, intended difference between `standard` and `production` — `production` already fails closed here. Restated by the audit, not newly found |
+## Third-party file-by-file security evaluation (46 files, hash-verified)
+
+A third independent evaluation reviewed all 46 files individually and published a
+SHA-256 for each. Those hashes were checked against this repository and **matched
+exactly**, so this review was demonstrably run against the current code, not a
+stale copy — which also means its "still open" items are genuinely open after the
+previous round's fixes, and two of them are cases where the earlier fix was real
+but did not go far enough.
+
+Overall verdict, quoted for accuracy rather than paraphrased favorably: *"Strong
+security engineering foundation; not yet ready for an unattended production
+certification gate."* That is a fair summary and worth keeping visible here.
+
+### Fixed in this round
+
+| **Finding** | **What changed** |
+| --- | --- |
+| SSH host-key check only warned on failure and always proceeded | Now a real gate. A guest-agent-verified key gets `StrictHostKeyChecking=yes` bound to a `known_hosts` containing only that verified key — which also closes a narrower TOCTOU window `accept-new` never covered (a MITM appearing between the scan and the connection moments later). An unverified or mismatched key now **skips** the SSH-dependent section rather than trusting it, with `--allow-unverified-sshid` as an explicit, named opt-out for a lab VM on a network path you already trust. This is the evaluator's own remediation ("retrieve the guest key… and *then* use `StrictHostKeyChecking=yes`"), which the previous round only half-implemented |
+| Host-side execution context not established before privileged work | `lib/00-preflight.sh` now fixes `PATH` to the standard system directories (so a hostile `PATH` entry can't substitute a lookalike `qm`/`qemu-nbd`/`curl`), sets `umask 027` as a floor under anything created without an explicit mode, sets `LC_ALL=C` for deterministic string/sort/regex behavior across every later file, and refuses to source or copy from a group/world-writable checkout |
+| Production profile allowed password-only SSH | Production now requires an SSH key and re-prompts until one is supplied, mirroring the existing force-enable pattern for digest pinning directly above it. Standard/lab is unchanged |
+| SSH agent forwarding and user scope | Added `AllowAgentForwarding no` and `AllowUsers <admin>`. Note: the evaluation also flagged TCP forwarding, X11 forwarding, and tunneling, but those three were **already** disabled in the generated config — only these two were genuinely missing |
+| No overlap protection on scheduled jobs | `wp-cron-run.sh` and `wp-db-backup.sh` each take a `mkdir`-based lock (matching `update.sh`'s existing convention rather than introducing a second locking style), detect a stale lock from a crashed run via recorded PID + `kill -0`, and log non-zero exits through `logger` instead of failing silently |
+
+### Still open, with reasoning
+
+**Signed release manifest (High, raised against four separate files).** This is the
+single most-repeated finding in the evaluation and the most substantial one still
+open. `install.sh` sources every `lib/*.sh` as host root; `lib/06` copies the whole
+payload into the guest; `install-wordpress.sh` executes every stage as guest root.
+Nothing cryptographically proves those files are the ones the project published.
+The permission check added this round narrows the window — it catches "another
+local account could have modified these since you fetched them" — but that is a
+genuinely weaker claim than "these are the published bytes," and should not be
+mistaken for it.
+
+The reason this isn't fixed here rather than deferred: a manifest is only worth
+what its key is worth. Generating a keypair inside a build sandbox and committing
+a "signature" next to the code it signs would produce something that *looks* like
+supply-chain assurance while verifying the repository against itself — which is
+exactly the trust circularity already documented in README's "Verifying what you
+run." Doing this properly needs a signing key held outside the repository, a
+release process that signs tags, and a published fingerprint users can check
+independently. Those are decisions for the repository owner, not something to
+manufacture unilaterally. Concretely, when that key exists: generate
+`MANIFEST.sha256` over `install.sh`, `lib/**`, and `payload/**`; sign it detached;
+have `install.sh` verify signature-then-hashes before sourcing any module; have
+`06-vars-and-payload-inject.sh` copy manifest and signature into the guest; and
+have `install-wordpress.sh` re-verify immediately before Stage 1. Until then, the
+honest posture is the one README already takes: this is the same trust model as
+any `curl | bash` installer, stated plainly rather than papered over.
+
+**Carried forward unchanged**, with reasoning unchanged from the sections above:
+candidate DB isolation (Critical — still the top item), off-VM backup gate,
+Trivy exception governance, Trivy installer checksum, egress restriction,
+backup *restore* proof (as distinct from structural verification), and full
+candidate-failure/rollback integration coverage. This evaluation independently
+reached all seven, which is corroboration of the existing assessment rather than
+new information.
+
+**Deliberately not changed: `allow_url_fopen = On` in `php-conf/security.ini`.**
+The evaluation recommends disabling it unless a verified plugin needs it. That is
+the right default for a locked-down single-purpose host, but this project targets
+real WordPress installs: `allow_url_include` (the directive that actually enables
+remote code inclusion) is already `Off`, while `allow_url_fopen` is used by many
+WooCommerce payment gateways and plugin APIs via `file_get_contents()`. Turning it
+off would silently break those integrations at runtime, which is a worse failure
+mode than the marginal risk it removes given `allow_url_include=Off`. The reasoning
+is already stated inline in the file at the point of use, and the recommended
+tighter control — restricting egress — is tracked separately above as its own item.
+
+**Deliberately not changed:** renaming `standard` to `lab` and making `production`
+the default. The recommendation is defensible, but it silently changes behavior for
+anyone with existing automation or documentation referencing the current names, and
+the profile difference is already stated at the prompt, in the summary, and in
+README. Worth doing at a major version boundary with a migration note — not as an
+unannounced change inside a patch round.
