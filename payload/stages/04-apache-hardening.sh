@@ -190,4 +190,3 @@ ok "  /home/wpuser/wp/logs     Apache access log (UID 33:www-data)"
 ok "  /home/wpuser/wp/mysql    MariaDB data      (UID 999:mysql)"
 ok "  /home/wpuser/wp/apache-conf/wp-security.conf"
 ok "  /home/wpuser/wp/php-conf/security.ini"
-
