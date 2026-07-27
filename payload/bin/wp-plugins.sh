@@ -180,7 +180,7 @@ case "${1:-status}" in
     printf "wordpress ctr: "
     podman ps --filter 'name=^wordpress$' --format '{{.Status}}' 2>/dev/null || echo "not found"
     echo "--- wp-cli self-check ---"
-    _wp cli version || echo "wp-cli could not run (is the image pulled? podman images | grep wordpress)"
+    _wp cli version || echo "wp-cli could not run (is the image pulled? doas podman images | grep wordpress)"
     echo "--- database reachability as wp-cli sees it ---"
     _wp db check || echo "wp-cli could not reach the database" ;;
   *)
