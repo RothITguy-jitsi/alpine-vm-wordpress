@@ -5,6 +5,9 @@
 # Usage: wp-health-check.sh [container_name] [http_port]
 # Exit 0 = all critical checks passed. Exit 1 = one or more failed.
 CONTAINER="${1:-wordpress}"
+# $2 is the port Apache listens on INSIDE the container (80 here), not a
+# host-published port -- every check below runs via `podman exec`, so the
+# host's port mappings do not exist in that namespace.
 HTTP_PORT="${2:-80}"
 FAIL=0
 
@@ -83,7 +86,23 @@ HTTP_CODE=$(podman exec --user www-data "$CONTAINER" php -r '
 ' 2>/dev/null)
 case "$HTTP_CODE" in
   200|301|302) _pass "HTTP response: ${HTTP_CODE}" ;;
-  *) _fail "Unexpected HTTP response: ${HTTP_CODE:-none} (expected 200, 301, or 302)" ;;
+  none|"")
+    # "none" means the request never got a response line at all -- refused or
+    # timed out -- as opposed to a real HTTP error code. By far the most
+    # common cause is a port-namespace mistake, so say so rather than leaving
+    # the operator to work out why PHP and the database pass while HTTP does
+    # not.
+    _fail "No HTTP response on 127.0.0.1:${HTTP_PORT} inside ${CONTAINER}"
+    echo "        This probe runs INSIDE the container, so the port must be the one" >&2
+    echo "        Apache listens on there (80) — NOT a host-published port such as" >&2
+    echo "        the 18080 in '-p 127.0.0.1:18080:80'. Nothing is bound to a" >&2
+    echo "        published port from inside the container." >&2
+    echo "        Listening sockets seen inside ${CONTAINER}:" >&2
+    podman exec "$CONTAINER" sh -c \
+      "netstat -tln 2>/dev/null || ss -tln 2>/dev/null || echo '(no netstat/ss in image)'" \
+      2>/dev/null | sed 's/^/          /' >&2 || true
+    ;;
+  *) _fail "Unexpected HTTP response: ${HTTP_CODE} (expected 200, 301, or 302)" ;;
 esac
 
 # 2) PHP actually executes inside the container.

@@ -34,7 +34,9 @@ _wp() {
     echo "✗  The 'wordpress' container is not running: rc-service wp-container start" >&2
     exit 1
   fi
+  # shellcheck disable=SC2086 -- WPCLI_ENV is a deliberate word-split list
   podman run --rm --network "container:wordpress" --user 33:33 \
+    ${WPCLI_ENV} \
     -v /home/wpuser/wp/html:/var/www/html \
     -v "${SECRETS_DIR}:/var/www/private:ro" \
     "$WPCLI_IMAGE" "$@"
@@ -85,6 +87,14 @@ show_status() {
 do_test() {
   _to="$1"
   [ -n "$_to" ] || { echo "Usage: wp-mail.sh test <recipient@example.com>" >&2; exit 1; }
+  # Reject anything that is not plausibly an address before it reaches a
+  # shell word-split list or the container environment.
+  case "$_to" in
+    *[!A-Za-z0-9._%+@-]*|*@*@*|@*|*@) 
+      echo "✗  '${_to}' does not look like an email address." >&2; exit 1 ;;
+    *@*.*) : ;;
+    *) echo "✗  '${_to}' does not look like an email address." >&2; exit 1 ;;
+  esac
   _configured || { echo "✗  No relay configured — run: wp-mail.sh setup" >&2; exit 1; }
   echo "Sending a test message to ${_to} via $(_cfg host):$(_cfg port)…"
   # wp_mail()'s own return value is the ground truth — it is what every
@@ -92,14 +102,24 @@ do_test() {
   # (swaks, openssl s_client) would prove the relay works while saying
   # nothing about whether WordPress can actually use it, which is the
   # question being asked.
+  # BUG FIX (found on a live VM): this passed the recipient as a second
+  # positional argument to `wp eval`, which accepts exactly one (the code) and
+  # has no $argv passthrough -- that is `wp eval-file`. wp-cli rejected the
+  # call outright with "Too many positional arguments", so the send never even
+  # reached the relay, and the failure looked like a mail problem when the
+  # relay was fine. Passed through the environment instead: no quoting to get
+  # wrong, and the address never becomes part of the PHP source, so an odd
+  # character in it cannot alter the code being evaluated.
+  WPCLI_ENV="-e WPMAIL_TO=${_to}"
   _out=$(_wp eval '
-    $to = $argv[0];
+    $to = getenv("WPMAIL_TO");
     $ok = wp_mail($to, "wp-mail.sh test message",
         "If you are reading this, WordPress on this VM can send mail.\n\n" .
         "Relay, credentials, TLS, and the SMTP mu-plugin are all working.\n" .
         "Sent: " . gmdate("c") . " UTC\n");
     echo $ok ? "SENT" : "FAILED";
-  ' "$_to" 2>&1) || true
+  ' 2>&1) || true
+  WPCLI_ENV=""
   case "$_out" in
     *SENT*)
       echo "✔  wp_mail() reported success — check ${_to} (including spam)."
@@ -178,9 +198,14 @@ do_doctor() {
   _h=$(_cfg host); _p=$(_cfg port)
   echo "  relay       : ${_h}:${_p}"
   [ -r "$MU_PLUGIN" ] && echo "  mu-plugin   : present" || echo "  mu-plugin   : MISSING"
-  printf "  mount (ro)  : "
-  podman inspect wordpress --format '{{range .Mounts}}{{.Destination}}:{{.RW}} {{end}}' 2>/dev/null \
-    | tr ' ' '\n' | grep '/var/www/private' || echo "not mounted ⚠"
+  printf "  mount       : "
+  _m=$(podman inspect wordpress --format '{{range .Mounts}}{{.Destination}}={{.RW}} {{end}}' 2>/dev/null \
+       | tr ' ' '\n' | grep '/var/www/private')
+  case "$_m" in
+    *=false) echo "/var/www/private mounted READ-ONLY (correct)" ;;
+    *=true)  echo "/var/www/private mounted WRITABLE — should be :ro" ;;
+    *)       echo "/var/www/private NOT MOUNTED — wp_mail cannot read the relay settings" ;;
+  esac
   printf "  DNS         : "
   podman exec wordpress sh -c "getent hosts ${_h} >/dev/null 2>&1" \
     && echo "${_h} resolves from the container" \

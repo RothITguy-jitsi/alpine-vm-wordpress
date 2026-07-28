@@ -6,6 +6,116 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Candidate health check probed the wrong port
+
+The cutover test got further than ever: the candidate started, and PHP, DNS
+and the database all passed inside it. Only HTTP failed, with `none` -- no
+response at all rather than an error code. Production was never touched.
+
+**Cause: a port-namespace mistake.** The candidate publishes
+`-p 127.0.0.1:18080:80`, so 18080 is the **host** side and Apache listens on
+**80** inside the container. `wp-health-check.sh` does `podman exec` and
+probes `127.0.0.1` *from within* that namespace, where nothing is bound to
+18080 -- so a genuinely healthy candidate reported no HTTP response. The
+other three checks passed precisely because none of them involve the port.
+
+Two ports with the same name in different namespaces, one variable. The
+host-side wget fallback a few lines below is correct to use 18080; the
+`podman exec` probe never was.
+
+**Fixed:** the candidate probe passes 80, like every other call site
+(`WEB_CHECK_PORT=80` elsewhere -- this was the only defect). This was the
+last unexercised bug in the never-before-run candidate path.
+
+**Diagnosis improved.** `Unexpected HTTP response: none` said nothing useful.
+A no-response result is now reported distinctly from a real HTTP error code,
+states that the probe runs inside the container and the port must therefore
+be the in-container one, and prints the sockets actually listening in there.
+The argument is documented at the point it is read.
+
+**Check added** (`test/check-healthcheck-ports.py`): every
+`wp-health-check.sh` invocation must pass `80` or `WEB_CHECK_PORT`. Verified
+by re-injecting the bug. (Its first version matched an `ok "..."` status
+message that merely named the script and read an em dash as a port -- caught
+and tightened to absolute-path invocations before shipping.)
+
+---
+
+## Unreleased — A nonexistent image tag is now reported as such
+
+A cutover test targeted `6.9.3-php8.3-apache`, which does not exist on Docker
+Hub. **The system behaved correctly** -- Skopeo could not resolve it, Trivy
+could not find it, `DEPLOYMENT_PROFILE=production` refused to proceed on an
+unknown security state, and production was never touched. The fail-closed
+path worked.
+
+The *diagnosis* was the problem. The operator was told:
+
+> Scanner-side failures (DB download, registry timeout, corrupt cache) look
+> like this — treat as unknown security state. [...] Investigate the scanner
+> failure above and retry.
+
+None of which applied. Trivy emits four errors for a missing tag and three
+are irrelevant noise (no docker socket, no containerd socket, no podman
+socket); the real one -- `MANIFEST_UNKNOWN` -- is last and easily missed. So
+a mistyped version sent the operator to debug a scanner that was working
+fine.
+
+**Fixed in two places:**
+
+- `scan_image` now recognises `MANIFEST_UNKNOWN`/`unknown tag` and says the
+  tag does not exist, with the command to list the tags that do -- instead of
+  reporting an unknown security state.
+- More usefully, `_check_component` catches it **first**. Skopeo is the
+  earliest thing to touch the registry, so the condition is detectable
+  minutes before the pull and scan that would fail for the same reason. This
+  required actually capturing Skopeo's stderr, which was previously sent to
+  `/dev/null` -- so the distinction between "no such tag" (fatal) and "lookup
+  failed" (transient, tag comparison is a reasonable fallback) was not
+  available at all.
+
+All three callers now stop on that condition; previously the return value was
+discarded and execution fell through to the pull and scan regardless.
+`_check_component` also got an explicit `return 0`, since its exit status is
+now load-bearing rather than incidental.
+
+---
+
+## Unreleased — Clean install; `wp-mail.sh test` argument bug fixed
+
+**A fully clean run.** Install-time validation `15 checks passed, 0 failed`,
+post-install `Passed: 47  Warnings: 0  Failed: 0`. Every failure mode found in
+the field so far -- the lost `cp`, the broken `podman run`, the missing
+libmaxminddb, the `<RequireAll>` context, the GeoIP local-address 403, the
+empty-User-Agent 403, the apostrophe, the conditionally-gated mu-plugin -- is
+resolved on real hardware.
+
+The only failure came from `--send-test-mail`, and it was mine:
+
+```
+Error: Too many positional arguments: contact@rothitguy.pro
+```
+
+`wp eval` takes exactly one positional (the code) and has no `$argv`
+passthrough -- that is `wp eval-file`. I passed the recipient as a second
+argument, so wp-cli rejected the call and the send never reached the relay.
+The failure therefore looked like a mail problem when `wp-mail.sh doctor`
+showed the whole path healthy: DNS resolving, TCP 587 reachable, credentials
+present, mount read-only.
+
+**Fixed** by passing the address through the container environment instead:
+nothing to quote wrongly, and the address never becomes part of the PHP source,
+so an unusual character in it cannot alter the code being evaluated. The
+address is also validated before it reaches either the argument list or the
+environment.
+
+**Also:** `wp-mail.sh doctor` printed the mount as `/var/www/private:false`,
+where `false` is the read-write flag -- so the correct state read like a
+failure. It now says `mounted READ-ONLY (correct)`. And `mail` was missing
+from the validator's "Sections:" hint.
+
+---
+
 ## Unreleased — First real `update.sh` run: candidate could not start
 
 `update.sh` had never been exercised on hardware -- `TODO.md` has carried

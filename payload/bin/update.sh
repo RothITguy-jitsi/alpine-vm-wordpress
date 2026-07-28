@@ -389,13 +389,28 @@ require_clean_container_state() {
 # (unambiguous, no parsing), fall back to the grep path with an explicit
 # `head -1` for older Skopeo builds that lack --format, and validate the
 # final value is exactly one well-formed sha256 line before returning it.
+# Set by _skopeo_digest so callers can distinguish "the registry says this
+# tag does not exist" (fatal — no point pulling or scanning) from "the lookup
+# failed" (transient — falling back to a tag comparison is reasonable).
+# Previously stderr went to /dev/null, so that distinction was unavailable and
+# a mistyped tag became a multi-minute detour through a misleading
+# "scanner-side failure / unknown security state" message.
+_SKOPEO_ERR=""
 _skopeo_digest() {
-  local ref="$1" out digest
+  local ref="$1" out digest _errf
   command -v skopeo >/dev/null 2>&1 || return 1
+  _SKOPEO_ERR=""
+  _errf=$(mktemp) || _errf=""
 
   # Preferred: let Skopeo emit just the manifest digest. No JSON parsing,
   # so LayersData can't contaminate the result no matter how it's shaped.
-  digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null | head -1) || digest=""
+  if [ -n "$_errf" ]; then
+    digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>"$_errf" | head -1) || digest=""
+    _SKOPEO_ERR=$(cat "$_errf" 2>/dev/null)
+    rm -f "$_errf"
+  else
+    digest=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null | head -1) || digest=""
+  fi
 
   # Fallback for Skopeo builds without --format support: parse the JSON.
   # v7-15 (audit #2): prefer jq, which extracts .Digest by KEY — no reliance
@@ -540,6 +555,27 @@ scan_image() {
       return 0
       ;;
     *)
+      # UX FIX (from a real cutover attempt): a tag that simply does not exist
+      # produced the generic "scanner-side failure ... unknown security state"
+      # message, sending the operator to investigate Trivy, its cache and the
+      # registry -- when the actual cause was a typo'''d version. Trivy reports
+      # four errors for this case and three are irrelevant noise (no docker
+      # socket, no containerd socket, no podman socket); the real one,
+      # MANIFEST_UNKNOWN, is last and easily missed. Detect it and say so
+      # plainly, because the remedy is completely different: pick a tag that
+      # exists, rather than debug the scanner.
+      if grep -qiE "MANIFEST_UNKNOWN|manifest unknown|unknown tag|not found|NAME_UNKNOWN" "${_trivy_err}" 2>/dev/null; then
+        echo "  ✗  The image tag does not exist in the registry:" >&2
+        echo "       ${img}" >&2
+        echo "     This is NOT a scanner problem and NOT a vulnerability finding —" >&2
+        echo "     there is simply no such tag to scan." >&2
+        echo "" >&2
+        echo "     List the tags that DO exist:" >&2
+        echo "       skopeo list-tags docker://${img%%:*} | grep '\''${WP_TAG##*-}'\''" >&2
+        echo "     Or take the exact command from:  update.sh versions" >&2
+        rm -f "${_trivy_err}"
+        return 1
+      fi
       echo "  ✗  Trivy scan DID NOT COMPLETE for ${img} (rc=${rc}) — this is NOT" >&2
       echo "     a clean scan and NOT a vulnerability finding. Scanner-side" >&2
       echo "     failures (DB download, registry timeout, corrupt cache) look" >&2
@@ -597,9 +633,27 @@ _check_component() {
       if [ "$target_ver" = "$running_tag" ]; then _UPD_ACTION="refresh"; else _UPD_ACTION="bump"; fi
       return 0
     fi
+    # UX FIX: Skopeo is the FIRST thing that touches the registry, so a
+    # nonexistent tag surfaces here -- several minutes before the pull and
+    # scan that will fail for the same reason. Distinguish "the registry
+    # says there is no such tag" (fatal, and the operator needs to pick a
+    # different one) from "the lookup itself failed" (transient; carrying on
+    # with a tag comparison is reasonable). Checking here turns a confusing
+    # multi-minute detour into an immediate, accurate message.
+    if printf '%s' "${_SKOPEO_ERR:-}" | grep -qiE "MANIFEST_UNKNOWN|manifest unknown|unknown tag|NAME_UNKNOWN"; then
+      echo "  ✗  The registry has no such tag: ${_probe_ref:-${registry}:${target_ver}}" >&2
+      echo "     Nothing was pulled and nothing was changed." >&2
+      echo "     Use the exact command printed by:  update.sh versions" >&2
+      _UPD_ACTION="notag"
+      return 1
+    fi
     echo "  ⚠  Skopeo digest lookup failed — comparing by tag only this run."
   fi
   if [ "$target_ver" = "$running_tag" ]; then _UPD_ACTION="skip"; else _UPD_ACTION="bump"; fi
+  # Explicit: this function's exit status is now load-bearing (callers use
+  # `|| return 1` to stop on a nonexistent tag), so it must not depend on
+  # whichever statement happens to be last.
+  return 0
 }
 
 do_wp_update() {
@@ -610,7 +664,10 @@ do_wp_update() {
   echo "  Target  : ${WP_REGISTRY}:${target_ver}"
   echo "  Data    : /home/wpuser/wp/html (bind-mount — never removed)"
 
-  _check_component "$WP_REGISTRY" "$WP_TAG" "$WP_DIGEST" "$target_ver"
+  # A nonexistent tag is fatal here: there is nothing to pull or scan, so
+  # stop now with the accurate message rather than falling through to a
+  # pull and a Trivy run that will both fail for the same reason.
+  _check_component "$WP_REGISTRY" "$WP_TAG" "$WP_DIGEST" "$target_ver" || return 1
   case "$_UPD_ACTION" in
     skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
     refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it?" || { echo "   Skipped."; return 0; } ;;
@@ -790,7 +847,15 @@ do_wp_update() {
   echo "  → Validating candidate (HTTP + PHP + DB name resolution + DB auth + real query)…"
   for i in $(seq 1 12); do
     if [ -x /usr/local/bin/wp-health-check.sh ]; then
-      if /usr/local/bin/wp-health-check.sh "$WP_CANDIDATE" "${WP_CANDIDATE_PORT}"; then
+      # PORT NAMESPACE (bug fixed here): WP_CANDIDATE_PORT is the HOST-side
+      # published port from `-p 127.0.0.1:18080:80`. wp-health-check.sh does
+      # `podman exec` INTO the container and probes 127.0.0.1 from in there,
+      # where Apache listens on 80 and nothing is bound to 18080 -- so passing
+      # the published port made the HTTP probe fail with "none" on a candidate
+      # that was actually healthy (PHP, DNS and the database all passed). The
+      # in-container port is always 80; the published port is only correct for
+      # the host-side wget fallback below.
+      if /usr/local/bin/wp-health-check.sh "$WP_CANDIDATE" 80; then
         candidate_ok=1; break
       fi
     else
@@ -1099,7 +1164,10 @@ do_db_update() {
   echo "  Data    : ${DB_DATA_DIR} (bind-mount — never removed)"
   echo "  Rollback: snapshotted to ${DB_SNAPSHOT_DIR} before the swap, removed after a verified success"
 
-  _check_component "$DB_REGISTRY" "$DB_TAG" "$DB_DIGEST" "$target_ver"
+  # A nonexistent tag is fatal here: there is nothing to pull or scan, so
+  # stop now with the accurate message rather than falling through to a
+  # pull and a Trivy run that will both fail for the same reason.
+  _check_component "$DB_REGISTRY" "$DB_TAG" "$DB_DIGEST" "$target_ver" || return 1
   case "$_UPD_ACTION" in
     skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
     refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it? (backup + data-directory snapshot taken first)" || { echo "   Skipped."; return 0; } ;;
@@ -1392,7 +1460,10 @@ do_cs_update() {
   echo "  Pinned  : tag=${CS_TAG:-none}  digest=${CS_DIGEST:-none}"
   echo "  Target  : ${CS_REGISTRY}:${target_ver}"
 
-  _check_component "$CS_REGISTRY" "$CS_TAG" "$CS_DIGEST" "$target_ver"
+  # A nonexistent tag is fatal here: there is nothing to pull or scan, so
+  # stop now with the accurate message rather than falling through to a
+  # pull and a Trivy run that will both fail for the same reason.
+  _check_component "$CS_REGISTRY" "$CS_TAG" "$CS_DIGEST" "$target_ver" || return 1
   case "$_UPD_ACTION" in
     skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
     refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it?" || { echo "   Skipped."; return 0; } ;;

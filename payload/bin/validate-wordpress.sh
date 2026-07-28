@@ -810,7 +810,7 @@ if [ -n "$REMEDIES" ]; then
   printf '%s\n' "$REMEDIES"
   echo ""
   echo "  Re-run a single area while fixing:  validate-wordpress.sh --section <name>"
-  echo "  Sections: containers database web security updates logs backups"
+  echo "  Sections: containers database web security updates logs backups mail"
 fi
 
 if [ "$FAIL" -gt 0 ]; then
