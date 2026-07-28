@@ -13,6 +13,11 @@ for f in sorted(set(glob.glob('**/*.sh', recursive=True)) | {'install.sh'}):
     for i in range(len(lines)-1):
         cur, nxt = lines[i], lines[i+1]
         c = cur.rstrip()
+        # A line that is ITSELF a comment cannot open a continuation: the
+        # trailing backslash is just comment text. This shows up in help
+        # output that wraps a long example command across two commented
+        # lines, and treating it as a continuation is a false positive.
+        if cur.lstrip().startswith('#'): continue
         if not c.endswith('\\') or c.endswith('\\\\'): continue
         st = nxt.lstrip()
         if st.startswith('#'):

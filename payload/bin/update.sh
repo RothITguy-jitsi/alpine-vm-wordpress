@@ -886,13 +886,13 @@ do_wp_update() {
   # port, guaranteeing every update attempt would fail (see the WORDPRESS
   # UPDATE CUTOVER header note above for the full history).
   require_clean_container_state wordpress wordpress-old || return 1
-  if ! podman rename wordpress wordpress-old; then
+  if ! podman rename wordpress wordpress-old >/dev/null; then
     echo "✗  Unable to rename wordpress → wordpress-old — Podman error above. Aborting; production is untouched." >&2
     return 1
   fi
-  if ! podman stop --time 15 wordpress-old; then
+  if ! podman stop --time 15 wordpress-old >/dev/null; then
     echo "✗  wordpress-old would not stop — attempting to restore the 'wordpress' name…" >&2
-    if podman rename wordpress-old wordpress; then
+    if podman rename wordpress-old wordpress >/dev/null; then
       echo "   Restored. The site is NOT down — it's still running as 'wordpress', just" >&2
       echo "   on the previous image. The update did not proceed; investigate why the" >&2
       echo "   container wouldn't stop, then retry." >&2

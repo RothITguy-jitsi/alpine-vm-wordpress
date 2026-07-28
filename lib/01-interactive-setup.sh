@@ -11,6 +11,81 @@ echo -e "\n${BLD}  WordPress VM${CL}"
 echo    "  Alpine (auto) + Podman (WordPress + MariaDB) + CrowdSec + nftables"
 echo    "  ${CORES} CPU · ${RAM} MB · ${DISK} · hardened Apache + PHP"
 echo ""
+# ── Introduction ─────────────────────────────────────────────────────────────
+# Shown once, before the first prompt. The intent is to explain what is
+# actually different here, in terms someone can verify afterwards, and to say
+# what this is NOT so nobody finishes the install with a wrong mental model of
+# what they are protected against. Claims that cannot be checked against the
+# running VM do not belong in it.
+echo -e "  ${BLD}Why this installer${CL}"
+echo -e "  ${YW}Most WordPress install scripts get you a running site. This one${CL}"
+echo -e "  ${YW}assumes the site will eventually be attacked, and that you will${CL}"
+echo -e "  ${YW}still have to run it in six months. The differences follow from${CL}"
+echo -e "  ${YW}that:${CL}"
+echo ""
+echo -e "  ${BL}  Segmented, not just firewalled.${CL}${YW} MariaDB sits on its own${CL}"
+echo -e "  ${YW}    internal network with no host port and no route to the${CL}"
+echo -e "  ${YW}    internet. A compromised WordPress cannot reach past it, and${CL}"
+echo -e "  ${YW}    the database is not exposed even if the firewall is wrong.${CL}"
+echo ""
+echo -e "  ${BL}  Updates are tested before they are applied.${CL}${YW} A candidate${CL}"
+echo -e "  ${YW}    container is started, scanned for CVEs, and health-checked${CL}"
+echo -e "  ${YW}    while production keeps serving. Only then is the swap made,${CL}"
+echo -e "  ${YW}    and it rolls back automatically if the new one fails.${CL}"
+echo ""
+echo -e "  ${BL}  Images are pinned to digests, not tags.${CL}${YW} What was scanned${CL}"
+echo -e "  ${YW}    and tested is exactly what runs. A registry moving a tag${CL}"
+echo -e "  ${YW}    cannot change your deployment underneath you.${CL}"
+echo ""
+echo -e "  ${BL}  Backups are verified, not assumed.${CL}${YW} The dump's exit status,${CL}"
+echo -e "  ${YW}    its completion marker and the archive itself are all checked${CL}"
+echo -e "  ${YW}    before any old backup is rotated away.${CL}"
+echo ""
+echo -e "  ${BL}  It tells you when it is wrong.${CL}${YW} Post-install validation${CL}"
+echo -e "  ${YW}    runs ~45 checks and prints the exact command to fix each${CL}"
+echo -e "  ${YW}    failure. Day-2 tooling ships with it: update.sh,${CL}"
+echo -e "  ${YW}    validate-wordpress.sh, wp-hardening.sh, wp-mail.sh,${CL}"
+echo -e "  ${YW}    wp-plugins.sh — including plugin CVE visibility, which is${CL}"
+echo -e "  ${YW}    where ~91% of WordPress vulnerabilities actually live and${CL}"
+echo -e "  ${YW}    which container scanning does not cover.${CL}"
+echo ""
+echo -e "  ${BL}  Every control tells you its limits.${CL}${YW} Where a setting is${CL}"
+echo -e "  ${YW}    noise reduction rather than a boundary, the prompt says so.${CL}"
+echo -e "  ${YW}    Nothing here is oversold — a control you over-trust is worse${CL}"
+echo -e "  ${YW}    than one you know the edges of.${CL}"
+echo ""
+echo -e "  ${YW}What this is not: a managed service, a substitute for backups you${CL}"
+echo -e "  ${YW}keep somewhere else, or protection against someone specifically${CL}"
+echo -e "  ${YW}targeting you. It raises the floor considerably and is honest${CL}"
+echo -e "  ${YW}about the ceiling.${CL}"
+echo ""
+echo -e "  ${BL}                                                  by RothITguy${CL}"
+echo ""
+# Closing line. Deliberately says "looks there too" rather than "scans your
+# plugins for CVEs": wp-plugins.sh surfaces what is out of date via the
+# WordPress.org update API, which is the practical remediation path, but it
+# is not a CVE-matching scanner. Overstating that here would be the exact
+# thing the rest of this installer refuses to do.
+echo -e "  ${BLD}  \"~91% of WordPress vulnerabilities live in plugins —${CL}"
+echo -e "  ${BLD}   where most hardening never looks. This one does.\"${CL}"
+echo -e "  ${YW}     figure: Patchstack, State of WordPress Security 2026${CL}"
+echo ""
+echo -e "  ${YW}  Press Enter to begin.${CL}"
+read -r _INTRO_ACK
+unset _INTRO_ACK
+echo ""
+# ── Security-reasoning blocks ────────────────────────────────────────────────
+# Several prompts below carry a short "what this does and does not buy you"
+# note. These exist because the failure mode of a security control is rarely
+# that it breaks -- it is that someone believes it excludes a class of
+# attacker it does not. The bound on a control belongs in front of the person
+# choosing whether to rely on it, not only in a README they may never read.
+#
+# _sec_note prints the attribution so it is clear these are this project's
+# considered judgements rather than generic vendor boilerplate.
+_sec_note() { echo -e "  ${BL}— RothITguy${CL}"; echo ""; }
+_sec_head() { echo -e "  ${BLD}What this does and does not buy you:${CL}"; }
+
 
 SUGGESTED=$(_next_vmid)
 while true; do
@@ -27,6 +102,16 @@ while true; do
   break
 done
 
+_sec_head
+echo -e "  ${YW}  Root SSH is disabled unconditionally, so this password is only ever${CL}"
+echo -e "  ${YW}  usable from the Proxmox console (qm terminal). That is deliberate: it${CL}"
+echo -e "  ${YW}  guarantees a recovery path that does not depend on the network, on${CL}"
+echo -e "  ${YW}  SSH, or on the admin account having been created successfully.${CL}"
+echo -e "  ${YW}  It is not decorative. Anyone who can reach the Proxmox web UI can${CL}"
+echo -e "  ${YW}  open that console, so this password is only as meaningful as your${CL}"
+echo -e "  ${YW}  hypervisor login — treat it as a hypervisor-tier secret, not a${CL}"
+echo -e "  ${YW}  throwaway you will never type again.${CL}"
+_sec_note
 ROOT_PASS=""
 while [[ -z "$ROOT_PASS" ]]; do
   read -rsp "  Root password for the VM : " p1; echo
@@ -53,6 +138,17 @@ ip -4 addr show scope global 2>/dev/null | awk '/inet /{split($2,a,"/"); print "
 echo ""
 echo "  [1] DHCP — VM gets an address automatically (default)"
 echo "  [2] Static IPv4 — you assign the address, gateway, and DNS now"
+_sec_head
+echo -e "  ${YW}  This is a security choice, not just a networking one. Several${CL}"
+echo -e "  ${YW}  controls here are keyed to addresses: the SSH and wp-admin${CL}"
+echo -e "  ${YW}  restrictions, the reverse-proxy trust for X-Forwarded-For, and any${CL}"
+echo -e "  ${YW}  firewall rule elsewhere that names this VM.${CL}"
+echo -e "  ${YW}  With DHCP, a lease change moves this host out from under those rules${CL}"
+echo -e "  ${YW}  silently — nothing errors, access simply starts being denied or,${CL}"
+echo -e "  ${YW}  worse, a rule that named the old address now names something else.${CL}"
+echo -e "  ${YW}  Static addressing is the safer default for anything you will write${CL}"
+echo -e "  ${YW}  firewall rules about. DHCP is fine for a lab VM you will rebuild.${CL}"
+_sec_note
 read -rp "  Network mode [1] : " NET_MODE_SEL
 NET_MODE="dhcp"
 VM_STATIC_IP="" VM_PREFIX="" VM_GATEWAY="" VM_DNS=""
@@ -227,6 +323,17 @@ _ask_single_ip() {  # $1 prompt text ; echoes validated single IPv4 (may be empt
 }
 
 echo -e "  ${BLD}Layer 1 — nftables (packet level, applies to ALL traffic on 80/443):${CL}"
+_sec_head
+echo -e "  ${YW}  Restricting SSH by source address is the single highest-value control${CL}"
+echo -e "  ${YW}  here: it removes this host from the constant background of internet${CL}"
+echo -e "  ${YW}  SSH brute-forcing entirely, rather than merely surviving it.${CL}"
+echo -e "  ${YW}  It trusts the network. Anything inside the allowed range — a${CL}"
+echo -e "  ${YW}  compromised workstation, a guest VLAN that can route here — is${CL}"
+echo -e "  ${YW}  unaffected by it. Narrow the range to what you actually administer${CL}"
+echo -e "  ${YW}  from, not to the whole LAN because that is easier.${CL}"
+echo -e "  ${YW}  Leaving it blank is defensible only if something in front of this VM${CL}"
+echo -e "  ${YW}  is already doing the same job.${CL}"
+_sec_note
 SSH_CIDR=$(_ask_cidr "  Restrict SSH (22) to a CIDR?           (blank = any)  : ")
 WEB_CIDR=$(_ask_cidr "  Restrict Web (80/443) to a CIDR?       (blank = any)  : ")
 [[ -z "$WEB_CIDR" ]] && msg_warn "Web ports open to any IP — Layer 2 (Apache) still enforces wp-admin"
@@ -246,6 +353,52 @@ echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the prox
 echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache trusts${CL}"
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
+
+# ── Outbound (egress) firewall ────────────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Restrict outbound traffic?${CL}"
+echo -e "  ${YW}By default this VM may connect OUT to anything; only the Proxmox${CL}"
+echo -e "  ${YW}management ports are blocked. Restricting egress limits what a${CL}"
+echo -e "  ${YW}compromised WordPress can reach.${CL}"
+echo ""
+echo -e "  ${YW}Allowed automatically, because every feature here needs them:${CL}"
+echo -e "  ${YW}    53   DNS            123  NTP (time sync)${CL}"
+echo -e "  ${YW}    80   HTTP           443  HTTPS${CL}"
+echo -e "  ${YW}    67/68 DHCP          25/465/587  outbound mail${CL}"
+echo -e "  ${YW}  That covers Alpine packages, container registries, WordPress${CL}"
+echo -e "  ${YW}  and plugin updates, CrowdSec, MaxMind, Trivy, and SMTP.${CL}"
+echo ""
+echo -e "  ${YW}Ports can be opened later without a reinstall:${CL}"
+echo -e "  ${YW}    wp-hardening.sh egress-allow 8443${CL}"
+echo ""
+# The limitation goes LAST, immediately before the question, and is as
+# concrete as the benefit. An earlier version put the memorable examples
+# (6667, 4444) in the selling paragraph and left the caveat vague and buried
+# under reassurance text -- which is how a feature gets over-trusted. If the
+# honest bound on a security control is worth writing in the README, it is
+# worth putting in front of the person choosing whether to rely on it.
+_sec_head
+echo -e "  ${YW}  It removes the easy options — C2 on an odd port, a reverse${CL}"
+echo -e "  ${YW}  shell on 4444, IRC botnet traffic on 6667, bulk exfiltration${CL}"
+echo -e "  ${YW}  over a random high port.${CL}"
+echo -e "  ${YW}  It is NOT containment against a determined attacker. 443 has${CL}"
+echo -e "  ${YW}  to stay open — nothing here works without it — and anyone${CL}"
+echo -e "  ${YW}  wanting a covert channel will simply use 443.${CL}"
+echo -e "  ${YW}  Worth having. Not worth over-trusting.${CL}"
+_sec_note
+read -rp "  Restrict outbound traffic to the ports above? [y/N] : " _EGR
+case "${_EGR}" in
+  y|Y|yes|YES)
+    RESTRICT_EGRESS=1
+    msg_ok "Egress restricted — everything except the listed ports is dropped and logged"
+    msg_info "  Open more later:  wp-hardening.sh egress-allow <port> [tcp|udp]"
+    msg_info "  See what is open:  wp-hardening.sh egress-list"
+    ;;
+  *)
+    msg_ok "Egress unrestricted (default) — only Proxmox management ports are blocked"
+    ;;
+esac
+unset _EGR
 
 # ── Outbound email / SMTP relay (NEW) ─────────────────────────────────────────
 echo ""
@@ -419,6 +572,18 @@ echo -e "  ${YW}the default /wp-login.php, so credential-stuffing bots hitting t
 echo -e "  ${YW}standard path get 403 before WordPress or PHP is ever reached.${CL}"
 echo -e "  ${YW}Choose something unique (e.g. siteadmin, seclogin, mymsp2024).${CL}"
 echo -e "  ${YW}Avoid obvious words: admin, login, dashboard, wp, secure.${CL}"
+_sec_head
+echo -e "  ${YW}  This is obscurity, and obscurity is worth having here: the${CL}"
+echo -e "  ${YW}  overwhelming majority of login attacks are bots that only ever try${CL}"
+echo -e "  ${YW}  /wp-login.php. Moving the door means they hit a 403 before PHP or${CL}"
+echo -e "  ${YW}  WordPress is reached, so they cost you nothing and never appear in${CL}"
+echo -e "  ${YW}  your auth logs as attempts.${CL}"
+echo -e "  ${YW}  It stops none of the following: anyone who can read a password-reset${CL}"
+echo -e "  ${YW}  email, a leaked link, a plugin that prints the login URL, or the${CL}"
+echo -e "  ${YW}  REST API. It is not a secret, it is a filter.${CL}"
+echo -e "  ${YW}  Treat it as noise reduction stacked on top of the IP restriction and${CL}"
+echo -e "  ${YW}  CrowdSec — never as the thing protecting the account.${CL}"
+_sec_note
 read -rp "  wp-admin custom slug?  (blank = keep default /wp-admin) : " WP_ADMIN_SLUG
 # Sanitise: lowercase, alphanumeric + hyphen only
 WP_ADMIN_SLUG=$(echo "${WP_ADMIN_SLUG}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
@@ -446,6 +611,17 @@ echo ""
 echo -e "  ${BLD}CrowdSec Console enrolment (optional — can be done after install):${CL}"
 echo -e "  ${YW}Get your enrolment key at https://app.crowdsec.net → Security Engines → Add${CL}"
 echo -e "  ${YW}This automates the enrolment step so you don't need to SSH in afterwards.${CL}"
+_sec_head
+echo -e "  ${YW}  Enrolling links this engine to CrowdSec's console: you get the${CL}"
+echo -e "  ${YW}  shared blocklist (addresses already attacking other people) and a${CL}"
+echo -e "  ${YW}  dashboard, which is a genuine gain — most attacking IPs hit many${CL}"
+echo -e "  ${YW}  sites before yours.${CL}"
+echo -e "  ${YW}  It also means signals about attacks on this VM leave it. That is the${CL}"
+echo -e "  ${YW}  trade being made, and it is a reasonable one, but it should be a${CL}"
+echo -e "  ${YW}  decision rather than a default you did not notice.${CL}"
+echo -e "  ${YW}  Skipping loses only the console and the shared blocklist. Local${CL}"
+echo -e "  ${YW}  detection and the firewall bouncer work exactly the same either way.${CL}"
+_sec_note
 read -rsp "  CrowdSec enrolment key (blank = skip, enrol manually later) : " CROWDSEC_ENROLL_KEY; echo
 
 echo ""
@@ -455,6 +631,25 @@ echo -e "  ${YW}Uses MaxMind's free GeoLite2-Country database via the mod_maxmin
 echo -e "  ${YW}Apache module (compiled during install — adds ~2 min, then removed${CL}"
 echo -e "  ${YW}build tools to keep the container lean).${CL}"
 echo -e "  ${YW}Requires a FREE MaxMind account: https://www.maxmind.com/en/geolite2/signup${CL}"
+echo ""
+# Same standard as the egress prompt: state the honest bound of the control
+# immediately before the person decides whether to rely on it. Country
+# filtering looks stronger than it is, and the failure mode of over-trusting
+# it is believing a whole class of attacker has been excluded when they have
+# not been.
+_sec_head
+echo -e "  ${YW}  It is very effective against bulk, opportunistic traffic —${CL}"
+echo -e "  ${YW}  credential-stuffing and vulnerability-scanning bots — which is${CL}"
+echo -e "  ${YW}  most of what reaches a WordPress site. Blocking runs in Apache${CL}"
+echo -e "  ${YW}  before PHP starts, so it costs almost nothing.${CL}"
+echo -e "  ${YW}  It is trivially bypassed by anyone who chooses to: a VPN, proxy${CL}"
+echo -e "  ${YW}  or Tor exit in an allowed country defeats it in seconds. It is${CL}"
+echo -e "  ${YW}  a noise filter, not a boundary.${CL}"
+echo -e "  ${YW}  It will also block legitimate visitors travelling abroad or on${CL}"
+echo -e "  ${YW}  a VPN, and GeoLite2 country data is good but not perfect.${CL}"
+echo -e "  ${YW}  Your own LAN and loopback are always exempt, so this cannot${CL}"
+echo -e "  ${YW}  lock you out of wp-admin from inside the network.${CL}"
+_sec_note
 read -rp "  Enable GeoIP country filtering? [y/N] : " GEOIP_ENABLE
 GEOIP_ENABLED=0 GEOIP_MODE="" GEOIP_WHITELIST="" GEOIP_BLOCKLIST=""
 MAXMIND_ACCOUNT_ID="" MAXMIND_LICENSE_KEY=""
@@ -522,6 +717,16 @@ echo -e "  ${YW}no image is pulled just to check), so this stays cheap on every 
 echo -e "  ${YW}update.sh re-pins on every update, and${CL}"
 echo -e "  ${YW}'update.sh digest-check' can find and move to a newer digest published${CL}"
 echo -e "  ${YW}under the SAME tag (e.g. a same-version security rebuild).${CL}"
+_sec_head
+echo -e "  ${YW}  A tag is a moving pointer. Pinning to a digest means the bits you${CL}"
+echo -e "  ${YW}  scanned and tested are exactly the bits that run, and that a registry${CL}"
+echo -e "  ${YW}  silently repointing a tag cannot change what is deployed under you.${CL}"
+echo -e "  ${YW}  It guarantees IDENTITY, not SAFETY. A pinned image with a critical${CL}"
+echo -e "  ${YW}  CVE stays pinned to that vulnerable image — pinning is what makes${CL}"
+echo -e "  ${YW}  Trivy's verdict meaningful, not a substitute for it.${CL}"
+echo -e "  ${YW}  It also means updates are deliberate. That is the point, and it is${CL}"
+echo -e "  ${YW}  why 'update.sh digest-check' exists to move you forward on purpose.${CL}"
+_sec_note
 read -rp "  Use SHA256 image digest pinning? [Y/n] : " PINNING_SEL
 USE_DIGEST_PINNING=1
 [[ "${PINNING_SEL:-Y}" =~ ^[Nn] ]] && USE_DIGEST_PINNING=0

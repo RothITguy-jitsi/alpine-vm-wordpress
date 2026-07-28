@@ -2,6 +2,9 @@
 
 A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, structurally-verified automated backups (see [Known Limitations](#known-limitations) for exactly what "verified" covers), and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 
+> **"~91% of WordPress vulnerabilities live in plugins — where most hardening never looks. This one does."**
+> — RothITguy *(figure: Patchstack, State of WordPress Security in 2026)*
+
 No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer around 16 interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and nightly database backups that are integrity-checked on creation.
 
 A note on how to read that sentence, and this README generally: "integrity-checked" means each backup's dump completion marker and gzip archive are verified before old backups are rotated — it does **not** mean the backup has been test-restored, or that a copy exists off this VM. Both of those are open items ([Known Limitations](#known-limitations), `TODO.md`). The same care applies elsewhere: the WordPress update "candidate" is isolated at the HTTP and filesystem level but shares the live database; CrowdSec provides firewall-level enforcement of ban decisions, not WAF request inspection; and rootful containers are contained primarily by the VM boundary rather than by the container runtime. Each of those is spelled out where it comes up below.
@@ -20,8 +23,27 @@ A note on how to read that sentence, and this README generally: "integrity-check
 
 ---
 
+## Why I built this
+
+I kept standing up WordPress for people and watching the same three failures, in the same order:
+
+1. **A plugin was four versions behind** and something walked in through it. Nobody was looking at plugins — the host was patched, the container was scanned, and the actual door was wide open.
+2. **The "backup" was an empty file.** It had been running nightly for a year. Nobody had ever restored one, and the cron job had been failing silently since the second week.
+3. **An update broke the site**, at a bad hour, with no way back except a snapshot somebody hoped existed.
+
+Every one-click installer I tried solved *"get WordPress running."* None of them solved *"still be running, still be yours, in six months."*
+
+So this one is opinionated about the boring things, because the boring things are what actually fail: the database shouldn't be reachable from anywhere, an update should have to prove itself on a throwaway container before it touches production, and a backup nobody has checked is not a backup.
+
+It's also honest about where it stops. Every control here states its own limits at the prompt, not buried in documentation — because a control you over-trust is worse than one whose edges you know. If a setting is noise reduction rather than a boundary, it says so before you rely on it.
+
+— **RothITguy**
+
+---
+
 ## Table of Contents
 
+- [Why I built this](#why-i-built-this)
 - [What This Is](#what-this-is)
 - [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
@@ -29,6 +51,7 @@ A note on how to read that sentence, and this README generally: "integrity-check
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
+- [Outbound Firewall (optional)](#outbound-firewall-optional)
 - [Outbound Email](#outbound-email)
 - [WordPress Site Address](#wordpress-site-address)
 - [Interactive Setup Walkthrough](#interactive-setup-walkthrough)
@@ -256,6 +279,38 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 ```
 
 (if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
+
+---
+
+## Outbound Firewall (optional)
+
+By default this VM may connect **out** to anything — only the Proxmox management ports are blocked. At install you can opt into restricting egress to the ports the system actually needs:
+
+| Port | Why it must stay open |
+|---|---|
+| 53 | DNS — everything else depends on it |
+| 123 | NTP (chrony). Without it TLS validation and log correlation drift |
+| 67/68 | DHCP, when not statically addressed |
+| 80 | Alpine `apk` repositories, redirect-to-HTTPS |
+| 443 | Container registries, WordPress + plugin update APIs, CrowdSec, MaxMind, Trivy DB |
+| 25/465/587 | Outbound mail (already connection-rate-limited) |
+
+Everything else is dropped and logged (`nft-egress-drop`).
+
+**What this is and isn't.** 443 has to stay open — nothing here works without it — so this is *not* containment against a determined attacker, who will simply use 443. It removes the easy options: C2 on an odd port, a reverse shell on 4444, IRC botnet traffic on 6667, bulk exfiltration over a random high port. Worth having, not worth over-trusting.
+
+Manage it afterwards without a reinstall:
+
+```sh
+wp-hardening.sh egress-list                  # mode, allowed ports, recent drops
+wp-hardening.sh egress-allow 8443            # open a port (live + persisted)
+wp-hardening.sh egress-allow 1194 udp
+wp-hardening.sh egress-deny  8443            # close it again
+```
+
+Added ports live in nftables named sets, so a change takes effect immediately with no ruleset reload, and persists via `/etc/wp-install/egress-extra.nft`.
+
+If you answer **no** at the prompt, behaviour is unchanged from before: outbound is open apart from the hypervisor management plane.
 
 ---
 
@@ -650,3 +705,15 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 [MIT](LICENSE) — Copyright © 2026 RothITguy-jitsi.
 
 ---
+
+---
+
+<div align="center">
+
+**Built and maintained by RothITguy**
+
+*"~91% of WordPress vulnerabilities live in plugins — where most hardening never looks. This one does."*
+
+Issues and pull requests welcome. If you find something this gets wrong, that's the most useful thing you can send.
+
+</div>

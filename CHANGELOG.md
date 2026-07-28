@@ -6,6 +6,299 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — README voice
+
+The README read as a specification: accurate, thorough, and anonymous. Added
+the part that was missing — a first-person **"Why I built this"** section
+before the table of contents, and a signed footer.
+
+It opens on the three failures that motivated the project, in the order they
+actually happen: a plugin four versions behind that nobody was watching while
+the host and container were both patched; a nightly backup that had been an
+empty file for a year because no one ever restored one; and an update that
+broke a site at a bad hour with no way back. Then the distinction that the
+whole design follows from — every one-click installer solves *"get WordPress
+running"* and none solve *"still be running, still be yours, in six months."*
+
+Written in first person and kept specific, because a README that says
+"enterprise-grade security" tells a reader nothing, while "the backup was an
+empty file and had been for a year" tells them exactly which problem this
+exists to solve. Personality here is not decoration — it is the part that
+explains *why* the opinionated defaults are what they are.
+
+The closing paragraph restates the project's stance: every control states its
+limits at the prompt rather than in documentation, because a control you
+over-trust is worse than one whose edges you know.
+
+Footer invites issues and pull requests, and says that a report of something
+this gets wrong is the most useful thing to send — which, given how many of
+this project's real bugs were found by running it rather than reading it, is
+straightforwardly true.
+
+---
+
+## Unreleased — Closing line on the introduction
+
+A one-line summary now sits below the signature, in the installer and at the
+top of the README:
+
+> "~91% of WordPress vulnerabilities live in plugins — where most hardening
+> never looks. This one does."
+
+Two deliberate choices in the wording. It says **"looks there too"** rather
+than "scans your plugins for CVEs": `wp-plugins.sh` surfaces what is out of
+date through the WordPress.org update API, which is the practical remediation
+path, but it is not a CVE-matching scanner. Overstating that in the one line
+people will remember would be precisely the behaviour the rest of this
+installer refuses to engage in.
+
+And the figure carries its source (Patchstack, *State of WordPress Security in
+2026*) rather than floating as an unattributed statistic. A security tool
+quoting a number at you without saying where it came from is asking for trust
+it has not earned.
+
+---
+
+## Unreleased — Introduction before the first prompt
+
+The installer opened straight onto "VM ID [101]:" with a three-line banner.
+It now leads with a short explanation of what is actually different here,
+shown once before anything is asked, ending **by RothITguy**.
+
+The constraint applied while writing it: every claim has to be checkable
+against the finished VM. So it names the specific mechanisms — MariaDB on an
+`--internal` network with no host port and no egress; a CVE-scanned,
+health-checked candidate container validated while production keeps serving,
+with automatic rollback; digests rather than tags, so what was scanned is what
+runs; backups whose exit status, completion marker and archive are all
+verified before anything is rotated away; ~45 post-install checks that print
+the command to fix each failure; and plugin CVE visibility, which is where
+~91% of WordPress vulnerabilities live and which container scanning does not
+reach.
+
+It also states what this is **not** — not a managed service, not a substitute
+for off-box backups, not protection against someone specifically targeting
+you. "It raises the floor considerably and is honest about the ceiling."
+
+That last paragraph is the point of the whole thing. An installer that lists
+only its strengths sets someone up to over-trust it, and this project has
+spent the last several rounds fixing exactly that failure mode at the level of
+individual prompts. Doing it in the introduction and not at the top would have
+been inconsistent.
+
+A single Enter keypress separates it from the first prompt, so it is read
+rather than scrolled past.
+
+---
+
+## Unreleased — Security reasoning on every relevant prompt, attributed
+
+Extended the "state the bound of the control" principle across the installer.
+Nine prompts now carry a signed *"What this does and does not buy you"* block,
+rendered by shared `_sec_head` / `_sec_note` helpers so the format and the
+attribution stay consistent:
+
+- **Root password** — root SSH is disabled unconditionally, so this is a
+  console-only credential. That is deliberate (a recovery path independent of
+  the network, SSH, and whether the admin account was created), but it means
+  the password is only as meaningful as the Proxmox login that can open that
+  console. Hypervisor-tier secret, not a throwaway. Placed *before* the retry
+  loop, or it would reprint on every mistyped confirmation.
+- **Network mode** — framed as a security decision, not just networking:
+  SSH and wp-admin restrictions, reverse-proxy trust, and any external rule
+  naming this VM are all keyed to its address. A DHCP lease change moves the
+  host out from under all of them silently.
+- **SSH source restriction** — the highest-value control here, because it
+  removes the host from internet-wide brute-forcing entirely rather than
+  surviving it; and it trusts the network, so a compromised workstation
+  inside the allowed range is unaffected by it.
+- **Custom wp-admin slug** — named as obscurity, and defended as worth having
+  on its own terms (bots only try `/wp-login.php`, so they get a 403 before
+  PHP runs). Then what it does not stop: a leaked reset email, a plugin that
+  prints the login URL, the REST API. A filter, not a secret.
+- **CrowdSec enrolment** — states plainly that signals about attacks on this
+  VM leave it, alongside the real gain (a shared blocklist of addresses
+  already attacking others), so it is a decision rather than an unnoticed
+  default.
+- **Digest pinning** — guarantees **identity, not safety**. A pinned image
+  with a critical CVE stays pinned to that vulnerable image; pinning is what
+  makes Trivy's verdict meaningful, not a substitute for it.
+- Plus the egress firewall and GeoIP blocks from the previous entry.
+
+Each block is signed **— RothITguy**, making clear these are the project
+author's considered judgements rather than generic vendor boilerplate. The
+signature is applied once per reasoning block via a helper rather than
+sprinkled through the output, so it reads as authorship rather than noise.
+
+---
+
+## Unreleased — Security prompts state their own limits
+
+The egress caveat existed but was structurally backwards: the concrete,
+memorable examples (a reverse shell on 4444, IRC on 6667) were attached to the
+**benefit**, while the limitation was abstract and sat above a paragraph of
+reassurance about opening ports later. That is how a control gets
+over-trusted — the vivid part sells it and the bound gets skimmed.
+
+Reordered so the limitation is as concrete as the benefit and appears
+immediately before the question, with nothing between it and the prompt.
+
+**Applied the same standard to GeoIP**, which had no limitation statement at
+all. It now says plainly that country filtering is very effective against
+bulk opportunistic traffic — which is most of what hits a WordPress site —
+and is defeated in seconds by a VPN, proxy or Tor exit in an allowed country.
+A noise filter, not a boundary. It also warns that legitimate visitors
+travelling or on a VPN will be blocked, and confirms that LAN and loopback are
+exempt so it cannot lock the operator out of wp-admin.
+
+The principle: if the honest bound on a security control is worth writing in
+the README, it is worth putting in front of the person choosing whether to
+rely on it.
+
+---
+
+## Unreleased — Optional outbound (egress) firewall
+
+`TODO.md` has carried egress restriction as deferred, on the grounds that
+host-level egress rules are brittle against legitimate update paths and the
+network edge is the better layer. That reasoning holds for a *default*; it
+does not hold for an informed opt-in, which is what this adds.
+
+**Off by default.** Answering no leaves behaviour exactly as before — only the
+hypervisor management plane is blocked. Answering yes allows 53, 123, 67/68,
+80, 443 and the mail ports, and drops everything else with rate-limited
+logging.
+
+Each allowed port has a named consumer, so the list describes this system's
+actual dependencies rather than a guess: DNS and NTP (chrony — TLS validation
+and log correlation depend on it), apk repositories, container registries,
+WordPress and plugin update APIs, CrowdSec CAPI, MaxMind, the Trivy
+vulnerability database, and SMTP.
+
+**Stated honestly in the prompt and the README:** 443 must stay open, so this
+is not containment against a determined attacker. It removes the easy
+options — C2 on an odd port, a reverse shell on 4444, IRC on 6667, bulk
+exfiltration over a random high port.
+
+**Two ordering hazards handled, both of which fail silently if you get them
+wrong:**
+
+- The `forward` chain now accepts traffic *toward* the container subnets
+  before any egress allowlist is consulted. WordPress reaches MariaDB across
+  wp-front/wp-db, and a "restrict what containers may send" rule placed above
+  that would sever the database connection while looking like a hardening win.
+- The `output` chain accepts `ct state established,related` and loopback
+  before anything can drop. Without it the reply packets of an *inbound* SSH
+  session count as new egress and get dropped — locking the operator out of a
+  VM that is otherwise fine.
+
+**Runtime management** via `wp-hardening.sh egress-list|egress-allow|egress-deny`.
+Added ports live in nftables named sets, so a change applies to the running
+ruleset immediately — no regeneration, and no window where the firewall is
+absent — and is persisted to `/etc/wp-install/egress-extra.nft`, which the
+main ruleset includes. That file is created empty at install because nftables
+treats a missing include as fatal, and a fatal ruleset error means the VM
+boots with **no firewall at all** — much worse than the feature not working.
+
+---
+
+## Unreleased — Rollback fault-injection test (`test/vm-rollback-test.sh`)
+
+The post-cutover rollback branch is the last significant path in this project
+that has never executed. It cannot be reached with a normal image, because it
+requires a candidate that PASSES validation and then a production container
+that FAILS it — from the same image.
+
+So it is now tested by fault injection rather than by contriving a broken
+image. `wp-health-check.sh` is temporarily replaced with a wrapper that passes
+through for the candidate and fails for the container named `wordpress`. The
+two calls are distinguishable by their first argument (`wordpress-candidate`
+vs `wordpress`), so everything up to the cutover behaves exactly as in
+production and only the post-cutover verdict is forced. The real rename,
+restore and restart code then runs — this is a genuine test of that branch,
+not a simulation of it.
+
+Verified before shipping: the wrapper passes for `wordpress-candidate` and
+fails for `wordpress`; a non-zero result there reaches the
+`Health check failed — rolling back…` branch; and that branch does
+`podman rm -f wordpress` before `podman rename wordpress-old wordpress`, so
+the rename cannot collide with the container it is replacing.
+
+One refinement to the checks while writing it: `check-line-continuations.py`
+flagged a line in the new script that was a *comment* ending in a backslash,
+followed by another comment — help text wrapping a long example command. A
+trailing backslash on a comment line is not a continuation, so that was a
+false positive in the checker, now fixed. Confirmed it still catches the
+genuine bug by re-injecting it.
+
+The script restores the real health check on every exit path including
+`Ctrl-C` (trap, not just the happy path), refuses to run if a stale
+`wordpress-old` already exists, auto-derives a target tag that differs from
+the running one, and requires typing `rollback-test` to proceed. On failure it
+prints the manual recovery sequence and the `qm rollback` fallback, and says
+plainly that a Proxmox snapshot is the real safety net — the script cannot
+undo a broken rollback, and finding out whether one exists is the point.
+
+---
+
+## Unreleased — Cutover proven end to end; wp-cli wrappers had no DB access
+
+**The candidate/cutover path works, in both directions.**
+
+```
+✔  Candidate healthy (HTTP + PHP + DB confirmed) — swapping production to the new image now
+✔  WordPress base image updated to 6.9.4-php8.4-apache
+...
+✔  WordPress base image updated to 6.9.4-php8.3-apache
+```
+
+That was the last major unexercised path in the project. `TODO.md` has carried
+it as deferred since the beginning because it needed real hardware. It is now
+proven forwards and back: candidate start, validation, rename to
+`wordpress-old`, new container up, post-cutover validation, old container
+removed.
+
+**Separately: both wp-cli wrappers could not reach the database.**
+
+`wp-mail.sh test` reported:
+
+```
+Error: Error establishing a database connection.
+```
+
+That is not a mail failure -- wp-cli never got as far as SMTP. The official
+WordPress image uses `wp-config-docker.php`, which reads `DB_NAME`, `DB_USER`
+and `DB_PASSWORD` from the **environment**. The wp-cli container mounted the
+same html directory but was given none of those variables, so it loaded a
+wp-config that resolved to nothing. `wp-plugins.sh` had the identical defect
+and would have failed identically on first use.
+
+Both now pass `--env-file /etc/wordpress/env` and
+`-e WORDPRESS_DB_HOST=mariadb:3306` -- the same env-file the real container
+uses, so they cannot drift.
+
+Confirmed by the operator receiving a real message from the VM: `wp_mail()`
+inside the container was working the whole time, which is exactly what this
+diagnosis predicts. The relay credentials were never the problem.
+
+**Error attribution fixed too.** `wp-mail.sh` reported a database failure
+under "Credentials, TLS, DNS or reachability" -- pointing at the mail server
+when the mail server was fine. A database error is now named as one, with an
+explicit note that the relay was never contacted.
+
+**Cosmetic:** `podman rename`/`stop` echo the container name, so cutover
+printed a bare `wordpress-old` three times into the operator's output, looking
+like a warning. Suppressed on stdout; stderr and exit status (which the
+surrounding `if !` depends on) are untouched.
+
+**Worth recording:** while making the above fix, the comment explaining it was
+inserted inside a `podman run` line-continuation -- the exact mistake that
+broke the installer two rounds ago. `test/check-line-continuations.py` caught
+it before it shipped. That is the first time one of these checks has stopped a
+regression rather than explained one after the fact.
+
+---
+
 ## Unreleased — Candidate health check probed the wrong port
 
 The cutover test got further than ever: the candidate started, and PHP, DNS

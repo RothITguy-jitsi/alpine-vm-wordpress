@@ -35,7 +35,16 @@ _wp() {
     exit 1
   fi
   # shellcheck disable=SC2086 -- WPCLI_ENV is a deliberate word-split list
+  # The official WordPress image's wp-config.php reads DB_NAME/DB_USER/
+  # DB_PASSWORD from the ENVIRONMENT (it is wp-config-docker.php). A wp-cli
+  # container that mounts the same html directory but without those variables
+  # loads a wp-config resolving to nothing, and every command dies with
+  # "Error establishing a database connection" -- which reads like a database
+  # or (in wp-mail.sh) a mail-server fault when neither is wrong. Uses the
+  # same env-file as the real container so the two cannot drift.
   podman run --rm --network "container:wordpress" --user 33:33 \
+    --env-file /etc/wordpress/env \
+    -e WORDPRESS_DB_HOST=mariadb:3306 \
     ${WPCLI_ENV} \
     -v /home/wpuser/wp/html:/var/www/html \
     -v "${SECRETS_DIR}:/var/www/private:ro" \
@@ -126,6 +135,12 @@ do_test() {
       echo "   If it does not arrive, the relay accepted it but something"
       echo "   downstream dropped it: check SPF/DKIM alignment for $(_cfg from)"
       echo "   and your relay's own outbound log." ;;
+    *"Error establishing a database connection"*|*"database connection"*)
+      echo "✗  wp-cli could not reach the database, so the message was never sent." >&2
+      echo "   This is NOT a mail problem — the relay was never contacted." >&2
+      printf '   %s\n' "$_out" >&2
+      echo "   Check:  wp-plugins.sh doctor   (same wp-cli path)" >&2
+      exit 1 ;;
     *)
       echo "✗  Send failed. Output:" >&2
       printf '%s\n' "$_out" >&2

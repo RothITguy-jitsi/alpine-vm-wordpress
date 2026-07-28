@@ -65,6 +65,7 @@ ADMIN_USER_CREATED=$(_vars_q "${ADMIN_USER_CREATED:-0}")
 # truth that the validator cross-checks against.
 ADMIN_CIDR=$(_vars_q "${ADMIN_CIDR:-}")
 ALLOWED_ADMIN_IP=$(_vars_q "${ALLOWED_ADMIN_IP:-}")
+RESTRICT_EGRESS=$(_vars_q "${RESTRICT_EGRESS:-0}")
 SMTP_HOST=$(_vars_q "${SMTP_HOST:-}")
 SMTP_PORT=$(_vars_q "${SMTP_PORT:-587}")
 SMTP_USER=$(_vars_q "${SMTP_USER:-}")

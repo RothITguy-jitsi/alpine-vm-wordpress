@@ -35,6 +35,7 @@ TRIVY_CACHE_DIR="/var/cache/trivy"
 # /etc/wp-install/ (not /var/run) so a reboot while open doesn't reset the
 # clock — the whole point is a bound on how long this stays open.
 UPLOADS_PHP_MARKER="/etc/wp-install/uploads-php-opened-at"
+EGRESS_EXTRA_FILE="/etc/wp-install/egress-extra.nft"
 UPLOADS_PHP_MAX_OPEN_SECS=3600
 
 restart_wp() { PRUN restart wordpress >/dev/null 2>&1 && echo "  ✔  WordPress restarted" || true; }
@@ -64,6 +65,7 @@ show_status() {
   echo "Lynis last:  $(stat -c '%y' /var/log/lynis-report.dat 2>/dev/null | cut -d. -f1 || echo 'not run yet')"
   echo ""
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
+  echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
 
@@ -127,6 +129,70 @@ case "${1:-status}" in
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;
   restart-wp)  restart_wp ;;
+  egress-list)
+    # Show what the LIVE ruleset permits, not what a config file says it
+    # should -- the two diverge the moment someone edits by hand.
+    echo ""
+    echo "Outbound (egress) policy"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+    if nft list chain inet filter output 2>/dev/null | grep -q "nft-egress-drop"; then
+      echo "  Mode: RESTRICTED — anything not listed below is dropped and logged."
+    else
+      echo "  Mode: UNRESTRICTED — only the hypervisor management ports are blocked."
+      echo "        (Enable at install time, or add rules by hand.)"
+    fi
+    echo ""
+    echo "  Always allowed:  53 DNS · 123 NTP · 67/68 DHCP · 80 HTTP · 443 HTTPS"
+    echo "                   25/465/587 mail (connection-rate-limited)"
+    echo ""
+    echo "  Operator-added TCP ports:"
+    nft list set inet filter egress_extra_tcp 2>/dev/null \
+      | sed -n 's/.*elements = {\(.*\)}.*/    \1/p' | grep . || echo "    (none)"
+    echo "  Operator-added UDP ports:"
+    nft list set inet filter egress_extra_udp 2>/dev/null \
+      | sed -n 's/.*elements = {\(.*\)}.*/    \1/p' | grep . || echo "    (none)"
+    echo ""
+    echo "  Recent drops (last 10):"
+    grep "nft-egress-drop" /var/log/messages 2>/dev/null | tail -10 | sed 's/^/    /' \
+      || echo "    (none logged)"
+    echo ""
+    echo "  Open a port:   wp-hardening.sh egress-allow <port> [tcp|udp]"
+    echo "  Close it:      wp-hardening.sh egress-deny  <port> [tcp|udp]" ;;
+
+  egress-allow|egress-deny)
+    _act="$1"; _port="${2:-}"; _proto="${3:-tcp}"
+    case "$_port" in
+      ''|*[!0-9]*) echo "Usage: wp-hardening.sh ${_act} <port> [tcp|udp]" >&2; exit 1 ;;
+    esac
+    [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ] || { echo "Port must be 1-65535" >&2; exit 1; }
+    case "$_proto" in tcp|udp) : ;; *) echo "Protocol must be tcp or udp" >&2; exit 1 ;; esac
+    _set="egress_extra_${_proto}"
+    # Applied to the running ruleset AND written to the persistence file that
+    # the main ruleset includes. Doing only the first is lost on reboot;
+    # doing only the second is a change that appears to have had no effect.
+    mkdir -p "$(dirname "$EGRESS_EXTRA_FILE")"
+    [ -f "$EGRESS_EXTRA_FILE" ] || {
+      printf '# Operator-added egress ports (wp-hardening.sh egress-allow).\n' > "$EGRESS_EXTRA_FILE"
+      printf '# Included by /etc/nftables.nft — do not delete; empty is valid.\n' >> "$EGRESS_EXTRA_FILE"
+      chmod 644 "$EGRESS_EXTRA_FILE"
+    }
+    _line="add element inet filter ${_set} { ${_port} }"
+    if [ "$_act" = "egress-allow" ]; then
+      nft add element inet filter "$_set" "{ ${_port} }" 2>/dev/null \
+        || { echo "✗ Could not add to the live ruleset — is nftables loaded?" >&2; exit 1; }
+      grep -qxF "$_line" "$EGRESS_EXTRA_FILE" 2>/dev/null || echo "$_line" >> "$EGRESS_EXTRA_FILE"
+      echo "✔ ${_proto}/${_port} allowed outbound (live now, and persisted)"
+      echo "  ⚠ Every port opened here is one more way out for a compromised site."
+      echo "    Review periodically:  wp-hardening.sh egress-list"
+    else
+      nft delete element inet filter "$_set" "{ ${_port} }" 2>/dev/null || true
+      if [ -f "$EGRESS_EXTRA_FILE" ]; then
+        grep -vxF "$_line" "$EGRESS_EXTRA_FILE" > "${EGRESS_EXTRA_FILE}.tmp" 2>/dev/null \
+          && mv -f "${EGRESS_EXTRA_FILE}.tmp" "$EGRESS_EXTRA_FILE"
+      fi
+      echo "✔ ${_proto}/${_port} no longer allowed outbound"
+    fi ;;
+
   check-expiry)
     # Called every 15 min from cron (payload/cron/wordpress-vm.cron). Not a
     # user-facing command, but harmless if run by hand. No-ops silently

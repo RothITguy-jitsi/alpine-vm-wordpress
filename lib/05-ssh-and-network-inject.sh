@@ -115,7 +115,24 @@ fi
 
 # ─ nftables ───────────────────────────────────────────────────────────────────
 echo "$NFT_CONF" > "$MNT/etc/nftables.nft"; chmod 600 "$MNT/etc/nftables.nft"
-msg_ok "nftables.nft injected"
+
+# Persistence for operator-added egress ports. `wp-hardening.sh egress-allow`
+# applies a port to the LIVE ruleset and appends an `add element` line here;
+# this include is what makes it survive a reboot. Created empty (comments
+# only) at install because nftables treats a missing include as a fatal
+# error -- and a fatal error loading nftables means the VM boots with NO
+# firewall at all, which is a far worse outcome than the feature not working.
+mkdir -p "$MNT/etc/wp-install"
+cat > "$MNT/etc/wp-install/egress-extra.nft" << 'EGRESSEXTRA'
+# Operator-added egress ports, managed by:
+#   wp-hardening.sh egress-allow <port> [tcp|udp]
+#   wp-hardening.sh egress-deny  <port> [tcp|udp]
+# Included from /etc/nftables.nft. Do not delete this file — an empty one is
+# valid and expected; a missing one makes the whole ruleset fail to load.
+EGRESSEXTRA
+chmod 644 "$MNT/etc/wp-install/egress-extra.nft"
+printf '\ninclude "/etc/wp-install/egress-extra.nft"\n' >> "$MNT/etc/nftables.nft"
+msg_ok "nftables.nft injected (with egress-extra include)"
 
 # ─ Network addressing (DHCP or static) ────────────────────────────────────────
 # Alpine's cloud image reads /etc/network/interfaces via the OpenRC "networking"

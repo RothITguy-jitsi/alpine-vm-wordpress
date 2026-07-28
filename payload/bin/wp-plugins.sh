@@ -82,9 +82,18 @@ _wp() {
     echo "     rc-service wp-container start" >&2
     exit 1
   fi
+  # The official WordPress image's wp-config.php reads DB_NAME/DB_USER/
+  # DB_PASSWORD from the ENVIRONMENT (it is wp-config-docker.php). A wp-cli
+  # container that mounts the same html directory but without those variables
+  # loads a wp-config resolving to nothing, and every command dies with
+  # "Error establishing a database connection" -- which reads like a database
+  # or (in wp-mail.sh) a mail-server fault when neither is wrong. Uses the
+  # same env-file as the real container so the two cannot drift.
   podman run --rm \
     --network "container:wordpress" \
     --user "${WPCLI_UID}:${WPCLI_UID}" \
+    --env-file /etc/wordpress/env \
+    -e WORDPRESS_DB_HOST=mariadb:3306 \
     -v "${WP_HTML_DIR}:/var/www/html" \
     "$WPCLI_IMAGE" "$@"
 }

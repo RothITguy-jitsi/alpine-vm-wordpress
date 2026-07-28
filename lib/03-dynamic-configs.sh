@@ -25,6 +25,58 @@ else
   WEB_RULE="tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 fi
 
+# ── Optional outbound (egress) restriction ────────────────────────────────────
+# Default OFF. When on, the VM and its containers may only reach the ports
+# every feature here actually needs; everything else is logged and dropped.
+#
+# What is allowed and why -- each of these has a concrete consumer, so the
+# list is a statement about this system's dependencies rather than a guess:
+#   53  DNS        resolution for everything below
+#   123 NTP        chrony; without it TLS validation and log correlation drift
+#   67/68 DHCP     only used when the VM is not statically addressed
+#   80  HTTP       Alpine apk repositories, redirect-to-HTTPS
+#   443 HTTPS      registries (Docker Hub), WordPress + plugin update APIs,
+#                  CrowdSec CAPI, MaxMind, Trivy vulnerability DB, GitHub
+#   25/465/587     outbound mail (already connection-rate-limited above)
+#
+# Stated plainly: 443 has to stay open, so this is not containment against a
+# determined attacker -- anyone who wants a covert channel will use 443. It
+# removes the easy options: C2 on an odd port, a reverse shell on 4444, a
+# botnet joining IRC on 6667, bulk exfiltration over a random high port.
+#
+# Operator-added ports live in the named sets declared on the table, so
+# `wp-hardening.sh egress-allow 8443` takes effect immediately and survives a
+# reboot, without regenerating or reloading this file.
+if [[ "${RESTRICT_EGRESS:-0}" == "1" ]]; then
+  EGRESS_OUTPUT="        # ── Egress restriction ACTIVE (RESTRICT_EGRESS=1) ──
+        # The host's own outbound traffic. ct-established and lo were already
+        # accepted above, so only genuinely new connections reach here.
+        ip daddr { 10.89.10.0/24, 10.89.20.0/24 } accept
+        udp dport { 53, 67, 68, 123 } accept
+        tcp dport { 53, 80, 443 } accept
+        tcp dport { 25, 465, 587 } accept
+        tcp dport @egress_extra_tcp accept
+        udp dport @egress_extra_udp accept
+        icmp type echo-request accept
+        icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert } accept
+        limit rate 5/minute log prefix \"nft-egress-drop \" level warn
+        counter drop"
+  EGRESS_FORWARD="        # ── Container egress, restricted (RESTRICT_EGRESS=1) ──
+        # SMTP is handled by the rate-limit rules above and never reaches here.
+        ip saddr 10.89.10.0/24 udp dport { 53, 123 } accept
+        ip saddr 10.89.10.0/24 tcp dport { 53, 80, 443 } accept
+        ip saddr 10.89.10.0/24 tcp dport @egress_extra_tcp accept
+        ip saddr 10.89.10.0/24 udp dport @egress_extra_udp accept
+        ip saddr 10.89.10.0/24 icmp type echo-request accept
+        ip saddr 10.89.10.0/24 limit rate 5/minute log prefix \"nft-egress-drop-ctr \" level warn
+        ip saddr 10.89.10.0/24 counter drop"
+else
+  EGRESS_OUTPUT="        # Egress unrestricted (RESTRICT_EGRESS=0) — only the hypervisor
+        # management plane above is blocked."
+  EGRESS_FORWARD="        # wp-front (10.89.10.0/24): WordPress's egress + published-port network.
+        ip saddr 10.89.10.0/24 accept"
+fi
+
 # ── Hypervisor management-plane egress block (NEW) ────────────────────────────
 # A compromised WordPress VM has no legitimate reason to reach the Proxmox
 # management plane, and that plane is the highest-value thing on the LAN from
@@ -95,6 +147,14 @@ NFT_CONF=$(cat << NFTEOF
 # --internal — no route out regardless of this ruleset).
 flush ruleset
 table inet filter {
+    # Operator-added egress ports live in named sets rather than in this file,
+    # so wp-hardening.sh can open one live with `nft add element` -- no
+    # regeneration, no reload, no window where the whole ruleset is absent.
+    # Declared unconditionally: harmless when egress is unrestricted, and it
+    # means the management commands behave identically either way.
+    set egress_extra_tcp { type inet_service; flags interval; }
+    set egress_extra_udp { type inet_service; flags interval; }
+
     chain input {
         type filter hook input priority filter; policy drop;
         iif lo accept
@@ -145,20 +205,29 @@ table inet filter {
         ct state established,related accept
         ct state invalid drop
 ${PVE_BLOCK_FORWARD}
-${SMTP_RATE_LIMIT}
-        # wp-front (10.89.10.0/24): WordPress's egress + published-port network.
-        ip saddr 10.89.10.0/24 accept
+        # Traffic TOWARD the container subnets is accepted before any egress
+        # allowlist is consulted. This ordering is load-bearing: WordPress
+        # reaches MariaDB across wp-front/wp-db, and a "restrict what
+        # containers may send" rule placed above these would sever the
+        # database connection while looking like a hardening win.
         ip daddr 10.89.10.0/24 accept
-        # wp-db (10.89.20.0/24, --internal): WordPress<->MariaDB traffic only.
-        # netavark never routes an --internal network to the internet, so this
-        # rule cannot grant MariaDB egress — it only permits the local
-        # container-to-container path.
-        ip saddr 10.89.20.0/24 accept
         ip daddr 10.89.20.0/24 accept
+        # wp-db (10.89.20.0/24) is --internal: netavark never routes it to
+        # the internet, so this permits only the container-to-container path.
+        ip saddr 10.89.20.0/24 accept
+${SMTP_RATE_LIMIT}
+${EGRESS_FORWARD}
     }
     chain output {
         type filter hook output priority filter; policy accept;
+        # Both of these MUST precede any drop below. Without the conntrack
+        # rule, the reply packets of an INBOUND ssh or http connection count
+        # as fresh egress and get dropped -- locking the operator out of a VM
+        # that is otherwise working perfectly.
+        ct state established,related accept
+        oif "lo" accept
 ${PVE_BLOCK_OUTPUT}
+${EGRESS_OUTPUT}
     }
 }
 NFTEOF
