@@ -59,7 +59,9 @@ for a in "$@"; do
   esac
 done
 
-say()  { printf '%s\n' "$*"; }
+# %b, not %s: the verdict lines below embed colour escapes, and with %s
+# they printed literally (\033[32mROLLBACK WORKS.\033[0m) on a real run.
+say()  { printf '%b\n' "$*"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✔\033[0m  %s\n' "$*"; }
 bad()  { printf '  \033[31m✗\033[0m  %s\n' "$*"; }

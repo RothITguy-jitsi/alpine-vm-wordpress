@@ -39,7 +39,7 @@ That is fixed: every normal assertion now requires the command to succeed before
 | Trivy installer checksum (15) | Deferred | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
 | CrowdSec key in argv (21) | Deferred | Eliminating the brief argv exposure depends on whether the installed cscli supports a stdin/fd interface |
 | Backup restoration proof | Deferred | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
-| Full candidate/cutover/rollback harness coverage | **Cutover DONE** (proven on hardware both directions, 6.9.4-php8.3 ↔ php8.4); rollback still deferred | test-wordpress-vm.sh exercises the rollback trigger (section 8) and the backup script (section 7), but not a full "bad candidate → automatic rollback → verified-healthy old version" run end to end. Real hardware and a deliberately-broken candidate image are both needed to build this safely |
+| Full candidate/cutover/rollback harness coverage | **DONE** — cutover proven both directions (6.9.4-php8.3 ↔ php8.4), and rollback proven by fault injection (`test/vm-rollback-test.sh`): forced post-cutover failure, automatic restore to the original image, site healthy, no leftover container | test-wordpress-vm.sh exercises the rollback trigger (section 8) and the backup script (section 7), but not a full "bad candidate → automatic rollback → verified-healthy old version" run end to end. Real hardware and a deliberately-broken candidate image are both needed to build this safely |
 
 **On candidate DB isolation specifically. **It is no longer blocked on the absence of a harness — it's blocked on real-hardware validation, which is a smaller gap. The two designs from the last round still stand, simpler first: a temporary SELECT-only MariaDB user the candidate points at (reads work, any write-on-init fails harmlessly against production), or a full dump-and-restore into a throwaway container on an isolated network. Both change live container/DB/network orchestration, so both want the harness to prove them end-to-end on real hardware before they ship — the same reasoning that kept them out last time, now one step closer.
 
@@ -140,3 +140,33 @@ anyone with existing automation or documentation referencing the current names, 
 the profile difference is already stated at the prompt, in the summary, and in
 README. Worth doing at a major version boundary with a migration note — not as an
 unannounced change inside a patch round.
+
+## Planned: safe site import
+
+Importing an existing WordPress site is a stated future direction, and the
+malware scanner was built with it in mind rather than retrofitted later. Two
+design decisions were made now specifically to support it:
+
+- **`--path <dir>`** — every layer scans an arbitrary tree, not a hardcoded
+  `/home/wpuser/wp/html`. An import can therefore be staged somewhere
+  isolated and scanned *before* anything is activated.
+- **`--json <file>`** — machine-readable findings with severity counts, so an
+  import flow can gate on them programmatically instead of parsing console
+  output.
+
+What still needs building for import:
+
+1. **Staging area** — unpack the incoming files and database somewhere the
+   web server cannot reach, so a webshell in the archive is never executable
+   during inspection.
+2. **Database import scanning** — the current `db` layer queries a *live*
+   database. Import needs the same analysis against a dump file before it is
+   loaded, which is a different code path.
+3. **A gate with a defined policy** — what happens on a critical finding.
+   Refusing outright is wrong (people import known-compromised sites
+   deliberately, to clean them); proceeding silently is worse. Probably:
+   refuse by default, allow an explicit acknowledged override, quarantine
+   flagged files rather than importing them.
+4. **Core normalisation** — an imported site's core should be replaced with
+   the pinned image's core rather than trusted, since modified core files are
+   exactly what an attacker leaves behind.

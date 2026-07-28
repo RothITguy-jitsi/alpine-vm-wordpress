@@ -51,6 +51,7 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
+- [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional)](#outbound-firewall-optional)
 - [Outbound Email](#outbound-email)
 - [WordPress Site Address](#wordpress-site-address)
@@ -279,6 +280,43 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 ```
 
 (if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
+
+---
+
+## Malware & Integrity Scanning
+
+`wp-malware-scan.sh` covers the layer container scanning cannot reach: the site's own files and database.
+
+```sh
+wp-malware-scan.sh              # full scan
+wp-malware-scan.sh quick        # structural + core + DB (the daily cron job)
+wp-malware-scan.sh structural   # PHP in uploads, permissions, stray files
+wp-malware-scan.sh core         # core files vs the pinned image
+wp-malware-scan.sh yara         # signature scan
+wp-malware-scan.sh db           # database content analysis
+wp-malware-scan.sh status       # last scan result
+wp-malware-scan.sh quarantine <file>
+```
+
+**Layers, ordered by signal-to-noise rather than by how impressive they sound:**
+
+| Layer | What it catches | Noise |
+|---|---|---|
+| **Structural** | `.php` in `wp-content/uploads`, PHP hidden in `.jpg`, world-writable files, stray PHP | Near zero — nothing legitimate does these |
+| **Core integrity** | Any modified or missing WordPress core file | Zero — compared against `/usr/src/wordpress` in the **pinned** image |
+| **YARA** | Webshells, obfuscation, request-data execution | Low; tiered critical/high/suspicious |
+| **Database** | Code in autoloaded options, rogue admins, injected post content | Low, and unique — file-only scanners miss all of it |
+| **ClamAV** | Broad signatures, uploaded binaries | Optional, not installed by default |
+
+**Core integrity is the strongest check here**, and it's a side effect of digest pinning: the pinned image contains pristine WordPress core, is read-only, and was already Trivy-scanned. Most scanners have to fetch a checksum list over the network and trust it.
+
+**On ClamAV:** deliberately *not* installed by default. Its signature database alone is close to a gigabyte resident, which is a poor trade on a 4 GB VM already running WordPress, MariaDB and CrowdSec — and its PHP-webshell coverage is weaker than the YARA layer. Add it if you want it: `apk add clamav clamav-libunrar && freshclam`.
+
+**On Linux Malware Detect (maldet/LMD):** deliberately not included. It installs by piping an unsigned shell script from a third-party host — the same supply-chain pattern this project refuses for the Trivy installer — and its signatures overlap ClamAV heavily. Real trust cost, marginal added coverage.
+
+**It reports; it does not delete.** Auto-removal breaks working sites on a false positive, and on a real compromise it destroys the evidence of how they got in — which is the part that stops it recurring. `quarantine` moves a file aside reversibly and records its original path.
+
+Nothing here detects a backdoor written specifically for your site. Clean output is evidence, not proof.
 
 ---
 

@@ -24,3 +24,13 @@
 # the operator learns to ignore. Never auto-updates -- see wp-plugins.sh for
 # why that's deliberate rather than an omission.
 0 7 * * 1 /usr/local/bin/wp-plugins.sh check >/dev/null 2>&1
+# Daily malware and integrity scan (03:30 UTC). Runs the QUICK profile:
+# structural checks, core-vs-pinned-image comparison, and database analysis.
+# These are the high-signal, low-noise layers. YARA and ClamAV are excluded
+# from the daily job deliberately -- YARA because a full-tree signature scan
+# is heavy enough to matter on a small VM, ClamAV because of its memory
+# footprint. Reports via syslog only when something is found, so a clean day
+# is silent and the operator does not learn to ignore it.
+30 3 * * * /usr/local/bin/wp-malware-scan.sh quick >/dev/null 2>&1 || logger -t wp-malware "scan reported findings — run: wp-malware-scan.sh status"
+# Weekly full scan including YARA (Sunday 03:45 UTC).
+45 3 * * 0 /usr/local/bin/wp-malware-scan.sh yara >/dev/null 2>&1 || logger -t wp-malware "weekly YARA scan reported findings — run: wp-malware-scan.sh status"

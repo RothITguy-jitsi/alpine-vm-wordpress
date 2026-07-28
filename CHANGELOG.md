@@ -6,6 +6,72 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — `wp-hardening.sh geoip-test`
+
+GeoIP-enabled cutover and rollback both verified on hardware: the swap
+happened, the forced failure triggered a revert, and GeoIP was then rebuilt on
+the restored image with `mod_maxminddb` loading again. Full cycle clean.
+
+That exposed a gap in what could be checked afterwards. `validate-wordpress.sh`
+only confirms the module is **loaded** — which says nothing about whether the
+database resolves addresses correctly, or whether the allow/block list does
+what the operator believes it does.
+
+`wp-hardening.sh geoip-test [ip]` now checks the parts that are checkable:
+module live in the running Apache, database present **and fresh** (GeoLite2 is
+republished weekly and allocations move — a stale database misclassifies real
+visitors, which presents as random 403s rather than as an out-of-date file),
+the policy read from the live `geoip.conf` rather than from `vars.sh`, and how
+a given address resolves along with the verdict it would receive.
+
+**It states plainly what it cannot do.** Every request originating on the VM
+comes from a private address, and private addresses are exempt by design, so
+an in-VM test will always be allowed regardless of policy. Reporting that as
+"GeoIP works" would be worse than not testing at all. The command says so and
+gives the two real end-to-end tests: curl from a host in a blocked country, or
+curl from the trusted reverse proxy with a forged `X-Forwarded-For` — noting
+that only the configured proxy IP is trusted for that header, so it cannot be
+faked from elsewhere.
+
+---
+
+## Unreleased — ROLLBACK PROVEN. Every install-time path now verified.
+
+The fault-injection test ran on real hardware and the rollback branch worked:
+
+```
+✔  Candidate healthy — swapping production to the new image now
+   [rollback-test] forcing post-cutover health FAILURE for 'wordpress'
+✗  Health check failed — rolling back…
+✗  Rolled back to 6.9.4-php8.3-apache.
+✔  'wordpress' container is running
+✔  Image rolled back to the original: localhost/wordpress-geoip:6.9.4-php8.3-apache
+✔  No leftover 'wordpress-old' container
+✔  Site passes the real health check (HTTP + PHP + DB)
+```
+
+Worth noting what that last part demonstrates beyond the branch itself: the
+restored image is the **GeoIP-built** one, so rollback returned the VM to its
+actual prior state rather than to the upstream base image. And the retry loop
+is visible in the log — the forced failure was hit six times before update.sh
+gave up and reverted, which is the intended behaviour for a container that
+might simply be slow to come up.
+
+`TODO.md` has carried candidate/cutover/rollback coverage as deferred since
+the repository was first split, on the grounds that it needed real hardware
+and a deliberately broken image. Both halves are now proven: cutover in both
+directions, and rollback by fault injection. **Every install-time and
+update-time path in this project has now executed successfully at least
+once.**
+
+**One bug in the test script itself**, found by reading its own output: the
+verdict printed `\033[32mROLLBACK WORKS.\033[0m` literally. `say()` used
+`printf '%s'`, which does not interpret escapes. Changed to `%b`. Cosmetic,
+but the summary line is the one thing an operator reads, and it should not
+look broken at the exact moment it reports success.
+
+---
+
 ## Unreleased — README voice
 
 The README read as a specification: accurate, thorough, and anonymous. Added

@@ -122,6 +122,29 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 ts "Installing wp-hardening.sh security toggle"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-hardening.sh" /usr/local/bin/wp-hardening.sh
+
+# ── Malware / integrity scanning ─────────────────────────────────────────────
+ts "Installing malware and integrity scanning"
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-malware-scan.sh" /usr/local/bin/wp-malware-scan.sh
+mkdir -p /etc/wp-install/malware
+install -m 0644 "${PAYLOAD_DIR}/malware/wp-malware.yar" /etc/wp-install/malware/wp-malware.yar
+mkdir -p /var/lib/wp-quarantine /var/lib/wp-malware-scan
+chmod 700 /var/lib/wp-quarantine
+ok "wp-malware-scan.sh installed (structural / core / yara / db / clamav)"
+
+# YARA is the backbone of the signature layer and is small, so it is installed
+# unconditionally. ClamAV is NOT: its signature database alone is close to a
+# gigabyte resident, which is a poor trade on a 4 GB VM also running
+# WordPress, MariaDB and CrowdSec -- and its PHP-webshell coverage is weaker
+# than the YARA rules. It stays a deliberate, on-demand choice.
+if apk add --no-cache yara >/dev/null 2>&1; then
+  ok "yara installed — signature scanning active"
+else
+  warn "yara could not be installed; the YARA layer will be skipped"
+  warn "  Install later with: apk add yara"
+fi
+ok "  ClamAV is optional and NOT installed by default (memory cost)."
+ok "  Add it if you want that layer: apk add clamav clamav-libunrar && freshclam"
 chmod +x /usr/local/bin/wp-hardening.sh
 ok "wp-hardening.sh installed"
 ok "  Usage: wp-hardening.sh status"

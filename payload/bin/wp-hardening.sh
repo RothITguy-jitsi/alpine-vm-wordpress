@@ -66,6 +66,7 @@ show_status() {
   echo ""
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
+  echo "          geoip-test [ip]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
 
@@ -129,6 +130,121 @@ case "${1:-status}" in
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;
   restart-wp)  restart_wp ;;
+  geoip-test)
+    # Functional test of country filtering. validate-wordpress.sh only checks
+    # that mod_maxminddb is LOADED, which says nothing about whether the
+    # database resolves addresses correctly or whether your allow/block list
+    # does what you think it does.
+    _ip="${2:-}"
+    GEOIP_DB=/home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb
+    echo ""
+    echo "GeoIP filtering — functional test"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    if [ "${GEOIP_ENABLED:-0}" != "1" ]; then
+      echo "  GeoIP is not enabled on this VM. Nothing to test."
+      echo "  Enable it with:  doas /usr/local/bin/wp-geoip-setup.sh"
+      exit 0
+    fi
+
+    # 1. Module actually loaded in the running Apache.
+    if podman exec wordpress apache2ctl -M 2>/dev/null | grep -qi maxminddb; then
+      echo "  ✔  mod_maxminddb is loaded in the running Apache"
+    else
+      echo "  ✗  mod_maxminddb is NOT loaded — filtering is inactive right now"
+      echo "     doas podman logs --tail 30 wordpress"
+      exit 1
+    fi
+
+    # 2. Database present, and FRESH. GeoLite2 is republished weekly and IP
+    #    allocations move; a database left to rot quietly misclassifies real
+    #    visitors, which looks like random 403s rather than a stale file.
+    if [ -s "$GEOIP_DB" ]; then
+      _age_days=$(( ( $(date +%s) - $(stat -c %Y "$GEOIP_DB" 2>/dev/null || echo 0) ) / 86400 ))
+      _size=$(du -h "$GEOIP_DB" | cut -f1)
+      if [ "$_age_days" -gt 60 ]; then
+        echo "  ⚠  Database present (${_size}) but ${_age_days} days old — refresh it:"
+        echo "     doas /usr/local/bin/wp-geoip-setup.sh"
+      else
+        echo "  ✔  Database present (${_size}, ${_age_days} days old)"
+      fi
+    else
+      echo "  ✗  Database missing at ${GEOIP_DB}"
+      exit 1
+    fi
+
+    # 3. Configured policy, read from the live config rather than from vars.sh
+    #    -- the running Apache is what actually decides.
+    _conf=/home/wpuser/wp/apache-conf/geoip.conf
+    _mode=$(grep -o 'AllowCountry\|BlockCountry' "$_conf" 2>/dev/null | head -1)
+    _list=$(sed -n 's/.*MM_COUNTRY_CODE "\^(\([^)]*\))\$".*/\1/p' "$_conf" 2>/dev/null | head -1)
+    case "$_mode" in
+      AllowCountry) echo "  ℹ  Policy: WHITELIST — only [${_list}] may reach the site" ;;
+      BlockCountry) echo "  ℹ  Policy: BLOCKLIST — [${_list}] is denied, everyone else allowed" ;;
+      *)            echo "  ⚠  Could not read the policy from ${_conf}" ;;
+    esac
+    echo "  ℹ  Private/loopback addresses are always exempt (your LAN is never blocked)"
+
+    # 4. Resolve a specific address, if one was given.
+    if [ -n "$_ip" ]; then
+      echo ""
+      echo "  Looking up ${_ip}…"
+      if command -v mmdblookup >/dev/null 2>&1; then
+        _cc=$(mmdblookup --file "$GEOIP_DB" --ip "$_ip" country iso_code 2>/dev/null \
+              | sed -n 's/.*"\([A-Z][A-Z]\)".*/\1/p' | head -1)
+        if [ -z "$_cc" ]; then
+          echo "  ⚠  No country for ${_ip} in the database."
+          echo "     Private, reserved and some newly-allocated ranges have no entry."
+          echo "     Under a WHITELIST that means DENIED unless the address is"
+          echo "     private (private is exempt); under a BLOCKLIST it means allowed."
+        else
+          echo "  ℹ  ${_ip} → ${_cc}"
+          case "$_mode" in
+            AllowCountry)
+              if echo "$_list" | tr '|' ' ' | grep -qw "$_cc"; then
+                echo "  ✔  Expected verdict: ALLOWED (${_cc} is in the whitelist)"
+              else
+                echo "  ✔  Expected verdict: BLOCKED (${_cc} is not in the whitelist)"
+              fi ;;
+            BlockCountry)
+              if echo "$_list" | tr '|' ' ' | grep -qw "$_cc"; then
+                echo "  ✔  Expected verdict: BLOCKED (${_cc} is in the blocklist)"
+              else
+                echo "  ✔  Expected verdict: ALLOWED (${_cc} is not in the blocklist)"
+              fi ;;
+          esac
+        fi
+      else
+        echo "  ⚠  mmdblookup is not installed, so the address cannot be resolved here."
+        echo "     It is a small package and does not touch the containers:"
+        echo "       doas apk add libmaxminddb"
+      fi
+    else
+      echo ""
+      echo "  Resolve a specific address:  wp-hardening.sh geoip-test 8.8.8.8"
+    fi
+
+    # 5. Be honest about what this proved.
+    echo ""
+    echo "  What this checked: the module is live, the database is present and"
+    echo "  fresh, the policy is what you think it is, and how a given address"
+    echo "  resolves. That is the configuration."
+    echo ""
+    echo "  What it CANNOT check from inside the VM: Apache's actual verdict on"
+    echo "  a real foreign request. Every request originating here comes from a"
+    echo "  private address, which is exempt by design, so it will always be"
+    echo "  allowed no matter what the policy says."
+    echo ""
+    echo "  The only true end-to-end test is from outside:"
+    echo "    • From a host in a blocked country (a cheap VPS, or a VPN exit):"
+    echo "        curl -o /dev/null -w '%{http_code}\\n' http://<your-site>/"
+    echo "        expect 403 when blocked, 200 when allowed"
+    echo "    • Or, if a reverse proxy fronts this VM, from the proxy itself:"
+    echo "        curl -o /dev/null -w '%{http_code}\\n' \\"
+    echo "             -H 'X-Forwarded-For: <foreign-ip>' http://<vm-ip>/"
+    echo "      (only the configured proxy IP is trusted for that header, so"
+    echo "       this cannot be forged from anywhere else)" ;;
+
   egress-list)
     # Show what the LIVE ruleset permits, not what a config file says it
     # should -- the two diverge the moment someone edits by hand.
