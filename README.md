@@ -45,12 +45,15 @@ It's also honest about where it stops. Every control here states its own limits 
 
 - [Why I built this](#why-i-built-this)
 - [What This Is](#what-this-is)
+- [Architecture Diagrams](ARCHITECTURE.md)
 - [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
+- [Login Protection](#login-protection)
+- [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional)](#outbound-firewall-optional)
 - [Outbound Email](#outbound-email)
@@ -86,6 +89,14 @@ Run `install.sh` on a Proxmox VE host as root. It will:
    - *Stage 2* — install Podman, create the two segmented container networks, stand up MariaDB → WordPress → CrowdSec, generate a syntax-checked nftables ruleset, configure hourly log rotation, install Trivy and Lynis, write out the `update.sh` / `wp-hardening.sh` / `validate-wordpress.sh` / `wp-db-backup.sh` management scripts, and run a full post-install validation suite.
 
 Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real time via `qm terminal <VMID>`.
+
+---
+
+## Architecture
+
+Four diagrams — components and trust boundaries, what a request passes through, the install flow, and the update/rollback path — are in **[ARCHITECTURE.md](ARCHITECTURE.md)**. They render on GitHub.
+
+The one structural fact worth stating here: **MariaDB has no route to the internet and no host port.** It sits on a Podman `--internal` network, so a compromised WordPress cannot reach past it, and the database stays unexposed even if a firewall rule is wrong.
 
 ---
 
@@ -126,6 +137,7 @@ and skips that step. Either way this is what actually gets used:
 ├── test/
 │   ├── test-wordpress-vm.sh     # integration test harness (see test/README.md)
 │   └── README.md
+├── ARCHITECTURE.md             # Mermaid diagrams: components, request flow, install, updates
 ├── CHANGELOG.md                # what changed and why, including this restructuring
 ├── TODO.md                     # currently open items and why they're deferred
 ├── LICENSE                     # MIT
@@ -280,6 +292,86 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 ```
 
 (if you `sudo`'d into root rather than already being root, use `sudo -E` so the environment variable survives)
+
+---
+
+## Login Protection
+
+Replaces Limit Login Attempts and similar plugins, in two layers.
+
+**Layer 1 — `02-wpvm-login-guard.php` (mu-plugin).** Progressive lockout: 5 failures in 20 minutes locks the address for 15 minutes, and each subsequent lockout doubles, capped at 24 hours. A fixed penalty is just a rate an attacker plans around — 5 guesses every quarter hour, forever. Doubling makes sustained guessing pointless while a legitimate mistyped password still costs only the base wait.
+
+It also **removes WordPress's username-enumeration leak**: core distinguishes "Unknown username" from "the password you entered is incorrect", which confirms which accounts exist. Both now return identical text.
+
+Tunable from `wp-config.php` without editing the file:
+
+| Constant | Default |
+|---|---|
+| `WPVM_LOGIN_MAX_ATTEMPTS` | 5 |
+| `WPVM_LOGIN_LOCKOUT_SECS` | 900 (15 min) |
+| `WPVM_LOGIN_WINDOW_SECS` | 1200 (20 min) |
+| `WPVM_LOGIN_MAX_LOCKOUT` | 86400 (24 h) |
+
+### Not banning yourself
+
+CrowdSec bans at **nftables**, which drops every packet from an address — SSH included. Mistype an admin password five times from your workstation and you lose access to the VM entirely, recoverable only from the Proxmox console.
+
+The installer asks for a whitelist and pre-fills it with your reverse proxy and admin IP. **The proxy matters most**: if it's ever banned, the site goes down for every visitor simultaneously, because all traffic arrives from it.
+
+```sh
+wp-hardening.sh crowdsec-whitelist list          # whitelist + current bans
+wp-hardening.sh crowdsec-whitelist add 1.2.3.4
+wp-hardening.sh crowdsec-whitelist remove 1.2.3.4
+doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4   # unban without whitelisting
+```
+
+Written as a **postoverflow** whitelist, not a parser one. A parser-stage whitelist discards events before they reach a scenario, making whitelisted addresses completely invisible. At the postoverflow stage the alert is still raised and only the ban is suppressed — so if your own workstation is compromised and starts brute-forcing, it appears in `cscli alerts list` rather than having silent free rein. Not locking yourself out and not blinding yourself are both achievable; the parser stage would have traded the second for the first.
+
+Prefer single addresses to ranges. Whitelisting a `/24` trusts every device on it, including the laptop that eventually gets malware.
+
+**Layer 2 — CrowdSec.** The guard logs every outcome in a fixed format; a parser and scenario ship with the VM so CrowdSec reads them and bans the source **at nftables**. That difference matters: layer 1 still pays for a full WordPress bootstrap on every blocked attempt — PHP started, database queried, CPU spent. Under a distributed attack that cost *is* the attack. Layer 2 drops the packet before any of it happens.
+
+```sh
+doas podman exec crowdsec cscli decisions list        # who is banned
+doas podman exec crowdsec cscli alerts list           # what triggered it
+doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4
+```
+
+**Why a mu-plugin and not a plugin:** a plugin is another update surface, another CVE surface, and can be switched off from an admin panel an intruder would reach immediately. mu-plugins can't be deactivated from wp-admin and survive core updates.
+
+**`X-Forwarded-For` is deliberately not read in PHP.** `REMOTE_ADDR` is used, because mod_remoteip has already corrected it and only for the one proxy IP you declared trusted. Reading the header directly would accept it from anyone — letting an attacker send a fresh forged address per attempt and never accumulate a count. That's the most common way application-layer login limiters get defeated.
+
+**On XML-RPC:** `xmlrpc.php`'s `system.multicall` allows hundreds of password attempts in a single request, which is how brute-force protection is usually bypassed. This VM blocks it in Apache already — check with `wp-hardening.sh status`.
+
+---
+
+## Plugin Vulnerability Scanning
+
+`wp-plugins.sh status` shows what's *out of date*. `wp-plugins.sh vulns` shows what's actually **vulnerable** — matching installed plugins and themes against known-vulnerable version ranges.
+
+| Source | Cost | Default | Notes |
+|---|---|---|---|
+| **Wordfence Intelligence** | Free, no key, commercial use permitted | **On** | Fetched as one **bulk feed**, matched locally |
+| **NVD** | Free | On demand (`vulns --nvd`) | Keyword matching only; sparse and noisy for WP plugins, rate-limited to 5 req/30s without a key |
+| **Patchstack** | Free browse, commercial API | Opt-in | Often fastest on new disclosures |
+| **WPScan** | Free tier (25 calls/day) | Opt-in | Long-standing; powers the WPScan CLI |
+
+```sh
+wp-plugins.sh vulns                          # scan (Wordfence)
+wp-plugins.sh vulns --nvd                    # also query NVD
+wp-plugins.sh vuln-sources                   # what's enabled and why
+wp-plugins.sh set-key patchstack <key>       # opt in
+wp-plugins.sh set-key wpscan <token>
+wp-plugins.sh vuln-refresh                   # force a feed refresh
+```
+
+**Wordfence is the default for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **your plugin inventory never leaves the machine**. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
+
+Keys live in `/etc/wp-install/vuln-sources.conf` (0600, root-only). A daily cron runs the Wordfence scan and reports via syslog only when something matches.
+
+Clean output means *no disclosed vulnerability in that feed* — not that the site is safe. Around 46% of plugin vulnerabilities have no patch when disclosed, and a plugin nobody has audited has no CVEs by definition.
+
+*Vulnerability data from Wordfence Intelligence; records sourced from MITRE remain © MITRE Corporation.*
 
 ---
 

@@ -6,6 +6,169 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — ARCHITECTURE.md (Mermaid diagrams)
+
+Four diagrams, in a separate file rather than one unreadable chart in the
+README, rendering natively on GitHub:
+
+1. **Components and trust boundaries** — makes the structural point visible:
+   MariaDB on a Podman `--internal` network with no host port and no route
+   out, so a compromised WordPress cannot reach past it.
+2. **What a request passes through** — layered by cost. A packet dropped at
+   nftables is free; a request reaching PHP has already bought a WordPress
+   bootstrap and a database query. That ordering explains why brute-force
+   protection escalates *down* to the firewall instead of living in PHP.
+3. **Install flow** — the two phases, split by the reboot the kernel switch
+   requires.
+4. **Update: candidate, cutover, rollback** — including the branch where
+   `wordpress-old` is renamed back, and the GeoIP rebuild that follows a
+   successful cutover.
+
+Plus a tooling map showing which layer each script covers.
+
+**One diagram type was swapped before shipping.** The tooling map was written
+as a Mermaid `mindmap`, which is the fussiest diagram type in Mermaid and
+whose documented syntax does not include quoted strings — and it could not be
+rendered here to confirm. Replaced with a `graph`, whose behaviour is
+predictable. Choosing the diagram type that can be reasoned about beats the
+one that looks tidier and might not render.
+
+Validated: fences balanced, every `subgraph` has a matching `end`, and every
+`style` target resolves to a declared node. The first pass of that check
+produced false positives because its node-declaration regex only matched
+line-start declarations, missing nodes declared as arrow targets — fixed, and
+worth noting since a checker that cries wolf is how real problems get waved
+through.
+
+---
+
+## Unreleased — Plugin vulnerability scanning (`wp-plugins.sh vulns`)
+
+`wp-plugins.sh status` answered "what is out of date". It now also answers
+"what is actually vulnerable", matching installed plugins and themes against
+known-vulnerable version ranges.
+
+**Wordfence Intelligence is the default source**, and the reason is as much
+privacy as cost. Wordfence publishes the complete database as a bulk feed with
+no API key, free for commercial use. It is downloaded once, cached, and
+matched **locally** — so the site's plugin inventory never leaves the VM. A
+per-plugin API, by contrast, tells the provider your exact attack surface.
+That is why Patchstack and WPScan are opt-in rather than default: they are
+per-slug lookups, which is a fair trade for coverage but should be a decision
+rather than a default nobody noticed.
+
+NVD is available via `vulns --nvd` and framed honestly: keyword matching only,
+5 requests per 30 seconds without a key, and WordPress plugin entries there
+are sparse and noisy because plugin names are ordinary words. Useful as a
+prompt to investigate, never as a verdict.
+
+Keys are stored in `/etc/wp-install/vuln-sources.conf` at 0600.
+
+**Verified before shipping:** the version comparator handles the shapes
+WordPress plugins actually use (`1.2`, `1.2.3`, `1.2.3.4`) including
+`1.10 > 1.9`, which naive string comparison gets wrong; and the range-matching
+logic was simulated against a realistic feed structure covering inclusive
+upper bound, inclusive lower bound, one patch above, well below, and a slug
+with no records — all eight cases correct. The jq expression's *syntax* is
+unverified, since jq is not available in this environment; its logic is what
+was tested.
+
+**Two honesty requirements built into the output.** A clean result states that
+it means no *disclosed* vulnerability in that feed — around 46% of plugin
+vulnerabilities have no patch at disclosure, and an unaudited plugin has no
+CVEs by definition. And the Wordfence feed's licence requires that MITRE
+copyright claims be displayed for MITRE-sourced records, so that attribution
+is printed with every scan rather than buried in documentation.
+
+---
+
+## Unreleased — CrowdSec whitelist (and a path bug that would have silently disabled detection)
+
+Login rate limiting made a lockout hazard concrete enough to need addressing:
+CrowdSec bans at nftables, so a ban drops **SSH as well as HTTP**. Five
+mistyped admin passwords and the operator is locked out of the VM, recoverable
+only from the Proxmox console.
+
+The installer now asks for never-ban addresses, pre-filled from answers
+already given — reverse proxy and admin IP. The proxy is flagged in red,
+because banning it takes the site down for **every visitor at once**: all
+traffic arrives from it.
+
+Managed afterwards with `wp-hardening.sh crowdsec-whitelist [list|add|remove]`,
+which also shows currently-banned addresses, and surfaced by
+`validate-wordpress.sh` — "am I about to lock myself out" should be answered
+by the validator rather than discovered the hard way.
+
+**Written as a postoverflow whitelist, not a parser whitelist.** A
+parser-stage whitelist drops the events before any scenario sees them, so a
+whitelisted address becomes invisible. At the postoverflow stage the bucket
+still fills and the alert is still raised — only the ban is suppressed. If the
+operator's own workstation is compromised and starts brute-forcing, it shows
+up in `cscli alerts list` instead of having silent free rein. Both goals were
+achievable; the parser stage would have quietly traded one for the other.
+
+**Path bug fixed, introduced in the previous entry.** Only
+`/opt/crowdsec/config` is mounted into the container (as `/etc/crowdsec`).
+The login parser and scenario were being written to `/opt/crowdsec/parsers`
+and `/opt/crowdsec/scenarios` — paths the container cannot see. CrowdSec would
+have started cleanly, loaded neither, and brute-force detection would simply
+never have fired, with nothing anywhere to indicate why. Found by checking the
+container's actual mounts before adding the whitelist rather than assuming the
+directory layout.
+
+Verified: generated whitelist YAML parses, and the `add` path keeps `ip:` and
+`cidr:` lists separate — CrowdSec validates that shape and silently ignores
+the entire file if a CIDR appears under `ip:`.
+
+---
+
+## Unreleased — Login rate limiting (replaces Limit Login Attempts)
+
+Two layers, because the application layer alone is the weaker half.
+
+**`02-wpvm-login-guard.php`** — progressive lockout (5 failures → 15 min,
+doubling per subsequent lockout, capped at 24 h). A fixed penalty is a rate an
+attacker plans around; doubling makes sustained guessing against one address
+pointless while a mistyped password still costs only the base wait. Hooked at
+`authenticate` priority 5, ahead of `wp_authenticate_username_password`, so a
+locked-out request never reaches bcrypt verification — deliberately expensive,
+and most of the CPU this layer can save.
+
+It also closes WordPress's **username-enumeration leak**: core distinguishes
+"Unknown username" from "the password you entered is incorrect", confirming
+which accounts exist and turning a guess at two unknowns into a guess at one.
+Both now return identical text.
+
+**CrowdSec parser + scenario** — the guard logs every outcome in a fixed
+format and CrowdSec now reads it, banning the source at nftables. CrowdSec
+could already see Apache access logs, but a failed and a successful login are
+both a `POST /wp-login.php` there, indistinguishable without inspecting the
+response body. The gap was never the bouncer; it was that **WordPress does not
+log failed logins at all**.
+
+**Decisions worth recording:**
+
+- **`REMOTE_ADDR`, never `X-Forwarded-For`, in PHP.** mod_remoteip has already
+  corrected `REMOTE_ADDR`, and only for the single proxy IP declared trusted.
+  Reading the header in PHP would accept it from anyone — an attacker sends a
+  fresh forged address per attempt and never accumulates a count. That is the
+  most common way application-layer login limiters are defeated.
+- **The parser reads the guard's `ip=` field, not Apache's `[client ...]`.**
+  Behind a proxy the connection address is the proxy, and banning it would
+  take the site offline for every visitor.
+- **`blocked` events are not counted toward the ban.** The application layer
+  already refused those, so counting them would double-count one attacker and
+  fire on far fewer real guesses than intended.
+- **A successful login clears the counter but not the escalation history**,
+  so an attacker who guesses right once cannot reset their own penalty ladder.
+
+Verified: the grok pattern matches all four event shapes wrapped in Apache's
+error-log prefix, and the scenario filter selects the intended two. The
+CrowdSec side is **untested against live traffic** — stage 09 prints the
+`cscli explain` command to validate it on the VM.
+
+---
+
 ## Unreleased — `wp-hardening.sh geoip-test`
 
 GeoIP-enabled cutover and rollback both verified on hardware: the swap
