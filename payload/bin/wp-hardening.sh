@@ -67,6 +67,7 @@ show_status() {
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
   echo "          geoip-test [ip]"
+  echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
 
@@ -130,6 +131,69 @@ case "${1:-status}" in
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;
   restart-wp)  restart_wp ;;
+  crowdsec-whitelist)
+    _WL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
+    _act="${2:-list}"; _ip="${3:-}"
+    case "$_act" in
+      list|"")
+        echo ""
+        echo "CrowdSec whitelist — addresses that are never banned"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ -r "$_WL" ]; then
+          sed -n 's/^    - "\(.*\)"/  • \1/p' "$_WL" | grep . || echo "  (file exists but lists nothing)"
+        else
+          echo "  (no whitelist configured)"
+          echo ""
+          echo "  A ban applies at nftables and drops SSH as well as HTTP, so an"
+          echo "  admin address getting banned locks you out of the VM until you"
+          echo "  use the Proxmox console."
+        fi
+        echo ""
+        echo "  Currently banned addresses:"
+        podman exec crowdsec cscli decisions list -o raw 2>/dev/null \
+          | tail -n +2 | head -20 | sed 's/^/    /' || echo "    (none, or cscli unavailable)"
+        echo ""
+        echo "  Add:     wp-hardening.sh crowdsec-whitelist add <ip|cidr>"
+        echo "  Remove:  wp-hardening.sh crowdsec-whitelist remove <ip|cidr>"
+        echo "  Unban now (does not whitelist): podman exec crowdsec cscli decisions delete --ip <ip>" ;;
+      add|remove)
+        [ -n "$_ip" ] || { echo "Usage: wp-hardening.sh crowdsec-whitelist ${_act} <ip|cidr>" >&2; exit 1; }
+        printf '%s' "$_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' \
+          || { echo "✗ '${_ip}' is not a valid IPv4 address or CIDR." >&2; exit 1; }
+        mkdir -p "$(dirname "$_WL")"
+        if [ ! -f "$_WL" ]; then
+          {
+            printf 'name: rothitguy/wpvm-operator-whitelist\n'
+            printf 'description: "Addresses the operator declared must never be banned"\n'
+            printf 'whitelist:\n'
+            printf '  reason: "operator-declared address"\n'
+          } > "$_WL"
+        fi
+        case "$_ip" in */*) _key="cidr" ;; *) _key="ip" ;; esac
+        if [ "$_act" = "add" ]; then
+          grep -q "\"${_ip}\"" "$_WL" && { echo "Already whitelisted: ${_ip}"; exit 0; }
+          grep -q "^  ${_key}:" "$_WL" || printf '  %s:\n' "$_key" >> "$_WL"
+          # Insert directly under the right key so ip: and cidr: lists stay
+          # separate -- CrowdSec validates the shape and silently ignores the
+          # whole file if a CIDR turns up under ip:.
+          awk -v k="  ${_key}:" -v v="    - \"${_ip}\"" \
+            '{print} $0==k && !d {print v; d=1}' "$_WL" > "${_WL}.tmp" && mv -f "${_WL}.tmp" "$_WL"
+          echo "✔ Whitelisted ${_ip}"
+          echo "  ⚠ Anything at that address can now brute-force this site without being banned."
+        else
+          grep -v -- "- \"${_ip}\"" "$_WL" > "${_WL}.tmp" && mv -f "${_WL}.tmp" "$_WL"
+          echo "✔ Removed ${_ip} from the whitelist"
+        fi
+        chmod 644 "$_WL"
+        # The engine reads these at start; a reload is what makes the change real.
+        if podman exec crowdsec kill -HUP 1 2>/dev/null || podman restart crowdsec >/dev/null 2>&1; then
+          echo "  CrowdSec reloaded — change is live."
+        else
+          echo "  ⚠ Could not reload CrowdSec. Apply with: podman restart crowdsec"
+        fi ;;
+      *) echo "Usage: wp-hardening.sh crowdsec-whitelist [list|add <ip>|remove <ip>]" >&2; exit 1 ;;
+    esac ;;
+
   geoip-test)
     # Functional test of country filtering. validate-wordpress.sh only checks
     # that mod_maxminddb is LOADED, which says nothing about whether the

@@ -354,6 +354,80 @@ echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache 
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
 
+# ── CrowdSec whitelist ────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}CrowdSec whitelist — addresses that must never be banned${CL}"
+echo -e "  ${YW}CrowdSec does not just block a login form. It bans at nftables,${CL}"
+echo -e "  ${YW}which drops EVERY packet from that address — HTTP, and SSH with${CL}"
+echo -e "  ${YW}it. Mistype an admin password five times from your workstation${CL}"
+echo -e "  ${YW}and you are locked out of the VM entirely, recoverable only from${CL}"
+echo -e "  ${YW}the Proxmox console.${CL}"
+echo ""
+if [[ -n "$PROXY_IP" ]]; then
+  echo -e "  ${RD}  You configured a reverse proxy at ${PROXY_IP}.${CL}"
+  echo -e "  ${YW}  If that address is ever banned, the site goes down for EVERY${CL}"
+  echo -e "  ${YW}  visitor at once, because all traffic arrives from it. Including${CL}"
+  echo -e "  ${YW}  it here is strongly advised.${CL}"
+  echo ""
+fi
+echo -e "  ${YW}From what you have already told this installer:${CL}"
+[[ -n "$PROXY_IP" ]]          && echo -e "  ${YW}    reverse proxy   : ${PROXY_IP}${CL}"
+[[ -n "$SSH_CIDR" ]]          && echo -e "  ${YW}    SSH allowed from: ${SSH_CIDR}${CL}"
+[[ -n "$ALLOWED_ADMIN_IP" ]]  && echo -e "  ${YW}    wp-admin extra IP: ${ALLOWED_ADMIN_IP}${CL}"
+[[ -n "$ADMIN_CIDR" ]]        && echo -e "  ${YW}    wp-admin network : ${ADMIN_CIDR}${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  It prevents you locking yourself out. That is its purpose, and${CL}"
+echo -e "  ${YW}  it is a real one — this is the most likely way to lose access${CL}"
+echo -e "  ${YW}  to a working VM.${CL}"
+echo -e "  ${YW}  It also means anything at those addresses can brute-force this${CL}"
+echo -e "  ${YW}  site indefinitely without being blocked. Whitelisting a whole${CL}"
+echo -e "  ${YW}  /24 trusts every device on it, including the laptop that gets${CL}"
+echo -e "  ${YW}  malware. Prefer single addresses over ranges where you can.${CL}"
+echo -e "  ${YW}  Alerts are still raised for whitelisted addresses — only the${CL}"
+echo -e "  ${YW}  ban is suppressed — so a compromised machine of your own is${CL}"
+echo -e "  ${YW}  still visible in 'cscli alerts list'.${CL}"
+_sec_note
+_CS_DEFAULT=""
+[[ -n "$PROXY_IP" ]] && _CS_DEFAULT="$PROXY_IP"
+[[ -n "$ALLOWED_ADMIN_IP" ]] && _CS_DEFAULT="${_CS_DEFAULT:+$_CS_DEFAULT,}$ALLOWED_ADMIN_IP"
+CROWDSEC_WHITELIST=""
+while :; do
+  if [[ -n "$_CS_DEFAULT" ]]; then
+    read -rp "  Never-ban addresses, comma-separated [${_CS_DEFAULT}] : " _CSW
+    _CSW="${_CSW:-$_CS_DEFAULT}"
+  else
+    read -rp "  Never-ban addresses, comma-separated (blank = none) : " _CSW
+  fi
+  [[ -z "$_CSW" ]] && { msg_warn "No whitelist — a banned admin address locks you out until you use the console."; break; }
+  _bad=""
+  _clean=""
+  _oldIFS="$IFS"; IFS=','
+  for _e in $_CSW; do
+    IFS="$_oldIFS"
+    _e=$(printf '%s' "$_e" | tr -d '[:space:]')
+    [[ -z "$_e" ]] && continue
+    # Accept a bare IPv4 or an IPv4/CIDR. Anything else is a typo, and a typo
+    # here fails silently later: CrowdSec loads the file, ignores the bad
+    # entry, and the address you thought was protected simply is not.
+    if printf '%s' "$_e" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; then
+      _clean="${_clean:+$_clean,}$_e"
+    else
+      _bad="${_bad:+$_bad, }$_e"
+    fi
+    IFS=','
+  done
+  IFS="$_oldIFS"
+  if [[ -n "$_bad" ]]; then
+    msg_warn "  Not a valid IPv4 address or CIDR: ${_bad}"
+    continue
+  fi
+  CROWDSEC_WHITELIST="$_clean"
+  msg_ok "CrowdSec will never ban: ${CROWDSEC_WHITELIST}"
+  break
+done
+unset _CSW _CS_DEFAULT _bad _clean _e _oldIFS
+
 # ── Outbound (egress) firewall ────────────────────────────────────────────────
 echo ""
 echo -e "  ${BLD}Restrict outbound traffic?${CL}"

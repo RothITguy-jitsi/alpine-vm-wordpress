@@ -277,6 +277,12 @@ WP_VOL_ARGS="-v /home/wpuser/wp/html:/var/www/html"
 SMTP_MU_DIR="/home/wpuser/wp/html/wp-content/mu-plugins"
 mkdir -p "${SMTP_MU_DIR}"
 install -m 0644 "${PAYLOAD_DIR}/mu-plugins/01-wpvm-smtp.php" "${SMTP_MU_DIR}/01-wpvm-smtp.php"
+# Login rate-limiting. Unconditional and in the same block as the SMTP
+# transport, for the same reason: it has nothing to do with the custom-slug
+# prompt, and burying it in that conditional is exactly how the SMTP plugin
+# went missing on every install that kept the default slug.
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/02-wpvm-login-guard.php" "${SMTP_MU_DIR}/02-wpvm-login-guard.php"
+chown 33:33 "${SMTP_MU_DIR}/02-wpvm-login-guard.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/01-wpvm-smtp.php" 2>/dev/null || true
 # Verify rather than assume -- this is the exact failure that shipped.
 if [ -r "${SMTP_MU_DIR}/01-wpvm-smtp.php" ]; then

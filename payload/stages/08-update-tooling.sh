@@ -26,6 +26,19 @@ ok "  pinned.env is now written atomically (temp file + rename) and re-validated
 # for that layer.
 ts "Installing WordPress plugin/theme update visibility"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
+# msmtp sends host-side, so alerts still go out when WordPress or MariaDB is
+# down -- which is exactly when an alert matters. Credentials are read from
+# the same smtp.php the mu-plugin uses; no second config file is written.
+apk add --no-cache msmtp >/dev/null 2>&1 \
+  && ok "msmtp installed — scan alerts can be emailed" \
+  || warn "msmtp not installed; scans will log to syslog only (apk add msmtp)"
+mkdir -p /var/lib/wp-notify && chmod 700 /var/lib/wp-notify
+# jq parses the Wordfence feed; without it `wp-plugins.sh vulns` cannot run.
+apk add --no-cache jq >/dev/null 2>&1 && ok "jq installed (vulnerability feed parsing)" \
+  || warn "jq not installed — 'wp-plugins.sh vulns' will not work until: apk add jq"
+mkdir -p /var/cache/wp-vulns && chmod 755 /var/cache/wp-vulns
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-mail.sh" /usr/local/bin/wp-mail.sh
 
 # Pull the official wp-cli image now, so the tool works on a VM that later
@@ -45,6 +58,8 @@ if podman pull "$WPCLI_IMAGE_REF" >/dev/null 2>&1; then
   fi
   printf 'WPCLI_IMAGE=%s\n' "$WPCLI_IMAGE_REF" >> /etc/wp-install/pinned.env
   ok "wp-plugins.sh installed (status / check / update-plugins / update-themes)"
+  ok "  Vulnerability scanning: wp-plugins.sh vulns  (Wordfence Intelligence, free)"
+  ok "  Optional extra sources: wp-plugins.sh vuln-sources"
   ok "wp-mail.sh installed (status / test / setup / doctor / log)"
   ok "  Reports by default, never auto-updates: ~46% of disclosed plugin CVEs have no patch"
   ok "  at disclosure, and plugin auto-update has itself been a supply-chain vector."

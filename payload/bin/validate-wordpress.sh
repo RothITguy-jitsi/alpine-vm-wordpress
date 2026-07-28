@@ -651,6 +651,23 @@ fi
 fi
 
 # ── BACKUPS ────────────────────────────────────────────────────────────────
+# CrowdSec whitelist visibility. A ban applies at nftables and drops SSH as
+# well as HTTP, so "am I about to lock myself out" is a question the validator
+# should answer rather than leave to be discovered the hard way.
+_CSWL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
+if [ -r "$_CSWL" ]; then
+  _n=$(grep -c '^    - "' "$_CSWL" 2>/dev/null || echo 0)
+  pass "CrowdSec whitelist present (${_n} address(es) never banned)"
+else
+  warn "No CrowdSec whitelist configured" \
+       "CrowdSec bans at nftables, which drops SSH too. A mistyped admin password five times can lock you out of the VM entirely; recovery is via the Proxmox console." \
+       "wp-hardening.sh crowdsec-whitelist add <your-admin-ip>"
+fi
+_CSBAN=$(podman exec crowdsec cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || echo 0)
+if [ "${_CSBAN:-0}" -gt 0 ]; then
+  note "CrowdSec is currently banning ${_CSBAN} address(es) — wp-hardening.sh crowdsec-whitelist list"
+fi
+
 if want_section mail; then
 note() { printf "     %s\n" "$1"; }
 section mail "Outbound email"

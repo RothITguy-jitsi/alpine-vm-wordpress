@@ -7,3 +7,10 @@ filenames:
   - /var/log/host/messages
 labels:
   type: syslog
+---
+# WordPress error log — carries WPVM Login Guard events. Read-only mount,
+# already present on the crowdsec container (/var/log/wordpress).
+filenames:
+  - /var/log/wordpress/error.log
+labels:
+  type: wpvm-login

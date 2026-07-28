@@ -1,0 +1,27 @@
+# Parses WPVM Login Guard events out of the WordPress error log.
+#
+# The pattern is anchored with a leading .* on purpose: PHP's error_log()
+# output arrives wrapped in Apache's own prefix, e.g.
+#   [Mon Jul 28 03:00:00 2026] [php:notice] [pid 12] [client 10.89.10.1:4444] [wpvm-login] ...
+# so the marker never sits at position 0.
+#
+# The `ip=` field is used rather than Apache's [client ...] value. Behind a
+# reverse proxy the connection address is the PROXY, and banning that would
+# take the whole site offline for every visitor. The guard writes the
+# mod_remoteip-corrected client address into ip=, which is the one worth
+# acting on.
+onsuccess: next_stage
+debug: false
+filter: "evt.Line.Labels.type == 'wpvm-login'"
+name: rothitguy/wpvm-login-logs
+description: "Parse WPVM Login Guard authentication events"
+grok:
+  pattern: '.*\[wpvm-login\] event=%{WORD:wpvm_event} ip=%{IP:wpvm_ip} user=%{NOTSPACE:wpvm_user}'
+  apply_on: message
+statics:
+  - meta: log_type
+    value: wpvm_login
+  - meta: source_ip
+    expression: "evt.Parsed.wpvm_ip"
+  - meta: username
+    expression: "evt.Parsed.wpvm_user"

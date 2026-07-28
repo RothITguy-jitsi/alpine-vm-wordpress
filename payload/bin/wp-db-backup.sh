@@ -78,6 +78,28 @@ if [ "${BACKUP_OK}" != "1" ]; then
   # anything (a monitoring script, an operator, or the rotation below).
   [ -s "${BACKUP_RAW}.err" ] && \
     logger -t wp-db-backup "stderr: $(head -c 500 "${BACKUP_RAW}.err")"
+  # Email on failure. A backup that has been failing silently for months is
+  # the single most common way people discover they have no backups -- at the
+  # exact moment they need one. This is the alert most worth having: it is
+  # rare, it is unambiguous, and there is nothing else that would tell you.
+  if [ -x /usr/local/bin/wp-notify.sh ]; then
+    _bb=$(mktemp)
+    {
+      printf 'The nightly database backup FAILED. Yesterday'"'"'s backup was kept.\n\n'
+      [ -s "${BACKUP_RAW}.err" ] && { printf 'Error output:\n'; head -c 1000 "${BACKUP_RAW}.err"; printf '\n\n'; }
+      printf 'Check:\n'
+      printf '  wp-db-backup.sh            # run one now\n'
+      printf '  validate-wordpress.sh --section backups\n'
+      printf '  podman logs --tail 30 mariadb\n'
+      printf '  df -h /                    # a full disk is a common cause\n'
+    } > "$_bb"
+    # Deliberately NOT deduplicated by content: a repeated failure is the
+    # thing you most need to keep hearing about, and each night the error
+    # text is likely identical.
+    NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wp-db-backup \
+      "Database backup FAILED" "$_bb"
+    rm -f "$_bb"
+  fi
   rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" "${BACKUP_GZ_TMP}" "${BACKUP_FILE}" 2>/dev/null || true
   # DELIBERATE: no rotation on failure. Yesterday's good backup stays.
   exit 1

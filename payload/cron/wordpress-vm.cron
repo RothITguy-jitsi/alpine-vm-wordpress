@@ -34,3 +34,9 @@
 30 3 * * * /usr/local/bin/wp-malware-scan.sh quick >/dev/null 2>&1 || logger -t wp-malware "scan reported findings — run: wp-malware-scan.sh status"
 # Weekly full scan including YARA (Sunday 03:45 UTC).
 45 3 * * 0 /usr/local/bin/wp-malware-scan.sh yara >/dev/null 2>&1 || logger -t wp-malware "weekly YARA scan reported findings — run: wp-malware-scan.sh status"
+# Daily vulnerability scan of installed plugins and themes (06:30 UTC).
+# Wordfence Intelligence only -- free, no key, and fetched as one bulk feed
+# that is queried locally, so the site's plugin inventory is never sent
+# anywhere. Silent unless something installed actually matches a disclosed
+# vulnerability.
+30 6 * * * /usr/local/bin/wp-vuln-cron.sh

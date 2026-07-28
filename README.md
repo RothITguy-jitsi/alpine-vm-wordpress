@@ -367,7 +367,53 @@ wp-plugins.sh vuln-refresh                   # force a feed refresh
 
 **Wordfence is the default for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **your plugin inventory never leaves the machine**. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
 
-Keys live in `/etc/wp-install/vuln-sources.conf` (0600, root-only). A daily cron runs the Wordfence scan and reports via syslog only when something matches.
+Keys live in `/etc/wp-install/vuln-sources.conf` (0600, root-only).
+
+### Email alerts
+
+Scheduled jobs email you when they find something, using the same relay you configured for WordPress.
+
+```sh
+wp-notify.sh --status     # relay, recipient, cooldown, recent alerts
+wp-notify.sh --test       # send a test alert now
+```
+
+| Job | Emails on |
+|---|---|
+| Vulnerability scan | any CRITICAL/HIGH/MEDIUM finding |
+| Malware scan | **CRITICAL only** |
+| Database backup | **any failure** — no cooldown |
+
+**Sent host-side via `msmtp`, not through WordPress.** Reusing `wp_mail()` would be the tidier reuse, but these alerts fire when something is wrong — and "WordPress or MariaDB is down" is both the moment an alert matters most and the moment `wp_mail()` cannot run. Credentials come from the same `smtp.php` the mu-plugin uses; no second config is written, and the password reaches msmtp via `--passwordeval` rather than the argument list where `ps` would expose it.
+
+**Alerts are deduplicated by content**, once per 24h by default. A daily scan that emails the same unpatched plugin every morning becomes a filter rule within a week — and then the finding that matters arrives unread. Change the findings and you get a new alert immediately; repeat the same ones and you don't.
+
+Two deliberate exceptions:
+
+- **Malware emails on CRITICAL only.** HIGH includes things like a world-writable file — worth fixing, not worth waking up for. Emailing those daily is how the CRITICAL mail stops being read.
+- **Backup failure has no cooldown.** A repeated failure is exactly what you need to keep hearing about, and the error text is likely identical each night. A backup silently failing for months is the most common way people discover they have no backups, at the worst possible moment.
+
+Not configured? Everything still logs to syslog — `doas grep -E 'wp-vulns|wp-malware|wp-db-backup' /var/log/messages`.
+
+**Scheduled scans** (all times UTC):
+
+| When | Job | Reports |
+|---|---|---|
+| Daily 06:30 | Vulnerability scan (Wordfence feed) | syslog `wp-vulns`, only on findings |
+| Daily 03:30 | Malware scan — structural + core + DB | syslog `wp-malware`, only on findings |
+| Sunday 03:45 | YARA signature scan | syslog `wp-malware`, only on findings |
+| Monday 07:00 | Plugin/theme update availability | syslog `wp-plugins`, only when updates pending |
+| Daily 02:00 | Verified database backup | — |
+| Sunday 04:00 | Container image update check (dry run) | syslog `podman-autoupdate` |
+
+Daily rather than weekly for vulnerabilities is deliberate: Wordfence adds dozens of records per week, and disclosure-to-exploitation for WordPress plugins is frequently measured in hours. A weekly scan can leave a known-exploited plugin live for six days.
+
+Every job is **silent when there is nothing to report**. A daily "nothing found" trains you to ignore it, and an ignored alert is worse than none because it manufactures the feeling of monitoring.
+
+```sh
+doas grep wp-vulns /var/log/messages       # what the scan found
+doas wp-plugins.sh vulns                   # run it now
+```
 
 Clean output means *no disclosed vulnerability in that feed* — not that the site is safe. Around 46% of plugin vulnerabilities have no patch when disclosed, and a plugin nobody has audited has no CVEs by definition.
 

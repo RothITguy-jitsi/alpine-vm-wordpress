@@ -1,0 +1,23 @@
+# Bans an address that keeps failing WordPress logins.
+#
+# Leaky bucket rather than a fixed count: capacity 5, leaking one every 20s.
+# A person who mistypes a password twice never fills it; a script trying
+# continuously does within seconds. The mu-plugin's own lockout has already
+# slowed them at the application layer — this is what moves the block down to
+# nftables, where the attempt costs no PHP, no database query, and no CPU.
+#
+# 'lockout' events are counted as well as 'failed' ones because a lockout
+# means the application layer already gave up on this address, which is a
+# stronger signal than a single failure.
+type: leaky
+name: rothitguy/wpvm-login-bruteforce
+description: "WordPress login brute-force (WPVM Login Guard events)"
+filter: "evt.Meta.log_type == 'wpvm_login' && (evt.Parsed.wpvm_event == 'failed' || evt.Parsed.wpvm_event == 'lockout')"
+leakspeed: "20s"
+capacity: 5
+groupby: evt.Meta.source_ip
+blackhole: 2m
+labels:
+  service: wordpress
+  type: bruteforce
+  remediation: true

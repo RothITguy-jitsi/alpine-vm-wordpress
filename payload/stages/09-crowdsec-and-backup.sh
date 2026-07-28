@@ -12,6 +12,73 @@ mkdir -p /home/wpuser/wp/logs; chown 33:33 /home/wpuser/wp/logs 2>/dev/null || t
 touch /var/log/messages 2>/dev/null || true
 
 install -m 0644 "${PAYLOAD_DIR}/crowdsec/acquis.yaml" /opt/crowdsec/acquis.yaml
+# Custom parser + scenario for WordPress login failures. CrowdSec sees Apache
+# access logs already, but a failed and a successful login are both a POST to
+# wp-login.php there -- indistinguishable without inspecting the response.
+# The mu-plugin logs the outcome explicitly, and these teach CrowdSec to read
+# it and ban at the firewall.
+# PATH FIX: only /opt/crowdsec/config is mounted into the container (as
+# /etc/crowdsec). An earlier revision wrote these to /opt/crowdsec/parsers,
+# which the container cannot see -- CrowdSec would have started cleanly and
+# simply never loaded them, so login brute-forcing would have gone
+# undetected with no error anywhere to say why.
+mkdir -p /opt/crowdsec/config/parsers/s01-parse \
+         /opt/crowdsec/config/scenarios \
+         /opt/crowdsec/config/postoverflows/s01-whitelist
+install -m 0644 "${PAYLOAD_DIR}/crowdsec/parsers/wpvm-login.yaml" \
+  /opt/crowdsec/config/parsers/s01-parse/wpvm-login.yaml
+install -m 0644 "${PAYLOAD_DIR}/crowdsec/scenarios/wpvm-login-bruteforce.yaml" \
+  /opt/crowdsec/config/scenarios/wpvm-login-bruteforce.yaml
+
+# ── Operator whitelist ───────────────────────────────────────────────────────
+# Written as a POSTOVERFLOW rather than a parser whitelist, deliberately.
+# A parser-stage whitelist discards the events before they ever reach a
+# scenario, so a whitelisted address becomes completely invisible. At the
+# postoverflow stage the bucket still fills and the alert is still raised --
+# only the ban is suppressed. So if the operator's own workstation is
+# compromised and starts brute-forcing, it shows up in `cscli alerts list`
+# instead of silently having free rein. Not locking yourself out and not
+# blinding yourself are both achievable; picking the parser stage would have
+# quietly traded the second for the first.
+if [ -n "${CROWDSEC_WHITELIST:-}" ]; then
+  _WL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
+  {
+    printf 'name: rothitguy/wpvm-operator-whitelist\n'
+    printf 'description: "Addresses the operator declared must never be banned"\n'
+    printf 'whitelist:\n'
+    printf '  reason: "operator-declared address (install-time)"\n'
+  } > "$_WL"
+  _ips=""; _cidrs=""
+  _oldIFS=$IFS; IFS=','
+  for _e in $CROWDSEC_WHITELIST; do
+    IFS=$_oldIFS
+    case "$_e" in
+      */*) _cidrs="${_cidrs} ${_e}" ;;
+      ?*)  _ips="${_ips} ${_e}" ;;
+    esac
+    IFS=','
+  done
+  IFS=$_oldIFS
+  if [ -n "$_ips" ]; then
+    printf '  ip:\n' >> "$_WL"
+    for _i in $_ips; do printf '    - "%s"\n' "$_i" >> "$_WL"; done
+  fi
+  if [ -n "$_cidrs" ]; then
+    printf '  cidr:\n' >> "$_WL"
+    for _c in $_cidrs; do printf '    - "%s"\n' "$_c" >> "$_WL"; done
+  fi
+  chmod 644 "$_WL"
+  ok "CrowdSec whitelist written: ${CROWDSEC_WHITELIST}"
+  ok "  Alerts still raised for these — only the ban is suppressed."
+else
+  warn "No CrowdSec whitelist configured."
+  warn "  A banned admin address drops SSH too; recovery is via qm terminal."
+  warn "  Add one later: /opt/crowdsec/config/postoverflows/s01-whitelist/"
+fi
+ok "Login brute-force parser + scenario installed"
+warn "  Untested against live traffic. Verify the parser once the VM is up:"
+warn "    doas podman exec crowdsec cscli explain --file /var/log/wordpress/error.log --type wpvm-login"
+warn "    doas podman exec crowdsec cscli scenarios list | grep wpvm"
 ok "acquis.yaml: Apache logs + syslog"
 
 podman rm -f crowdsec 2>/dev/null || true

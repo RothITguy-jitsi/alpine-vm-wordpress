@@ -6,6 +6,81 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Email alerts from scheduled scans (`wp-notify.sh`)
+
+Scans logged to syslog, which nobody reads on a VM they are not currently
+looking at. They now email, through the relay already configured for
+WordPress.
+
+**One shared sender**, not a snippet copied into each job. This project has
+been bitten repeatedly by the same logic living in several places and
+drifting; the container run command alone turned out to exist in five.
+
+**Host-side via msmtp rather than `wp_mail()`.** Reusing the WordPress mail
+path would be the tidier reuse and was the first instinct. It is wrong here:
+these alerts fire when something is broken, and "WordPress or MariaDB is
+down" is simultaneously the moment an alert matters most and the moment
+`wp_mail()` cannot run. Credentials are read from the same `smtp.php` the
+mu-plugin uses — no second config file — and reach msmtp through
+`--passwordeval` rather than the argument list, where `ps` would show the
+relay password to any local account.
+
+**Deduplicated by body content, 24h default.** A daily scan that emails the
+same unpatched plugin every morning becomes a filter rule inside a week, and
+then the finding that matters arrives unread. Hashing the *body* rather than
+the subject matters: a subject like "3 findings" is identical two days running
+even when the findings changed completely, and deduplicating on that would
+suppress a genuinely new alert. Verified: identical findings suppressed,
+changed findings sent immediately.
+
+**Two deliberate exceptions:**
+
+- **Malware emails on CRITICAL only.** HIGH includes a world-writable file —
+  worth fixing, not worth an email at 03:30. Sending those daily is precisely
+  how the CRITICAL mail stops being read.
+- **Backup failure sends every time, no cooldown.** A repeated failure is the
+  thing you most need to keep hearing about, and the error text will be
+  identical each night, so content-dedup would silence it after the first.
+  A backup failing silently for months is the most common way people find out
+  they have no backups, at the worst possible moment.
+
+Nothing changes if no relay is configured: every job still logs to syslog as
+before, and `wp-notify.sh` exits cleanly rather than erroring.
+
+---
+
+## Unreleased — Vulnerability scan cron: scan once, not twice
+
+The daily vulnerability scan was wired as the obvious inline cron form:
+
+```
+wp-plugins.sh vulns | grep -q FINDING && wp-plugins.sh vulns | logger
+```
+
+That runs the **entire scan twice** — two `podman run` starts of the wp-cli
+container, and one `jq` invocation per installed plugin, doubled. On a site
+with 30 plugins that is 120 jq calls to answer a question 60 could answer,
+every day, forever.
+
+Replaced with `wp-vuln-cron.sh`: runs once, captures the output, decides from
+that. It logs a one-line summary plus the CRITICAL and HIGH findings
+individually, and stays completely silent when there is nothing to report — a
+daily job that says "nothing found" every day teaches the operator to ignore
+it, and an ignored alert is worse than no alert because it manufactures the
+feeling of monitoring.
+
+**Also fixed while there:** colour escapes are now emitted only when stdout is
+a terminal. These tools are read by humans *and* piped to `logger` by cron,
+and raw `\033[31m` sequences in syslog are unreadable and break grep. Applies
+to every path in `wp-plugins.sh`, not just the cron one.
+
+Daily rather than weekly is deliberate and worth stating: Wordfence adds
+dozens of records per week and disclosure-to-exploitation for WordPress
+plugins is often measured in hours, so a weekly scan can leave a
+known-exploited plugin live for six days.
+
+---
+
 ## Unreleased — ARCHITECTURE.md (Mermaid diagrams)
 
 Four diagrams, in a separate file rather than one unreadable chart in the
