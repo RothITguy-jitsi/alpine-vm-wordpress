@@ -6,6 +6,51 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Backticks in an unquoted heredoc executed nft on the HOST
+
+From a real install log:
+
+```
+Error: syntax error, unexpected newline, expecting string or last
+add element
+           ^
+```
+
+**Cause.** The generated nftables ruleset is built with
+`NFT_CONF=$(cat << NFTEOF ...)` — an **unquoted** heredoc, because it has to
+substitute the operator's CIDRs. A comment inside that body read:
+
+```
+# so wp-hardening.sh can open one live with `nft add element` -- no
+```
+
+The shell expands an unquoted heredoc body, so those backticks were command
+substitution. Every install ran `nft add element` **on the Proxmox host**,
+printed nftables' syntax error into the install log, and wrote the comment
+out with the text replaced by empty output.
+
+Nothing downstream broke, which is the uncomfortable part: it executed an
+unintended command on the hypervisor and produced a scary error in the middle
+of an otherwise-clean run, and the install carried on regardless.
+
+**This is precisely the failure mode `scan-heredocs.py` existed to catch**,
+and it was retired earlier in this project on the grounds that no heredoc
+still wrote an executable script body. That reasoning was true and beside the
+point: the hazard is the unquoted heredoc, not what its output is later used
+for. A config heredoc expands its body exactly the same way.
+
+**Fixed**, and the capability is restored as
+`test/check-heredoc-backticks.py`, which finds backticks in any unquoted
+heredoc across the repo. Verified three ways: it flags a known-bad file;
+`bash -n` passes that same file cleanly; and the shell demonstrably
+substitutes the command when the delimiter is unquoted and leaves it literal
+when quoted.
+
+Shell comments *outside* heredocs are unaffected — the shell does not expand
+comments — so the other backticks in the file were checked and are safe.
+
+---
+
 ## Unreleased — Production feed and ClamAV both offered at install
 
 Two things that were hardcoded decisions are now operator choices, each with
