@@ -39,6 +39,23 @@ mkdir -p /var/lib/wp-notify && chmod 700 /var/lib/wp-notify
 apk add --no-cache jq >/dev/null 2>&1 && ok "jq installed (vulnerability feed parsing)" \
   || warn "jq not installed — 'wp-plugins.sh vulns' will not work until: apk add jq"
 mkdir -p /var/cache/wp-vulns && chmod 755 /var/cache/wp-vulns
+# The token collected at install has to reach the file wp-plugins.sh reads at
+# runtime. vars.sh already carries it, but that file is sourced by several
+# tools and is not the place for a per-source credential; vuln-sources.conf is
+# the single location the vulnerability code looks at.
+if [ -n "${WORDFENCE_API_KEY:-}" ]; then
+  install -m 0600 /dev/null /etc/wp-install/vuln-sources.conf
+  printf 'WORDFENCE_API_KEY=%s\n' "$WORDFENCE_API_KEY" > /etc/wp-install/vuln-sources.conf
+  # Feed choice lives beside the token: both are read by the same code, and
+  # splitting them would create a second place to look when scanning misbehaves.
+  printf 'WORDFENCE_FEED=%s\n' "${WORDFENCE_FEED:-scanner}" >> /etc/wp-install/vuln-sources.conf
+  chmod 600 /etc/wp-install/vuln-sources.conf
+  ok "Wordfence token stored (0600) — daily vulnerability scans active"
+else
+  warn "No Wordfence token — plugin vulnerability scanning is unavailable"
+  warn "  Free token: https://www.wordfence.com/products/wordfence-intelligence/"
+  warn "  Then:       wp-plugins.sh set-key wordfence <token>"
+fi
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-mail.sh" /usr/local/bin/wp-mail.sh
 
 # Pull the official wp-cli image now, so the tool works on a VM that later

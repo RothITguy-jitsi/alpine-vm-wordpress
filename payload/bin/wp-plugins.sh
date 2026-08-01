@@ -87,7 +87,22 @@ fi
 # survive an update of this script.
 VULN_CONF="/etc/wp-install/vuln-sources.conf"
 VULN_CACHE="/var/cache/wp-vulns"
-WF_FEED="https://www.wordfence.com/api/intelligence/v2/vulnerabilities/scanner"
+# v3. The v2 feed was open with no authentication and has been retired --
+# anything still pointing at v2 silently stops receiving data. v3 requires a
+# token generated under Integrations in a (free) Wordfence account, sent as a
+# bearer credential in the Authorization header.
+#
+# Scanner feed rather than Production, deliberately: Production carries the
+# full analysed records and is well over 100 MB, which is a poor thing to
+# hand to jq on a 4 GB VM also running WordPress and MariaDB. Scanner is the
+# minimal detection format -- exactly the fields this matching needs -- and it
+# additionally contains newly discovered vulnerabilities that have not yet
+# been fully analysed, so it is both smaller AND earlier.
+WF_BASE="https://www.wordfence.com/api/intelligence/v3/vulnerabilities"
+# scanner | production | both. Default scanner -- see the note above: it is
+# the one that carries vulnerabilities still under research, so choosing
+# production alone trades detection breadth for record detail.
+WORDFENCE_FEED="${WORDFENCE_FEED:-scanner}"
 [ -r "$VULN_CONF" ] && . "$VULN_CONF"
 
 # Compare two dotted version strings. Returns 0 if $1 <= $2.
@@ -115,15 +130,64 @@ _ver_le() {
 # of one per plugin, and -- more importantly -- the list of plugins this site
 # runs is never sent to a third party. A per-plugin API tells the provider
 # your exact attack surface.
-_wf_refresh() {
-  mkdir -p "$VULN_CACHE"
-  _f="$VULN_CACHE/wordfence-scanner.json"
+# Fetch one named feed into the cache. Called once or twice depending on
+# WORDFENCE_FEED; the matcher then reads every cached feed file present, so
+# "both" needs no special case downstream.
+_wf_fetch_one() {
+  _which="$1"; _force="${2:-}"
+  _f="$VULN_CACHE/wordfence-${_which}.json"
   _age=99999
   [ -f "$_f" ] && _age=$(( ( $(date +%s) - $(stat -c %Y "$_f" 2>/dev/null || echo 0) ) / 3600 ))
+  WF_FEED="${WF_BASE}/${_which}"
+  _wf_do_fetch "$_force"
+}
+
+_wf_refresh() {
+  mkdir -p "$VULN_CACHE"
+  _rc=0
+  case "$WORDFENCE_FEED" in
+    both)       _wf_fetch_one scanner "${1:-}" || _rc=1
+                _wf_fetch_one production "${1:-}" || _rc=1 ;;
+    production) _wf_fetch_one production "${1:-}" || _rc=1 ;;
+    *)          _wf_fetch_one scanner "${1:-}" || _rc=1 ;;
+  esac
+  return $_rc
+}
+
+_wf_do_fetch() {
+  if [ -z "${WORDFENCE_API_KEY:-}" ]; then
+    if [ -f "$_f" ]; then
+      echo "  ⚠ No Wordfence token set — using the cached feed (${_age}h old)."
+      echo "    It will go stale. Add one: wp-plugins.sh set-key wordfence <token>"
+      return 0
+    fi
+    echo "  ✗ No Wordfence API token configured, and no cached feed to fall back on." >&2
+    echo "    The v3 feed requires a token. It is free (personal and commercial)." >&2
+    echo "      1. Create a free account and generate a token under Integrations:" >&2
+    echo "         https://www.wordfence.com/products/wordfence-intelligence/" >&2
+    echo "      2. wp-plugins.sh set-key wordfence <token>" >&2
+    return 1
+  fi
   if [ "${1:-}" = "force" ] || [ "$_age" -gt 12 ]; then
-    echo "  Fetching Wordfence Intelligence feed (free, no key required)…"
-    if curl -fsSL --max-time 120 -o "${_f}.tmp" "$WF_FEED" 2>/dev/null \
-       && [ -s "${_f}.tmp" ] && head -c1 "${_f}.tmp" | grep -q '{'; then
+    echo "  Fetching Wordfence Intelligence v3 ${_which:-scanner} feed…"
+    _code=$(curl -sS --max-time 180 -w '%{http_code}' \
+              -H "Authorization: Bearer ${WORDFENCE_API_KEY}" \
+              -o "${_f}.tmp" "$WF_FEED" 2>/dev/null || echo 000)
+    case "$_code" in
+      401|403)
+        rm -f "${_f}.tmp"
+        echo "  ✗ Wordfence rejected the token (HTTP ${_code})." >&2
+        echo "    Check it under Integrations in your Wordfence account, then:" >&2
+        echo "      wp-plugins.sh set-key wordfence <token>" >&2
+        [ -f "$_f" ] && echo "    Using the cached feed (${_age}h old) meanwhile." >&2 && return 0
+        return 1 ;;
+      429)
+        rm -f "${_f}.tmp"
+        echo "  ⚠ Rate limited by Wordfence (HTTP 429)." >&2
+        [ -f "$_f" ] && echo "    Using the cached feed (${_age}h old)." >&2 && return 0
+        return 1 ;;
+    esac
+    if [ "$_code" = "200" ] && [ -s "${_f}.tmp" ] && head -c1 "${_f}.tmp" | grep -q '{'; then
       mv -f "${_f}.tmp" "$_f"; chmod 644 "$_f"
     else
       rm -f "${_f}.tmp"
@@ -212,12 +276,16 @@ vuln_scan() {
   _use_nvd="${1:-0}"
   command -v jq >/dev/null 2>&1 || { echo "✗ jq is required: apk add jq" >&2; exit 1; }
   _wf_refresh || exit 1
-  _feed="$VULN_CACHE/wordfence-scanner.json"
+  # Read every cached feed. With WORDFENCE_FEED=both a vulnerability can
+  # appear in both files; duplicate findings are collapsed by sorting unique
+  # on the reported line rather than by trying to reconcile the two records.
+  _feeds=$(ls "$VULN_CACHE"/wordfence-*.json 2>/dev/null)
+  [ -n "$_feeds" ] || { echo "  ✗ No cached feed. Run: wp-plugins.sh vuln-refresh" >&2; exit 1; }
 
   echo ""
   echo "Vulnerability scan — installed plugins and themes"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  Sources: Wordfence Intelligence (free)$([ -n "${PATCHSTACK_API_KEY:-}" ] && printf ', Patchstack')$([ -n "${WPSCAN_API_TOKEN:-}" ] && printf ', WPScan')$([ "$_use_nvd" = 1 ] && printf ', NVD')"
+  echo "  Sources: Wordfence Intelligence ${WORDFENCE_FEED} feed$([ -n "${PATCHSTACK_API_KEY:-}" ] && printf ', Patchstack')$([ -n "${WPSCAN_API_TOKEN:-}" ] && printf ', WPScan')$([ "$_use_nvd" = 1 ] && printf ', NVD')"
   echo ""
 
   _inv=$(_wp plugin list --fields=name,version,status --format=csv 2>/dev/null | tail -n +2)
@@ -229,7 +297,7 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
   printf '%s\n' "$_inv" | while IFS=, read -r _slug _ver _status; do
     [ -n "$_slug" ] || continue
     # Every affected range recorded for this slug, as "from|from_incl|to|to_incl|title|cve|score"
-    _ranges=$(jq -r --arg s "$_slug" '
+    _ranges=$(cat $_feeds | jq -s 'add' 2>/dev/null | jq -r --arg s "$_slug" '
       to_entries[] | .value as $v
       | ($v.software // [])[] | select(.slug == $s)
       | (.affected_versions // {}) | to_entries[] | .value as $r
@@ -237,7 +305,7 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
           ($r.to_version // "*"),   ($r.to_inclusive|tostring),
           ($v.title // "untitled"), ($v.cve // ""),
           (($v.cvss.score // "") | tostring) ] | @tsv
-    ' "$_feed" 2>/dev/null)
+    ' 2>/dev/null)
     [ -n "$_ranges" ] || continue
 
     printf '%s\n' "$_ranges" | while IFS="$(printf '\t')" read -r _fv _fi _tv _ti _title _cve _score; do
@@ -319,14 +387,15 @@ case "${1:-status}" in
     echo ""
     echo "Vulnerability data sources"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Wordfence Intelligence : ENABLED (free, no key, bulk feed)"
+    printf '  Wordfence Intelligence : %s\n' "$([ -n "${WORDFENCE_API_KEY:-}" ] && echo 'ENABLED (free token, bulk feed v3)' || echo 'NO TOKEN — vulnerability scanning unavailable')"
     printf '  Patchstack             : %s\n' "$([ -n "${PATCHSTACK_API_KEY:-}" ] && echo ENABLED || echo 'not configured')"
     printf '  WPScan                 : %s\n' "$([ -n "${WPSCAN_API_TOKEN:-}" ] && echo ENABLED || echo 'not configured')"
     echo "  NVD                    : on demand — wp-plugins.sh vulns --nvd"
     echo ""
-    echo "  Wordfence is the default because it is free for commercial use, needs"
-    echo "  no key, and is fetched as ONE bulk feed queried locally — so your"
-    echo "  plugin inventory never leaves this VM."
+    echo "  Wordfence is the primary source: free for personal and commercial"
+    echo "  use, and fetched as ONE bulk feed queried locally — so your plugin"
+    echo "  inventory never leaves this VM. The v3 feed does require a free"
+    echo "  account token (v2 was open and has been retired)."
     echo ""
     echo "  The opt-in sources query per plugin slug, which does disclose what"
     echo "  you run to that provider. That is a reasonable trade for better"
@@ -337,15 +406,19 @@ case "${1:-status}" in
     echo "    Patchstack: https://patchstack.com/  ·  WPScan: https://wpscan.com/api" ;;
   set-key)
     _src="${2:-}"; _key="${3:-}"
-    [ -n "$_src" ] && [ -n "$_key" ] || { echo "Usage: wp-plugins.sh set-key [patchstack|wpscan] <key>" >&2; exit 1; }
+    [ -n "$_src" ] && [ -n "$_key" ] || { echo "Usage: wp-plugins.sh set-key [wordfence|patchstack|wpscan] <key>" >&2; exit 1; }
     mkdir -p "$(dirname "$VULN_CONF")"
     touch "$VULN_CONF"; chmod 600 "$VULN_CONF"
     case "$_src" in
+      wordfence)  sed -i '/^WORDFENCE_API_KEY=/d' "$VULN_CONF"
+                  printf 'WORDFENCE_API_KEY=%s\n' "$_key" >> "$VULN_CONF"
+                  echo "  Note: the feed is fetched whole and matched locally, so your"
+                  echo "  plugin list is not sent to Wordfence." ;;
       patchstack) sed -i '/^PATCHSTACK_API_KEY=/d' "$VULN_CONF"
                   printf 'PATCHSTACK_API_KEY=%s\n' "$_key" >> "$VULN_CONF" ;;
       wpscan)     sed -i '/^WPSCAN_API_TOKEN=/d' "$VULN_CONF"
                   printf 'WPSCAN_API_TOKEN=%s\n' "$_key" >> "$VULN_CONF" ;;
-      *) echo "Unknown source '${_src}'. Use patchstack or wpscan." >&2; exit 1 ;;
+      *) echo "Unknown source '${_src}'. Use wordfence, patchstack or wpscan." >&2; exit 1 ;;
     esac
     echo "✔ ${_src} key stored in ${VULN_CONF} (0600, root-only)"
     echo "  Note: per-slug lookups disclose your plugin list to ${_src}." ;;

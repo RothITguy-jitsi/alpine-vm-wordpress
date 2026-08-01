@@ -148,7 +148,7 @@ NFT_CONF=$(cat << NFTEOF
 flush ruleset
 table inet filter {
     # Operator-added egress ports live in named sets rather than in this file,
-    # so wp-hardening.sh can open one live with `nft add element` -- no
+    # so wp-hardening.sh can open one live with an 'nft add element' call
     # regeneration, no reload, no window where the whole ruleset is absent.
     # Declared unconditionally: harmless when egress is unrestricted, and it
     # means the management commands behave identically either way.
