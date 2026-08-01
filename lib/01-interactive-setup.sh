@@ -698,6 +698,123 @@ echo -e "  ${YW}  detection and the firewall bouncer work exactly the same eithe
 _sec_note
 read -rsp "  CrowdSec enrolment key (blank = skip, enrol manually later) : " CROWDSEC_ENROLL_KEY; echo
 
+# ── ClamAV (optional malware signature layer) ────────────────────────────────
+echo ""
+echo -e "  ${BLD}Install ClamAV?${CL}"
+echo -e "  ${YW}This VM already scans for malware without it: PHP in the uploads${CL}"
+echo -e "  ${YW}directory, WordPress core compared byte-for-byte against the${CL}"
+echo -e "  ${YW}pinned image, YARA webshell rules, and database analysis.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  ClamAV is not the backbone of WordPress malware detection, and${CL}"
+echo -e "  ${YW}  that is the real reason it is optional rather than the memory${CL}"
+echo -e "  ${YW}  cost. It is a general-purpose, signature-driven file scanner${CL}"
+echo -e "  ${YW}  built largely for email attachments. Its coverage of modern,${CL}"
+echo -e "  ${YW}  obfuscated PHP webshells is weak next to the YARA rules here,${CL}"
+echo -e "  ${YW}  which were written specifically for that shape of threat.${CL}"
+echo -e "  ${YW}  It also false-positives on some minified JavaScript, and a${CL}"
+echo -e "  ${YW}  WordPress site is full of minified plugin assets — noise you${CL}"
+echo -e "  ${YW}  have to triage is how a scanner stops being read.${CL}"
+echo -e "  ${YW}  Its signatures need refreshing (freshclam) to stay meaningful;${CL}"
+echo -e "  ${YW}  a stale AV database is worse than none, because it looks like${CL}"
+echo -e "  ${YW}  coverage.${CL}"
+echo ""
+echo -e "  ${YW}  Where it genuinely earns its place: sites that accept file${CL}"
+echo -e "  ${YW}  uploads from visitors, where a user might post a real malware${CL}"
+echo -e "  ${YW}  binary rather than a PHP shell; catching non-PHP payloads such${CL}"
+echo -e "  ${YW}  as dropped ELF binaries, which YARA rules here do not target;${CL}"
+echo -e "  ${YW}  and compliance regimes that simply require an AV product.${CL}"
+echo -e "  ${YW}  Costs roughly 1 GB resident for the signature database, and a${CL}"
+echo -e "  ${YW}  full scan takes minutes — so it is on-demand and weekly, never${CL}"
+echo -e "  ${YW}  part of the daily job.${CL}"
+_sec_note
+INSTALL_CLAMAV=0
+read -rp "  Install ClamAV? [y/N] : " _CLAM
+case "${_CLAM}" in
+  y|Y|yes|YES) INSTALL_CLAMAV=1
+    msg_ok "ClamAV will be installed (signatures fetched on first run)"
+    msg_info "  Scan on demand: wp-malware-scan.sh clamav" ;;
+  *) msg_ok "ClamAV skipped — structural, core-integrity, YARA and database layers still run" ;;
+esac
+unset _CLAM
+
+# ── Wordfence Intelligence API key ───────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Wordfence Intelligence API token (plugin vulnerability data)${CL}"
+echo -e "  ${YW}This is what lets the VM tell you a plugin you have installed has a${CL}"
+echo -e "  ${YW}known vulnerability — as opposed to merely being out of date.${CL}"
+echo ""
+echo -e "  ${YW}Free, for personal and commercial use. It needs a free Wordfence${CL}"
+echo -e "  ${YW}account; generate the token under Integrations in the account${CL}"
+echo -e "  ${YW}dashboard:  https://www.wordfence.com/products/wordfence-intelligence/${CL}"
+echo -e "  ${YW}The v2 feed was open with no key and has been retired, so a token${CL}"
+echo -e "  ${YW}is now required to read the database at all.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  It covers the layer container scanning cannot see. Trivy and${CL}"
+echo -e "  ${YW}  digest pinning secure the IMAGE; plugins and themes live in a${CL}"
+echo -e "  ${YW}  mounted volume that an image update never touches — and that is${CL}"
+echo -e "  ${YW}  where roughly 91% of WordPress vulnerabilities are found.${CL}"
+echo -e "  ${YW}  The feed is downloaded whole and matched on this VM, so your${CL}"
+echo -e "  ${YW}  plugin list is never sent to anyone. Skipping it costs you that${CL}"
+echo -e "  ${YW}  visibility and nothing else — everything else still works.${CL}"
+echo -e "  ${YW}  It reports DISCLOSED issues. Roughly 46% of plugin${CL}"
+echo -e "  ${YW}  vulnerabilities have no patch when they are disclosed, and a${CL}"
+echo -e "  ${YW}  plugin nobody has audited has no CVEs by definition.${CL}"
+_sec_note
+WORDFENCE_FEED="scanner"
+read -rsp "  Wordfence API token (blank = skip, add later with wp-plugins.sh) : " WORDFENCE_API_KEY; echo
+if [[ -n "$WORDFENCE_API_KEY" ]]; then
+  msg_ok "Wordfence token captured (${#WORDFENCE_API_KEY} chars) — daily vulnerability scans enabled"
+  echo ""
+  echo -e "  ${BLD}Which Wordfence feed?${CL}"
+  echo -e "  ${YW}Two feeds exist, and the difference is NOT simply that one is${CL}"
+  echo -e "  ${YW}bigger. They contain different things.${CL}"
+  echo ""
+  echo -e "  ${YW}  scanner    Minimal detection format. Contains newly discovered${CL}"
+  echo -e "  ${YW}             vulnerabilities that are still being researched and${CL}"
+  echo -e "  ${YW}             are NOT yet in the production feed. So it detects${CL}"
+  echo -e "  ${YW}             MORE, and detects it EARLIER — which matters,${CL}"
+  echo -e "  ${YW}             because a freshly disclosed plugin flaw is the one${CL}"
+  echo -e "  ${YW}             most likely to be under active exploitation.${CL}"
+  echo -e "  ${YW}             ~10 MB. This is the default.${CL}"
+  echo ""
+  echo -e "  ${YW}  production Fully analysed records: descriptions, CVSS vectors,${CL}"
+  echo -e "  ${YW}             references, patched versions, researcher credit.${CL}"
+  echo -e "  ${YW}             Better for DECIDING what to do about a finding, and${CL}"
+  echo -e "  ${YW}             for evidence you can hand a client. But a record${CL}"
+  echo -e "  ${YW}             only appears once analysis is complete, so on its${CL}"
+  echo -e "  ${YW}             own it can MISS the newest issues. Over 100 MB.${CL}"
+  echo ""
+  echo -e "  ${YW}  both       Scanner for detection coverage, production for the${CL}"
+  echo -e "  ${YW}             detail on whatever it finds. Two downloads, most${CL}"
+  echo -e "  ${YW}             RAM during parsing, and the most complete picture.${CL}"
+  echo ""
+  _sec_head
+  echo -e "  ${YW}  Production is optional and not the default for a security${CL}"
+  echo -e "  ${YW}  reason before a resource one: using it ALONE narrows what you${CL}"
+  echo -e "  ${YW}  detect. Richer records about issues you already know of are${CL}"
+  echo -e "  ${YW}  worth less than knowing about the issue that landed today.${CL}"
+  echo -e "  ${YW}  Choose 'both' if you want the detail without giving up the${CL}"
+  echo -e "  ${YW}  early warning; that is the only combination with no blind${CL}"
+  echo -e "  ${YW}  spot, and it costs disk and parse time rather than accuracy.${CL}"
+  _sec_note
+  read -rp "  Feed? [scanner/production/both] (default: scanner) : " _WFF
+  case "${_WFF:-scanner}" in
+    production|prod) WORDFENCE_FEED="production" ;;
+    both|all)        WORDFENCE_FEED="both" ;;
+    *)               WORDFENCE_FEED="scanner" ;;
+  esac
+  unset _WFF
+  msg_ok "Wordfence feed: ${WORDFENCE_FEED}"
+  [ "$WORDFENCE_FEED" = "production" ] && \
+    msg_warn "  Production alone will not see vulnerabilities still under research."
+else
+  msg_warn "No Wordfence token — plugin vulnerability scanning will be unavailable."
+  msg_warn "  Update visibility (wp-plugins.sh status) still works without it."
+  msg_warn "  Add later:  wp-plugins.sh set-key wordfence <token>"
+fi
+
 echo ""
 echo -e "  ${BLD}GeoIP country filtering (optional — Layer 2 Apache, site-wide)${CL}"
 echo -e "  ${YW}Blocks or allows visitors by country before WordPress/PHP ever runs.${CL}"

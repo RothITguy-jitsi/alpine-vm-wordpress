@@ -351,10 +351,14 @@ doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4
 
 | Source | Cost | Default | Notes |
 |---|---|---|---|
-| **Wordfence Intelligence** | Free, no key, commercial use permitted | **On** | Fetched as one **bulk feed**, matched locally |
+| **Wordfence Intelligence** | Free (personal + commercial), **free account token required** | **Primary** | Fetched as one **bulk feed**, matched locally |
 | **NVD** | Free | On demand (`vulns --nvd`) | Keyword matching only; sparse and noisy for WP plugins, rate-limited to 5 req/30s without a key |
 | **Patchstack** | Free browse, commercial API | Opt-in | Often fastest on new disclosures |
 | **WPScan** | Free tier (25 calls/day) | Opt-in | Long-standing; powers the WPScan CLI |
+
+**A free Wordfence token is required.** The old v2 feed was open with no key and has been retired, so v3 with a token is the only way to read the database now. Generate one under **Integrations** in a free [Wordfence account](https://www.wordfence.com/products/wordfence-intelligence/). The installer asks for it alongside the CrowdSec enrolment key; add it later with `wp-plugins.sh set-key wordfence <token>`.
+
+Without a token, `wp-plugins.sh status` (update availability) still works — you lose vulnerability matching only.
 
 ```sh
 wp-plugins.sh vulns                          # scan (Wordfence)
@@ -365,7 +369,19 @@ wp-plugins.sh set-key wpscan <token>
 wp-plugins.sh vuln-refresh                   # force a feed refresh
 ```
 
-**Wordfence is the default for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **your plugin inventory never leaves the machine**. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
+**Which feed?** Two exist, and the difference isn't just size:
+
+| Feed | Contains | Trade-off |
+|---|---|---|
+| `scanner` *(default)* | Minimal detection format — **plus vulnerabilities still under research**, not yet in production | Detects **more**, and **earlier**. ~10 MB. Little detail per record. |
+| `production` | Fully analysed: descriptions, CVSS vectors, references, patched versions | Better for deciding what to do and for client-facing evidence. A record only lands once analysis completes, so **on its own it can miss the newest issues**. 100 MB+. |
+| `both` | Scanner for coverage, production for detail | No blind spot. Two downloads, more parse time. |
+
+**Production is optional, and the reason is security before resources.** Using it *alone* narrows what you detect: a freshly disclosed plugin flaw is the one most likely to be under active exploitation, and that's exactly the record that hasn't finished analysis yet. Richer detail about issues you already know of is worth less than knowing about the one that landed today. Pick `both` if you want the detail without giving up the early warning — that costs disk and parse time rather than accuracy.
+
+Change it later: `wp-plugins.sh set-key wordfence <token>` then edit `WORDFENCE_FEED` in `/etc/wp-install/vuln-sources.conf`.
+
+**Wordfence is primary for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **your plugin inventory never leaves the machine** — the token authenticates the download, it doesn't report what you run. The **Scanner** feed is used rather than Production: Production carries full analysed records and is well over 100 MB, which is a poor thing to hand `jq` on a 4 GB VM, while Scanner is the minimal detection format *and* includes newly discovered vulnerabilities not yet fully analysed — smaller and earlier. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
 
 Keys live in `/etc/wp-install/vuln-sources.conf` (0600, root-only).
 
@@ -448,7 +464,15 @@ wp-malware-scan.sh quarantine <file>
 
 **Core integrity is the strongest check here**, and it's a side effect of digest pinning: the pinned image contains pristine WordPress core, is read-only, and was already Trivy-scanned. Most scanners have to fetch a checksum list over the network and trust it.
 
-**On ClamAV:** deliberately *not* installed by default. Its signature database alone is close to a gigabyte resident, which is a poor trade on a 4 GB VM already running WordPress, MariaDB and CrowdSec — and its PHP-webshell coverage is weaker than the YARA layer. Add it if you want it: `apk add clamav clamav-libunrar && freshclam`.
+**On ClamAV:** asked for at install (default no), and the reason it's optional is *not primarily memory*.
+
+ClamAV is a general-purpose, signature-driven file scanner built largely for email attachments. Its coverage of modern obfuscated PHP webshells is weak next to the YARA rules here, which were written for exactly that. It also false-positives on some minified JavaScript — and a WordPress tree is full of minified plugin assets, so that's triage noise, which is how a scanner stops being read. Its signatures need refreshing to stay meaningful, and a stale AV database is worse than none because it *looks* like coverage.
+
+Where it genuinely earns its place: sites that accept **file uploads from visitors**, where someone may post a real malware binary rather than a PHP shell; **non-PHP payloads** such as dropped ELF binaries, which the YARA rules here don't target; and **compliance regimes that simply require an AV product**.
+
+Answer yes and it's installed with signatures fetched and a weekly scan (Sunday 04:15). Answer no and the structural, core-integrity, YARA and database layers still run daily. Add it later with `apk add clamav clamav-libunrar && freshclam`.
+
+*(Superseded note:)*  Its signature database alone is close to a gigabyte resident, which is a poor trade on a 4 GB VM already running WordPress, MariaDB and CrowdSec — and its PHP-webshell coverage is weaker than the YARA layer. Add it if you want it: `apk add clamav clamav-libunrar && freshclam`.
 
 **On Linux Malware Detect (maldet/LMD):** deliberately not included. It installs by piping an unsigned shell script from a third-party host — the same supply-chain pattern this project refuses for the Trivy installer — and its signatures overlap ClamAV heavily. Real trust cost, marginal added coverage.
 

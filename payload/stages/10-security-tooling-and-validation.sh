@@ -143,8 +143,40 @@ else
   warn "yara could not be installed; the YARA layer will be skipped"
   warn "  Install later with: apk add yara"
 fi
-ok "  ClamAV is optional and NOT installed by default (memory cost)."
-ok "  Add it if you want that layer: apk add clamav clamav-libunrar && freshclam"
+# ClamAV is installed only if asked for. It is optional for a reason that
+# is not primarily memory: it is a general-purpose, signature-driven file
+# scanner built largely for email attachments, and its coverage of modern
+# obfuscated PHP webshells is weak next to the YARA rules installed above,
+# which target exactly that. It also false-positives on some minified
+# JavaScript, and a WordPress tree is full of minified plugin assets.
+# It earns its place on sites that accept visitor uploads, for non-PHP
+# payloads such as dropped ELF binaries, and where a compliance regime
+# simply requires an AV product.
+if [ "${INSTALL_CLAMAV:-0}" = "1" ]; then
+  ts "Installing ClamAV (requested at install time)"
+  if apk add --no-cache clamav clamav-libunrar >/dev/null 2>&1; then
+    ok "ClamAV installed"
+    # Signatures are fetched now so the first scan is not the thing that
+    # discovers the database is empty. Non-fatal: a registry or mirror
+    # problem should not fail an otherwise-good install.
+    if freshclam --quiet >/dev/null 2>&1; then
+      ok "  Signature database downloaded"
+    else
+      warn "  freshclam could not download signatures yet — run 'freshclam' later"
+    fi
+    # Weekly, not daily: a full ClamAV pass over a WordPress tree takes
+    # minutes, and the layers that matter most for WordPress already run daily.
+    printf '15 4 * * 0 /usr/local/bin/wp-malware-scan.sh clamav >/dev/null 2>&1 || logger -t wp-malware "weekly ClamAV scan reported findings"\n' >> /etc/crontabs/root
+    ok "  Weekly ClamAV scan scheduled (Sunday 04:15 UTC)"
+    ok "  On demand: wp-malware-scan.sh clamav"
+  else
+    warn "ClamAV was requested but could not be installed — other layers unaffected"
+  fi
+else
+  ok "ClamAV not installed (not requested)."
+  ok "  Structural, core-integrity, YARA and database layers still run daily."
+  ok "  Add later: apk add clamav clamav-libunrar && freshclam"
+fi
 chmod +x /usr/local/bin/wp-hardening.sh
 ok "wp-hardening.sh installed"
 ok "  Usage: wp-hardening.sh status"

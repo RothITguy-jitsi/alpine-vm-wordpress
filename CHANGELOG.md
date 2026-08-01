@@ -6,6 +6,94 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Production feed and ClamAV both offered at install
+
+Two things that were hardcoded decisions are now operator choices, each with
+its actual reasoning stated at the prompt.
+
+**Wordfence feed: scanner / production / both.** The honest framing here is
+not "production is better but heavy" — the feeds contain different things.
+Scanner carries vulnerabilities that are still under research and therefore
+absent from production, so it detects **more** and **earlier**; production
+carries fully analysed records with CVSS vectors, references and patched
+versions, which is better for deciding what to do and for client-facing
+evidence, but a record only lands once analysis completes.
+
+So production is optional for a **security** reason before a resource one:
+using it alone narrows detection. A freshly disclosed plugin flaw is the one
+most likely to be under active exploitation, and that is precisely the record
+production does not have yet. `both` is offered as the combination with no
+blind spot, costing disk and parse time rather than accuracy.
+
+Implemented by splitting the fetch into a per-feed helper; the matcher reads
+every cached feed file, so `both` needs no special case downstream and
+duplicate findings collapse naturally.
+
+**ClamAV: asked at install, default no.** The memory cost was the reason
+given previously, and it was the least interesting one. ClamAV is a
+general-purpose signature scanner built largely for email attachments, and
+its coverage of obfuscated PHP webshells is weak next to the YARA rules
+already installed, which target exactly that shape of threat. It
+false-positives on some minified JavaScript, and a WordPress tree is full of
+minified plugin assets — triage noise is how a scanner stops being read. Its
+signatures also need refreshing, and a stale AV database is worse than none
+because it looks like coverage.
+
+Where it does earn its place, and the prompt says so: sites accepting visitor
+file uploads, non-PHP payloads such as dropped ELF binaries that the YARA
+rules do not target, and compliance regimes that simply require an AV
+product. Answering yes installs it, fetches signatures during the install
+rather than letting the first scan discover an empty database, and schedules
+a weekly scan — weekly rather than daily because a full pass takes minutes
+and the layers that matter most for WordPress already run daily.
+
+---
+
+## Unreleased — Wordfence API v3 (v2 is retired and the code pointed at it)
+
+Reported by the operator, and correct: the integration was written against
+Wordfence Intelligence **v2**, which required no authentication. v2 has since
+been retired in favour of **v3**, which requires a token generated under
+Integrations in a free Wordfence account and sent in the `Authorization`
+header.
+
+This mattered more than a version bump. Code pointing at a retired endpoint
+does not announce itself — the daily scan would have failed quietly and the
+site would have looked monitored while nothing was being checked. Worth
+recording that my original research returned the v2 documentation and I
+treated it as current; the operator's correction is what caught it.
+
+**Changed:**
+
+- Endpoint moved to `/api/intelligence/v3/vulnerabilities/scanner`, with
+  `Authorization: Bearer <token>`.
+- The token is prompted for at install, immediately after the CrowdSec
+  enrolment key — the same shape of question, in the same part of the run.
+- Persisted to `/etc/wp-install/vuln-sources.conf` (0600), the single file the
+  vulnerability code reads, rather than left only in `vars.sh` which several
+  tools source for unrelated reasons.
+- `wp-plugins.sh set-key wordfence <token>` added for configuring it later.
+
+**Failure paths are explicit rather than silent**, since a vulnerability
+scanner that stops working quietly is worse than one that was never
+installed. Verified across the matrix: no token with no cache fails with
+signup instructions; no token with a cache warns and uses it; HTTP 401/403
+reports a rejected token; 429 reports rate limiting; each falls back to the
+cached feed when one exists and says how old it is.
+
+**Scanner feed rather than Production, now documented as a decision.**
+Production carries the fully analysed records and is well over 100 MB — a
+poor thing to hand `jq` on a 4 GB VM also running WordPress and MariaDB.
+Scanner is the minimal detection format, which is exactly the fields this
+matching uses, and it additionally carries newly discovered vulnerabilities
+not yet fully analysed. Smaller and earlier.
+
+The privacy property is unchanged: the token authenticates the download, it
+does not report what you run. The feed is still fetched whole and matched on
+the VM.
+
+---
+
 ## Unreleased — Email alerts from scheduled scans (`wp-notify.sh`)
 
 Scans logged to syslog, which nobody reads on a VM they are not currently
