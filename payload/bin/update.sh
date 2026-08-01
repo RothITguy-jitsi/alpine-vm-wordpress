@@ -773,6 +773,51 @@ do_wp_update() {
   local candidate_ok=0 i
   podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
 
+  # ── Candidate DB isolation (read-only user) ────────────────────────────────
+  # The lighter half of the isolation problem, and the half worth paying for.
+  # A temporary SELECT-only account is created for the candidate and dropped
+  # again afterwards, so the candidate can read everything it needs to render
+  # a page and boot WordPress, while any write it attempts fails at the
+  # database rather than landing in production.
+  #
+  # BE CLEAR ABOUT WHAT THIS DOES NOT DO. It does not test the migration. A
+  # read-only candidate cannot run schema upgrades, so this proves "the new
+  # image boots and can read this database", not "upgrading this database
+  # will succeed". Proving the latter needs a dump restored into a throwaway
+  # instance -- that is what wasp-selftest.sh restore-test does, separately
+  # and on its own schedule, rather than adding minutes to every update.
+  #
+  # Write failures in the candidate's log during this window are EXPECTED and
+  # are the mechanism working, not a fault.
+  local CAND_DB_USER="" CAND_DB_PASS="" CAND_DB_ARGS=""
+  if [ "${CANDIDATE_DB_READONLY:-1}" = "1" ] && [ -n "${MARIADB_ROOT_PASSWORD:-}" ]; then
+    CAND_DB_USER="wp_cand_$$"
+    CAND_DB_PASS=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    if podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD}" -e "
+          CREATE USER '${CAND_DB_USER}'@'%' IDENTIFIED BY '${CAND_DB_PASS}';
+          GRANT SELECT ON \`${WORDPRESS_DB_NAME:-wordpress}\`.* TO '${CAND_DB_USER}'@'%';
+          FLUSH PRIVILEGES;" >/dev/null 2>&1; then
+      CAND_DB_ARGS="-e WORDPRESS_DB_USER=${CAND_DB_USER} -e WORDPRESS_DB_PASSWORD=${CAND_DB_PASS}"
+      echo "  → Candidate will use a temporary SELECT-only database account"
+      echo "    (production data cannot be modified by the candidate)"
+    else
+      echo "  ⚠ Could not create the read-only candidate account — falling back to"
+      echo "    production credentials for the candidate, as before. Set"
+      echo "    CANDIDATE_DB_READONLY=0 to silence this." >&2
+      CAND_DB_USER=""
+    fi
+  fi
+  # Dropped on every exit path, including a failed candidate or Ctrl-C. A
+  # leftover account would be a standing credential nobody knows about.
+  _drop_cand_user() {
+    [ -n "$CAND_DB_USER" ] || return 0
+    podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD}" \
+      -e "DROP USER IF EXISTS '${CAND_DB_USER}'@'%'; FLUSH PRIVILEGES;" >/dev/null 2>&1 || \
+      echo "  ⚠ Could not drop temporary DB user ${CAND_DB_USER} — remove it by hand" >&2
+    CAND_DB_USER=""
+  }
+  trap '_drop_cand_user' EXIT INT TERM
+
   # FIX (first real `update.sh` run): the candidate used a bare
   #     --tmpfs /var/log/apache2:size=32M,noexec,nosuid,nodev
   # and Apache died on startup with
@@ -811,6 +856,7 @@ do_wp_update() {
     -e WORDPRESS_DEBUG="" \
     -e WP_ENVIRONMENT_TYPE=staging \
     -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
+    ${CAND_DB_ARGS} \
     -v /home/wpuser/wp/html:/var/www/html:ro \
     -v /home/wpuser/wp/logs-candidate:/var/log/apache2 \
     -v /home/wpuser/wp/apache-conf/wp-security.conf:/etc/apache2/conf-enabled/wp-security.conf:ro \
@@ -833,6 +879,7 @@ do_wp_update() {
     fi
     echo "   ────────────────────────────────────────────────────────"
     podman rm -f "$WP_CANDIDATE" >/dev/null 2>&1 || true
+    _drop_cand_user
     return 1
   fi
 

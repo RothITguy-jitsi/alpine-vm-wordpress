@@ -23,40 +23,23 @@ fi
 [ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
 SECRETS_DIR="/home/wpuser/wp/secrets"
-SMTP_FILE="${SECRETS_DIR}/smtp.php"
-MU_PLUGIN="/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php"
-WP_LOG_DIR="/home/wpuser/wp/logs"
-WPCLI_IMAGE="${WPCLI_IMAGE:-docker.io/library/wordpress:cli}"
-
-_wp() {
-  if ! podman ps --filter 'name=^wordpress$' --filter status=running --format '{{.Names}}' \
-       | grep -qx wordpress; then
-    echo "✗  The 'wordpress' container is not running: rc-service wp-container start" >&2
-    exit 1
-  fi
-  # shellcheck disable=SC2086 -- WPCLI_ENV is a deliberate word-split list
-  # The official WordPress image's wp-config.php reads DB_NAME/DB_USER/
-  # DB_PASSWORD from the ENVIRONMENT (it is wp-config-docker.php). A wp-cli
-  # container that mounts the same html directory but without those variables
-  # loads a wp-config resolving to nothing, and every command dies with
-  # "Error establishing a database connection" -- which reads like a database
-  # or (in wp-mail.sh) a mail-server fault when neither is wrong. Uses the
-  # same env-file as the real container so the two cannot drift.
-  podman run --rm --network "container:wordpress" --user 33:33 \
-    --env-file /etc/wordpress/env \
-    -e WORDPRESS_DB_HOST=mariadb:3306 \
-    ${WPCLI_ENV} \
-    -v /home/wpuser/wp/html:/var/www/html \
-    -v "${SECRETS_DIR}:/var/www/private:ro" \
-    "$WPCLI_IMAGE" "$@"
-}
-
-# Read one value out of the generated PHP config without executing it —
-# a plain grep/sed, so `status` works even if the file is malformed (which
-# is exactly when you most want to look at it).
+# INI, not PHP. The credentials file is data now, so reading it cannot
+# execute anything -- see the note in 01-wpvm-smtp.php for why that changed.
+# Legacy smtp.php is still read if present so an existing VM keeps working
+# until `setup` migrates it.
+SMTP_FILE="${SECRETS_DIR}/smtp.ini"
+SMTP_FILE_LEGACY="${SECRETS_DIR}/smtp.php"
 _cfg() {
-  [ -r "$SMTP_FILE" ] || return 1
-  sed -n "s/^[[:space:]]*'$1'[[:space:]]*=>[[:space:]]*'\{0,1\}\([^',]*\)'\{0,1\},.*/\1/p" "$SMTP_FILE" | head -1
+  if [ -r "$SMTP_FILE" ]; then
+    if [ "$1" = "pass" ]; then
+      sed -n 's/^[[:space:]]*pass_b64[[:space:]]*=[[:space:]]*//p' "$SMTP_FILE" | head -1 | base64 -d 2>/dev/null
+    else
+      sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$SMTP_FILE" | head -1
+    fi
+    return 0
+  fi
+  [ -r "$SMTP_FILE_LEGACY" ] || return 1
+  sed -n "s/^[[:space:]]*'$1'[[:space:]]*=>[[:space:]]*'\{0,1\}\([^',]*\)'\{0,1\},.*/\1/p" "$SMTP_FILE_LEGACY" | head -1
 }
 
 _configured() { [ -r "$SMTP_FILE" ] && [ -n "$(_cfg host)" ]; }
@@ -180,30 +163,27 @@ do_setup() {
   printf "  From address [%s] : " "$_u"; read -r _f; _f="${_f:-$_u}"
   printf "  From name [WordPress] : "; read -r _fn; _fn="${_fn:-WordPress}"
 
-  _php_q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"; }
-  # root:33 0750 — the PHP worker must be able to traverse this directory or
-  # it can never read the file inside, whatever that file's own mode says.
+  # INI, not PHP: the config is data, so it can never be executed. Password
+  # base64-encoded so quotes/semicolons/'=' cannot interact with INI parsing.
   mkdir -p "$SECRETS_DIR"
   chown root:33 "$SECRETS_DIR" 2>/dev/null || true
   chmod 0750 "$SECRETS_DIR"
   install -m 0600 -o 0 -g 33 /dev/null "$SMTP_FILE"
-  cat > "$SMTP_FILE" << PHPEOF
-<?php
-// Written by wp-mail.sh setup. Mounted read-only into the container at
-// /var/www/private/smtp.php — outside the web root on purpose.
-return array(
-    'host'       => '$(_php_q "$_h")',
-    'port'       => $(printf '%d' "$_p" 2>/dev/null || echo 587),
-    'user'       => '$(_php_q "$_u")',
-    'pass'       => '$(_php_q "$_pw")',
-    'from'       => '$(_php_q "$_f")',
-    'from_name'  => '$(_php_q "$_fn")',
-    'encryption' => '$_enc',
-    'timeout'    => 10,
-);
-PHPEOF
+  {
+    printf '; WASP SMTP relay settings. Data, not code -- never include() this.\n'
+    printf 'host = %s\n'       "$_h"
+    printf 'port = %s\n'       "$_p"
+    printf 'user = %s\n'       "$_u"
+    printf 'pass_b64 = %s\n'   "$(printf '%s' "$_pw" | base64 | tr -d '\n')"
+    printf 'from = %s\n'       "$_f"
+    printf 'from_name = %s\n'  "$_fn"
+    printf 'encryption = %s\n' "$_enc"
+    printf 'timeout = 10\n'
+  } > "$SMTP_FILE"
   chmod 0440 "$SMTP_FILE"; chown root:33 "$SMTP_FILE"
-  echo "✔  Written to ${SMTP_FILE} (root:33 0440, dir 0750)"
+  # Retire the executable form if this VM predates the change.
+  [ -f "$SMTP_FILE_LEGACY" ] && { rm -f "$SMTP_FILE_LEGACY"; echo "  Removed legacy executable smtp.php"; }
+  echo "✔  Written to ${SMTP_FILE} (INI, non-executable, root:33 0440, dir 0750)"
   # The mount is read-only and already in place, and PHP reads the file per
   # request, so no container restart is needed — but opcache can hold a
   # compiled copy, so nudge it.

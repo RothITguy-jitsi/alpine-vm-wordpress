@@ -242,28 +242,32 @@ if [ -n "${SMTP_HOST:-}" ]; then
   _php_q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"; }
   # Pre-create with restrictive mode so the file never exists world-readable,
   # even briefly: `cat >` truncates but preserves an existing file's mode.
-  install -m 0600 -o 0 -g 33 /dev/null /home/wpuser/wp/secrets/smtp.php
-  cat > /home/wpuser/wp/secrets/smtp.php << PHPEOF
-<?php
-// Generated at install time by 06-containers-mariadb-wordpress.sh.
-// Mounted read-only into the WordPress container at
-// /var/www/private/smtp.php and read by the 01-wpvm-smtp.php mu-plugin.
-// Deliberately outside /var/www/html: no URL maps here even if PHP breaks.
-// Do not move this into the web root.
-return array(
-    'host'       => '$(_php_q "$SMTP_HOST")',
-    'port'       => $(printf '%d' "${SMTP_PORT:-587}" 2>/dev/null || echo 587),
-    'user'       => '$(_php_q "$SMTP_USER")',
-    'pass'       => '$(_php_q "$SMTP_PASS")',
-    'from'       => '$(_php_q "$SMTP_FROM")',
-    'from_name'  => '$(_php_q "$SMTP_FROM_NAME")',
-    'encryption' => '$(_php_q "${SMTP_ENCRYPTION:-tls}")',
-    'timeout'    => 10,
-);
-PHPEOF
-  chmod 0440 /home/wpuser/wp/secrets/smtp.php
-  chown root:33 /home/wpuser/wp/secrets/smtp.php
-  ok "SMTP credentials written (root:33 0440, dir 0750, outside the web root)"
+  # Written as INI, not PHP. A .php credentials file is code -- it gets
+  # include()d, so a flaw in the escaping below, or any future write access to
+  # the file, would be code execution rather than a bad password. INI is data:
+  # the worst a malformed value can do is fail to parse.
+  #
+  # The password is base64-encoded so that quotes, semicolons, '=' and
+  # whitespace cannot interact with INI parsing at all. That is encoding for
+  # robustness, NOT secrecy -- file permissions remain what protects it.
+  install -m 0600 -o 0 -g 33 /dev/null /home/wpuser/wp/secrets/smtp.ini
+  {
+    printf '; WASP SMTP relay settings. Data, not code -- never include() this.\n'
+    printf '; Managed by wp-mail.sh setup. Mounted read-only into the container.\n'
+    printf 'host = %s\n'       "$SMTP_HOST"
+    printf 'port = %s\n'       "${SMTP_PORT:-587}"
+    printf 'user = %s\n'       "$SMTP_USER"
+    printf 'pass_b64 = %s\n'   "$(printf '%s' "$SMTP_PASS" | base64 | tr -d '\n')"
+    printf 'from = %s\n'       "$SMTP_FROM"
+    printf 'from_name = %s\n'  "$SMTP_FROM_NAME"
+    printf 'encryption = %s\n' "${SMTP_ENCRYPTION:-tls}"
+    printf 'timeout = 10\n'
+  } > /home/wpuser/wp/secrets/smtp.ini
+  chmod 0440 /home/wpuser/wp/secrets/smtp.ini
+  chown root:33 /home/wpuser/wp/secrets/smtp.ini
+  # Remove any pre-existing executable config so it cannot be the one used.
+  rm -f /home/wpuser/wp/secrets/smtp.php
+  ok "SMTP credentials written as INI (root:33 0440, non-executable, outside the web root)"
 else
   # Create the directory regardless so the read-only mount below always has
   # a source -- podman would otherwise create it root-owned at run time.

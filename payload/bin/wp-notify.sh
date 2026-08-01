@@ -11,7 +11,7 @@
 # by repeatedly: anything implemented in several places drifts, and the copy
 # nobody remembered to update fails silently.
 #
-# CREDENTIALS: read from /home/wpuser/wp/secrets/smtp.php, the same single
+# CREDENTIALS: read from /home/wpuser/wp/secrets/smtp.ini, the same single
 # file the WordPress mu-plugin uses. Nothing is duplicated into a second
 # config, so there is no second place to forget when the relay changes.
 #
@@ -40,16 +40,23 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 [ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 
-SMTP_FILE="/home/wpuser/wp/secrets/smtp.php"
-STATE="/var/lib/wp-notify"
-NOTIFY_COOLDOWN_HOURS="${NOTIFY_COOLDOWN_HOURS:-24}"
-mkdir -p "$STATE" 2>/dev/null || true
-chmod 700 "$STATE" 2>/dev/null || true
-
-# Same parser wp-mail.sh uses: read the value without executing the file.
+# INI, not PHP. The credentials file is data now, so reading it cannot
+# execute anything -- see the note in 01-wpvm-smtp.php for why that changed.
+# Legacy smtp.php is still read if present so an existing VM keeps working
+# until `setup` migrates it.
+SMTP_FILE="${SECRETS_DIR}/smtp.ini"
+SMTP_FILE_LEGACY="${SECRETS_DIR}/smtp.php"
 _cfg() {
-  [ -r "$SMTP_FILE" ] || return 1
-  sed -n "s/^[[:space:]]*'$1'[[:space:]]*=>[[:space:]]*'\{0,1\}\([^',]*\)'\{0,1\},.*/\1/p" "$SMTP_FILE" | head -1
+  if [ -r "$SMTP_FILE" ]; then
+    if [ "$1" = "pass" ]; then
+      sed -n 's/^[[:space:]]*pass_b64[[:space:]]*=[[:space:]]*//p' "$SMTP_FILE" | head -1 | base64 -d 2>/dev/null
+    else
+      sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$SMTP_FILE" | head -1
+    fi
+    return 0
+  fi
+  [ -r "$SMTP_FILE_LEGACY" ] || return 1
+  sed -n "s/^[[:space:]]*'$1'[[:space:]]*=>[[:space:]]*'\{0,1\}\([^',]*\)'\{0,1\},.*/\1/p" "$SMTP_FILE_LEGACY" | head -1
 }
 
 _recipient() {
@@ -117,7 +124,26 @@ case "${1:-}" in
     _configured || { echo "✗ No SMTP relay configured. Run: wp-mail.sh setup" >&2; exit 1; }
     _t=$(mktemp)
     printf 'This is a test alert from wp-notify.sh.\n\nIf you received it, scheduled scans can reach you.\n' > "$_t"
-    send_mail "test" "wp-notify test message" "$_t" && echo "✔ Test alert sent to $(_recipient)"
+    # The && form meant a failed send printed NOTHING AT ALL -- observed in
+    # the field: `wp-notify.sh --test` returned to the prompt with no output,
+    # which reads like success. A test command that is silent on failure is
+    # worse than no test command.
+    if send_mail "test" "wp-notify test message" "$_t"; then
+      echo "✔ Test alert sent to $(_recipient)"
+      echo "  If it does not arrive, the relay accepted it and something"
+      echo "  downstream dropped it — check SPF/DKIM for $(_cfg from)."
+    else
+      echo "✗ Test alert FAILED to send." >&2
+      if [ -s "$STATE/last-error" ]; then
+        echo "  msmtp said:" >&2
+        sed 's/^/    /' "$STATE/last-error" >&2
+      else
+        echo "  No error output captured. Is msmtp installed? (apk add msmtp)" >&2
+      fi
+      echo "  Check the relay settings:  wp-mail.sh doctor" >&2
+      rm -f "$_t"
+      exit 1
+    fi
     rm -f "$_t" ;;
   --status)
     echo ""

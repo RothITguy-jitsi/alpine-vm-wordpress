@@ -1,4 +1,4 @@
-# Architecture
+# WASP — Architecture
 
 Diagrams render natively on GitHub. Four views, because one diagram covering
 all of this would be unreadable: what exists, what a request passes through,

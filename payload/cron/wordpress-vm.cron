@@ -40,3 +40,10 @@
 # anywhere. Silent unless something installed actually matches a disclosed
 # vulnerability.
 30 6 * * * /usr/local/bin/wp-vuln-cron.sh
+# Weekly self-test (Sunday 05:30 UTC): restore the newest backup into a
+# throwaway database and verify the data is really there, and prove the
+# read-only candidate account genuinely refuses writes. Weekly rather than
+# daily because the restore starts a second database and copies the whole
+# dump. Emails only on failure -- a guarantee that stops holding is exactly
+# the thing worth interrupting someone for.
+30 5 * * 0 /usr/local/bin/wasp-selftest.sh all >/tmp/wasp-selftest.out 2>&1 || { logger -t wasp-selftest "SELF-TEST FAILED — a stated guarantee is not holding"; [ -x /usr/local/bin/wp-notify.sh ] && NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-selftest "Self-test FAILED: backup restore or DB isolation" /tmp/wasp-selftest.out; }

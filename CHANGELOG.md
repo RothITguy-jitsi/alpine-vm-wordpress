@@ -6,6 +6,87 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — SMTP credentials are no longer an executable PHP file
+
+A third-party evaluation raised, as High: *"Setup writes executable PHP secret
+config — quoting defects or replacement can become code execution."* Correct,
+and worth acting on rather than defending.
+
+`smtp.php` returned a PHP array and was `include()`d, which made the
+credentials file **code**. The escaping that wrote it was careful — it was
+tested against passwords containing quotes and backslashes — but careful
+escaping is a mitigation, and a data format is a fix. Two ways it could have
+bitten: a defect in the escaper turning a crafted password into a statement,
+and any future write access to the file becoming immediate RCE rather than a
+wrong password.
+
+Now written as `smtp.ini` and parsed with `parse_ini_file(..., INI_SCANNER_RAW)`
+— values are taken literally, with no interpretation of quotes, constants or
+types. Nothing in it can execute. The password is base64-encoded so that
+quotes, semicolons, `=` and whitespace cannot interact with INI parsing at
+all; that is **encoding for robustness, not secrecy**, and the file's
+permissions remain what protects it. Verified a password containing
+`;`, `"`, `=`, `'` and `\` round-trips byte-exact.
+
+Existing VMs keep working: the mu-plugin still reads a legacy `smtp.php` if
+present, logs that it did so, and `wp-mail.sh setup` rewrites as INI and
+deletes the old file. `validate-wordpress.sh` warns while an executable
+config remains.
+
+**On the rest of that evaluation:** it reviewed a build predating
+`wasp-selftest.sh` and the read-only candidate account, so two of its six
+stated blockers — live-database candidate testing, and restore proof — were
+already closed. Off-VM restore, the signed manifest and formal vulnerability
+exceptions remain open and are tracked in `TODO.md` with their blockers named.
+Destination-restricted egress is a genuine gap and is discussed there rather
+than silently ignored: allowlisting destinations for HTTPS is brittle against
+CDNs and registries with rotating addresses, which is why it is not simply
+switched on.
+
+---
+
+## Unreleased — Rate-limit handling, silent test failure, and an unexplained prompt
+
+A clean run: 15/15 at install, 47 passed / 1 warning / 0 failed after. Three
+things the log and the operator's own note exposed.
+
+**1. "Restrict Web (80/443) to a CIDR?" had no explanation** — reported
+directly: *"not well explained during install but ssh is."* Correct, and the
+omission was mine: the SSH prompt got a reasoning block and its neighbour did
+not, which is worse than neither having one because it implies the unexplained
+question is the unimportant one.
+
+It now says plainly that **almost every site should leave this blank** — a
+public website that answers only one network is not a public website, and
+visitors, search engines and uptime monitors are dropped at the packet level
+with no error page. It names the two cases where it is right (an internal or
+staging site; a proxied site restricted to the proxy's own address, which
+stops anyone bypassing the proxy), distinguishes it from the wp-admin
+restriction asked separately, and notes that leaving it blank is not "no
+protection" — CrowdSec, the 8G firewall, the admin IP rules and the login
+limiter all still apply.
+
+**2. Wordfence rate limiting was being made worse by the code.** The
+diagnostic showed `scanner -> HTTP 206` (a successful range request) and
+`production -> HTTP 429`, then `vulns` seconds later hit 429 on *scanner* too:
+the limit counts requests, and a 1 KB range request spends one.
+
+Two faults. `Retry-After` was ignored in favour of a guessed 20 seconds — the
+server states the wait and the client was overriding it. And when scanner was
+refused, the code went on to request the 100 MB production feed anyway, which
+could not succeed and only deepened the limit; the log shows two 429s and two
+pointless waits back to back. Now: `Retry-After` is honoured (capped at 300s,
+45s default), production is skipped entirely when scanner was refused, and the
+gap between the two feeds is 60s rather than the 5s I picked without evidence.
+
+**3. `wp-notify.sh --test` failed silently.** The field log shows it returning
+straight to the prompt with no output, which reads like success. It used
+`send_mail ... && echo "sent"`, so a failure printed nothing. It now reports
+the failure, shows msmtp's own error, and exits non-zero. A test command that
+is silent when it fails is worse than not having one.
+
+---
+
 ## Unreleased — `vulns` aborted on a rate limit and hid its own commands
 
 From the field:

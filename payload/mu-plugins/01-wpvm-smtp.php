@@ -12,7 +12,7 @@
  *
  * WHY THE CREDENTIALS LIVE OUTSIDE THE DOCROOT
  *
- * The relay password is read from /var/www/private/smtp.php, mounted
+ * The relay password is read from /var/www/private/smtp.ini, mounted
  * read-only from the host and deliberately NOT under /var/www/html. Two
  * distinct reasons:
  *
@@ -35,8 +35,28 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+/*
+ * NON-EXECUTABLE CONFIG FORMAT
+ *
+ * This was previously a .php file returning an array, which meant the
+ * credentials file was CODE: it was include()d, so any flaw in the escaping
+ * that wrote it -- or any future write access to it -- became remote code
+ * execution rather than a bad password. The escaping was careful, but
+ * "careful escaping" is a mitigation and a data format is a fix.
+ *
+ * It is now an INI file parsed with INI_SCANNER_RAW, so a malformed value is
+ * a malformed value and can never be a statement. The password is stored
+ * base64-encoded purely so that quotes, semicolons and whitespace cannot
+ * interact with INI parsing at all -- that is encoding for robustness, NOT
+ * secrecy, and the file's permissions remain the thing protecting it.
+ */
 if (!defined('WPVM_SMTP_CONFIG')) {
-    define('WPVM_SMTP_CONFIG', '/var/www/private/smtp.php');
+    define('WPVM_SMTP_CONFIG', '/var/www/private/smtp.ini');
+}
+/* Legacy PHP config, still read if present so an existing VM keeps sending
+ * mail after an update. Deliberately second: if both exist, the INI wins. */
+if (!defined('WPVM_SMTP_CONFIG_LEGACY')) {
+    define('WPVM_SMTP_CONFIG_LEGACY', '/var/www/private/smtp.php');
 }
 
 /**
@@ -51,9 +71,25 @@ function wpvm_smtp_config() {
     }
     $cfg = false;
     if (is_readable(WPVM_SMTP_CONFIG)) {
-        $loaded = include WPVM_SMTP_CONFIG;
+        // INI_SCANNER_RAW: values are taken literally, with no interpretation
+        // of quotes, constants or type juggling. Nothing here can execute.
+        $ini = @parse_ini_file(WPVM_SMTP_CONFIG, false, INI_SCANNER_RAW);
+        if (is_array($ini) && !empty($ini['host']) && !empty($ini['user'])) {
+            $ini['pass'] = isset($ini['pass_b64'])
+                ? base64_decode($ini['pass_b64'], true)
+                : '';
+            if ($ini['pass'] !== false) {
+                $cfg = $ini;
+            }
+        }
+    }
+    if ($cfg === false && is_readable(WPVM_SMTP_CONFIG_LEGACY)) {
+        // Pre-INI installs. Logged so it is visible rather than silent, since
+        // the whole point of the change is not to include() this file.
+        $loaded = include WPVM_SMTP_CONFIG_LEGACY;
         if (is_array($loaded) && !empty($loaded['host']) && !empty($loaded['user'])) {
             $cfg = $loaded;
+            error_log('[wpvm-smtp] using legacy smtp.php; re-run wp-mail.sh setup to migrate to the non-executable smtp.ini');
         }
     }
     return $cfg;

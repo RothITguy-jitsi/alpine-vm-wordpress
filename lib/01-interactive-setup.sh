@@ -7,7 +7,7 @@
 
 # ── Interactive setup ─────────────────────────────────────────────────────────
 clear
-echo -e "\n${BLD}  WordPress VM${CL}"
+echo -e "\n${BLD}  WASP — WordPress Alpine Security Platform${CL}"
 echo    "  Alpine (auto) + Podman (WordPress + MariaDB) + CrowdSec + nftables"
 echo    "  ${CORES} CPU · ${RAM} MB · ${DISK} · hardened Apache + PHP"
 echo ""
@@ -335,6 +335,21 @@ echo -e "  ${YW}  Leaving it blank is defensible only if something in front of t
 echo -e "  ${YW}  is already doing the same job.${CL}"
 _sec_note
 SSH_CIDR=$(_ask_cidr "  Restrict SSH (22) to a CIDR?           (blank = any)  : ")
+_sec_head
+echo -e "  ${YW}  Almost every site should leave this BLANK. A public website that${CL}"
+echo -e "  ${YW}  only answers a single network is not a public website — visitors,${CL}"
+echo -e "  ${YW}  search engines and uptime monitors all get dropped at the packet${CL}"
+echo -e "  ${YW}  level, silently, with no error page to explain it.${CL}"
+echo -e "  ${YW}  It is the right answer for a staging or internal site that genuinely${CL}"
+echo -e "  ${YW}  should not be reachable from the internet, and for a site behind a${CL}"
+echo -e "  ${YW}  reverse proxy where you can restrict this to the proxy's address${CL}"
+echo -e "  ${YW}  alone — then nothing can bypass the proxy by hitting the VM directly.${CL}"
+echo -e "  ${YW}  Note this is Layer 1 and blocks EVERYTHING, including the front page.${CL}"
+echo -e "  ${YW}  It is not the wp-admin restriction — that is asked separately below and${CL}"
+echo -e "  ${YW}  is what protects the login page while leaving the site public.${CL}"
+echo -e "  ${YW}  Leaving it blank is not 'no protection': CrowdSec, the 8G firewall,${CL}"
+echo -e "  ${YW}  the wp-admin IP rules and the login rate limiter all still apply.${CL}"
+_sec_note
 WEB_CIDR=$(_ask_cidr "  Restrict Web (80/443) to a CIDR?       (blank = any)  : ")
 [[ -z "$WEB_CIDR" ]] && msg_warn "Web ports open to any IP — Layer 2 (Apache) still enforces wp-admin"
 echo ""

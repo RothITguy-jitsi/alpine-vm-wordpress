@@ -676,7 +676,7 @@ section mail "Outbound email"
 # failure modes that matter. A LIVE send is opt-in via --send-test-mail
 # because it leaves this VM and lands in a real mailbox: a validation command
 # someone runs repeatedly should not mail a person each time.
-SMTP_FILE=/home/wpuser/wp/secrets/smtp.php
+SMTP_FILE=/home/wpuser/wp/secrets/smtp.ini
 MU_SMTP=/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php
 if [ -r "$SMTP_FILE" ]; then
   pass "SMTP relay is configured"
@@ -701,7 +701,12 @@ if [ -r "$SMTP_FILE" ]; then
   esac
   # Prove it end to end rather than inferring from modes: ask PHP, as the
   # user it actually runs as, whether it can read the file.
-  if podman exec --user 33 wordpress test -r /var/www/private/smtp.php 2>/dev/null; then
+  if [ -f /home/wpuser/wp/secrets/smtp.php ]; then
+    warn "An executable smtp.php credentials file is still present" \
+         "A .php config is include()d, so any write access to it becomes code execution. The INI form removes that entirely." \
+         "wp-mail.sh setup   # rewrites as INI and removes the .php"
+  fi
+  if podman exec --user 33 wordpress test -r /var/www/private/smtp.ini 2>/dev/null; then
     pass "PHP (uid 33) can actually read the credential file"
   else
     fail "PHP (uid 33) CANNOT read /var/www/private/smtp.php" \

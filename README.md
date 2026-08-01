@@ -1,4 +1,6 @@
-# WordPress VM Provisioner for Proxmox VE
+# WASP — WordPress Alpine Security Platform
+
+*Hardened WordPress provisioning for Proxmox VE.*
 
 A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, structurally-verified automated backups (see [Known Limitations](#known-limitations) for exactly what "verified" covers), and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 
@@ -54,6 +56,7 @@ It's also honest about where it stops. Every control here states its own limits 
   - [Verifying what you run](#verifying-what-you-run)
 - [Login Protection](#login-protection)
 - [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
+- [Self-Test](#self-test-proving-the-guarantees-hold)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional)](#outbound-firewall-optional)
 - [Outbound Email](#outbound-email)
@@ -437,6 +440,28 @@ Clean output means *no disclosed vulnerability in that feed* — not that the si
 
 ---
 
+## Self-Test: proving the guarantees hold
+
+Two things this system claims are usually only *assumed*. `wasp-selftest.sh` proves them against real data.
+
+```sh
+wasp-selftest.sh restore-test          # restore the newest backup, verify the data
+wasp-selftest.sh candidate-isolation   # prove the read-only account refuses writes
+wasp-selftest.sh all
+```
+
+**Backup restore proof.** `wp-db-backup.sh` checks the dump completed, its marker is present, and the gzip is intact — all *structural*. It proves a well-formed file exists, not that it restores. This starts a **throwaway MariaDB** on an isolated network with no host port, restores the newest archive into it, and verifies the schema, `siteurl`, users and row counts are actually there — then destroys it. It also compares row counts against production, so a silently shrinking backup is visible.
+
+**Candidate DB isolation.** `update.sh` now runs the update candidate under a temporary **SELECT-only** database account, created before the candidate starts and dropped on every exit path. Any write the candidate attempts fails at the database rather than landing in production.
+
+That's only worth something if the grant really refuses writes — so this creates the same kind of account against a scratch database and tries `INSERT`, `UPDATE`, `DELETE`, `CREATE` and `DROP`, requiring each to be denied, and confirms the account cannot reach the production database at all. A test that assumes its own mechanism works isn't a test.
+
+**What read-only isolation does *not* do:** it cannot test the migration. A read-only candidate can't run schema upgrades, so it proves *"the new image boots and can read this database"*, not *"upgrading this database will succeed"*. Proving the latter needs the dump-restore path — which is what `restore-test` exercises, on its own schedule, rather than adding minutes to every update. Disable with `CANDIDATE_DB_READONLY=0` if a plugin genuinely needs write access to boot.
+
+Runs weekly (Sunday 05:30 UTC) and emails **only on failure** — a guarantee that stops holding is worth interrupting someone for.
+
+---
+
 ## Malware & Integrity Scanning
 
 `wp-malware-scan.sh` covers the layer container scanning cannot reach: the site's own files and database.
@@ -534,8 +559,9 @@ How it's handled:
 
 | | |
 |---|---|
-| **Credential location** | `/home/wpuser/wp/secrets/smtp.php`, mode `0400`, owned by uid 33, mounted **read-only** at `/var/www/private/` — deliberately outside the web root, so no URL maps to it even if PHP execution breaks and Apache starts serving `.php` as plain text. Not passed as a container env var either, since `podman inspect` prints those. |
+| **Credential location** | `/home/wpuser/wp/secrets/smtp.ini`, mode `0440` `root:www-data`, directory `0750`, mounted **read-only** at `/var/www/private/` — outside the web root, so no URL maps to it even if PHP execution breaks. Not a container env var either, since `podman inspect` prints those. |
 | **Transport** | A mu-plugin (`01-wpvm-smtp.php`) hooking `phpmailer_init`. WordPress bundles PHPMailer with SMTP support, so no third-party plugin is needed. mu-plugins can't be deactivated from wp-admin and survive core updates. |
+| **Format** | **INI, not PHP.** The config was previously a `.php` file returning an array — meaning the credentials file was *code*: it got `include()`d, so a flaw in the escaping that wrote it, or any future write access, became code execution rather than a bad password. INI is data; the worst a malformed value can do is fail to parse. The password is base64-encoded so quotes, semicolons and `=` cannot interact with INI parsing — encoding for robustness, **not** secrecy. |
 | **TLS** | Certificate verification stays on and is not exposed as a toggle. The usual reason to disable it is a self-signed cert, and accepting those hands the relay password to anyone on-path. |
 | **Timeout** | 10s, not PHPMailer's 300s default — otherwise an unreachable relay hangs user-visible requests like registration for five minutes each. |
 | **From address** | Set explicitly, including the envelope sender. WordPress otherwise sends as `wordpress@<domain>`, which is usually not SPF-authorized — and under a DMARC policy of `quarantine`/`reject` that means silent non-delivery, the same invisible failure again. |

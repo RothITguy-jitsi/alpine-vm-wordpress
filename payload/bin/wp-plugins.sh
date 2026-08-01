@@ -151,14 +151,25 @@ _wf_refresh() {
       # scanner feed and aborted the whole scan -- observed in the field as
       # "Rate limited (429)" with no results at all, despite scanner having
       # downloaded seconds earlier.
+      # Scanner first and unconditionally: it is the feed that carries
+      # vulnerabilities still under research, so if only one can be had, it
+      # should be that one.
       _ok=0
       _wf_fetch_one scanner "${1:-}" && _ok=1
-      # Two large downloads back to back is what triggers the rate limit; the
-      # production feed is 100 MB+ and the request lands immediately after
-      # scanner. A short pause is the difference between both feeds arriving
-      # and the second being refused.
-      [ "$_ok" = 1 ] && sleep 5
-      _wf_fetch_one production "${1:-}" && _ok=1
+      if [ "$_ok" = 0 ]; then
+        # Scanner was refused, so the budget is already spent. Asking for the
+        # 100 MB production feed immediately afterwards cannot succeed and
+        # only deepens the rate limit -- the field log showed exactly that,
+        # two 429s and two pointless 20s waits back to back.
+        echo "  Skipping the production feed this run: the scanner request was" >&2
+        echo "  refused, so another request now would only be refused too." >&2
+      else
+        # 60s, not 5s. Five was chosen without evidence and was not enough;
+        # the two feeds are a small request and a 100 MB one, and the limit
+        # counts requests rather than bytes.
+        sleep 60
+        _wf_fetch_one production "${1:-}" && _ok=1
+      fi
       [ "$_ok" = 1 ] && return 0
       return 1 ;;
     production) _wf_fetch_one production "${1:-}" || return 1 ;;
@@ -168,6 +179,7 @@ _wf_refresh() {
 }
 
 _wf_do_fetch() {
+  trap 'rm -f "$VULN_CACHE/.hdr.$$"' RETURN 2>/dev/null || true
   if [ -z "${WORDFENCE_API_KEY:-}" ]; then
     if [ -f "$_f" ]; then
       echo "  ⚠ No Wordfence token set — using the cached feed (${_age}h old)."
@@ -185,6 +197,7 @@ _wf_do_fetch() {
     echo "  Fetching Wordfence Intelligence v3 ${_which:-scanner} feed…"
     _code=$(curl -sS --max-time 180 -w '%{http_code}' \
               -H "Authorization: Bearer ${WORDFENCE_API_KEY}" \
+              -D "$VULN_CACHE/.hdr.$$" \
               -o "${_f}.tmp" "$WF_FEED" 2>/dev/null || echo 000)
     case "$_code" in
       401|403)
@@ -200,8 +213,14 @@ _wf_do_fetch() {
         # large feed downloads rather than a sustained quota, so waiting a
         # few seconds generally clears it -- and giving up immediately meant
         # `both` users effectively never got the production feed at all.
-        echo "  ⚠ Rate limited (HTTP 429) on the ${_which:-} feed — waiting 20s and retrying once…" >&2
-        sleep 20
+        # Honour Retry-After when the server sends one. Guessing a delay when
+        # the server has stated it is how a client keeps getting refused.
+        _wait=$(awk 'BEGIN{IGNORECASE=1} /^Retry-After:/{gsub(/[^0-9]/,"",$2); print $2}' \
+                  "$VULN_CACHE/.hdr.$$" 2>/dev/null | head -1)
+        case "$_wait" in ''|*[!0-9]*) _wait=45 ;; esac
+        [ "$_wait" -gt 300 ] && _wait=300
+        echo "  ⚠ Rate limited (HTTP 429) on the ${_which:-} feed — waiting ${_wait}s and retrying once…" >&2
+        sleep "$_wait"
         _code=$(curl -sS --max-time 180 -w '%{http_code}' \
                   -H "Authorization: Bearer ${WORDFENCE_API_KEY}" \
                   -o "${_f}.tmp" "$WF_FEED" 2>/dev/null || echo 000)

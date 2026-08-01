@@ -28,9 +28,10 @@ ts "Installing WordPress plugin/theme update visibility"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
 # msmtp sends host-side, so alerts still go out when WordPress or MariaDB is
 # down -- which is exactly when an alert matters. Credentials are read from
-# the same smtp.php the mu-plugin uses; no second config file is written.
+# the same smtp.ini the mu-plugin uses; no second config file is written.
 apk add --no-cache msmtp >/dev/null 2>&1 \
   && ok "msmtp installed — scan alerts can be emailed" \
   || warn "msmtp not installed; scans will log to syslog only (apk add msmtp)"

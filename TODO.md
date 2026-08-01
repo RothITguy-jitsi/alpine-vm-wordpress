@@ -32,13 +32,13 @@ That is fixed: every normal assertion now requires the command to succeed before
 
 | **Still open (source finding)** | **Status** | **Why it's deferred** |
 | --- | --- | --- |
-| Candidate DB isolation (17) | Deferred | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
+| Candidate DB isolation (17) | **DONE (light form)** — candidate runs under a temporary SELECT-only account, dropped on every exit path; `wasp-selftest.sh candidate-isolation` proves the grant refuses writes. Does NOT test migrations — see below | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
 | Production findings approval (14) | Deferred | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
 | Off-VM backup gate (18) | Deferred | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
 | Egress restriction (20) | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
 | Trivy installer checksum (15) | Deferred | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
 | CrowdSec key in argv (21) | Deferred | Eliminating the brief argv exposure depends on whether the installed cscli supports a stdin/fd interface |
-| Backup restoration proof | Deferred | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
+| Backup restoration proof | **DONE** — `wasp-selftest.sh restore-test` restores the newest archive into a throwaway isolated MariaDB and verifies schema, siteurl, users and row counts against production. Weekly | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
 | Full candidate/cutover/rollback harness coverage | **DONE** — cutover proven both directions (6.9.4-php8.3 ↔ php8.4), and rollback proven by fault injection (`test/vm-rollback-test.sh`): forced post-cutover failure, automatic restore to the original image, site healthy, no leftover container | test-wordpress-vm.sh exercises the rollback trigger (section 8) and the backup script (section 7), but not a full "bad candidate → automatic rollback → verified-healthy old version" run end to end. Real hardware and a deliberately-broken candidate image are both needed to build this safely |
 
 **On candidate DB isolation specifically. **It is no longer blocked on the absence of a harness — it's blocked on real-hardware validation, which is a smaller gap. The two designs from the last round still stand, simpler first: a temporary SELECT-only MariaDB user the candidate points at (reads work, any write-on-init fails harmlessly against production), or a full dump-and-restore into a throwaway container on an isolated network. Both change live container/DB/network orchestration, so both want the harness to prove them end-to-end on real hardware before they ship — the same reasoning that kept them out last time, now one step closer.
@@ -170,3 +170,23 @@ What still needs building for import:
 4. **Core normalisation** — an imported site's core should be replaced with
    the pinned image's core rather than trusted, since modified core files are
    exactly what an attacker leaves behind.
+
+## Note on candidate DB isolation as implemented
+
+The read-only account is the lighter of the two designs discussed, and it is
+worth being precise about what it buys. It prevents the candidate from
+modifying production data, which was the actual risk. It does **not** validate
+that a schema migration will succeed, because a read-only candidate cannot
+run one.
+
+The heavier design — dump, restore into a throwaway instance, run the
+candidate against that copy — would validate migrations too, and remains
+unimplemented for the reason originally given: it adds minutes per gigabyte to
+every image update and introduces its own failure modes. The restore half of
+that work now exists and runs weekly as `wasp-selftest.sh restore-test`, so
+the dump is known to be restorable even though the candidate does not use it.
+
+An operator whose compliance regime requires full isolation can compose the
+two: restore into a scratch instance with `restore-test`, then point a
+candidate at it. The pieces are there; wiring them into every update by
+default is the part that is not worth the cost.
