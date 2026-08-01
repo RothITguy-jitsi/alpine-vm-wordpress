@@ -162,7 +162,7 @@ echo   "  ╠══════════════════════�
   printf "  ║  GeoIP:         %-44s║\n" "${_GEO_DESC}"
   [[ -n "${WP_ADMIN_SLUG}" ]] && printf "  ║  Custom slug:   %-44s║\n" "/${WP_ADMIN_SLUG}-login"
 echo   "  ║  Background install (~15 min total):                       ║"
-echo   "  ║    qm terminal $VMID  then:  tail -f /var/log/wp-install.log"
+echo   "  ║    qm terminal $VMID  then:  tail -800 /var/log/wp-install.log"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"
   echo   "  ║  When done: http://<VM-IP>/wp-admin/install.php            ║"
 echo   "  ╚══════════════════════════════════════════════════════════════╝"

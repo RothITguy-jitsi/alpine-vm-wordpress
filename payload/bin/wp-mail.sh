@@ -83,8 +83,8 @@ show_status() {
   # world-readable credentials file is the failure worth catching early.
   _perm=$(stat -c '%a %U:%G' "$SMTP_FILE" 2>/dev/null || echo "?")
   case "$_perm" in
-    "400 "*) printf "  %-14s %s\n" "File mode:" "$_perm  ✔" ;;
-    *)       printf "  %-14s %s\n" "File mode:" "$_perm  ⚠ expected 400, owned by uid 33" ;;
+    "440 root:www-data"|"440 root:33") printf "  %-14s %s\n" "File mode:" "$_perm  ✔" ;;
+    *) printf "  %-14s %s\n" "File mode:" "$_perm  ⚠ expected 440 root:www-data" ;;
   esac
   [ -r "$MU_PLUGIN" ] \
     && printf "  %-14s %s\n" "mu-plugin:" "present ✔" \
@@ -105,7 +105,18 @@ do_test() {
     *) echo "✗  '${_to}' does not look like an email address." >&2; exit 1 ;;
   esac
   _configured || { echo "✗  No relay configured — run: wp-mail.sh setup" >&2; exit 1; }
-  echo "Sending a test message to ${_to} via $(_cfg host):$(_cfg port)…"
+  # Check the name resolves before sending. Without this the failure surfaces
+  # as PHPMailer's "Could not instantiate mail function", which points at the
+  # mail system when the actual problem is a typo in the hostname.
+  _h=$(_cfg host)
+  if ! podman exec wordpress getent hosts "$_h" >/dev/null 2>&1; then
+    echo "✗  ${_h} does not resolve from inside the container." >&2
+    echo "   Nothing was sent. This is a DNS or hostname problem, not a mail one." >&2
+    echo "   Check the spelling:  wp-mail.sh doctor" >&2
+    echo "   Reconfigure:         wp-mail.sh setup" >&2
+    exit 1
+  fi
+  echo "Sending a test message to ${_to} via ${_h}:$(_cfg port)…"
   # wp_mail()'s own return value is the ground truth — it is what every
   # plugin and core feature calls. Testing the relay with something else
   # (swaks, openssl s_client) would prove the relay works while saying
@@ -170,8 +181,12 @@ do_setup() {
   printf "  From name [WordPress] : "; read -r _fn; _fn="${_fn:-WordPress}"
 
   _php_q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"; }
-  mkdir -p "$SECRETS_DIR"; chmod 0700 "$SECRETS_DIR"
-  install -m 0600 -o 33 -g 33 /dev/null "$SMTP_FILE"
+  # root:33 0750 — the PHP worker must be able to traverse this directory or
+  # it can never read the file inside, whatever that file's own mode says.
+  mkdir -p "$SECRETS_DIR"
+  chown root:33 "$SECRETS_DIR" 2>/dev/null || true
+  chmod 0750 "$SECRETS_DIR"
+  install -m 0600 -o 0 -g 33 /dev/null "$SMTP_FILE"
   cat > "$SMTP_FILE" << PHPEOF
 <?php
 // Written by wp-mail.sh setup. Mounted read-only into the container at
@@ -187,8 +202,8 @@ return array(
     'timeout'    => 10,
 );
 PHPEOF
-  chmod 0400 "$SMTP_FILE"; chown 33:33 "$SMTP_FILE"
-  echo "✔  Written to ${SMTP_FILE} (0400, uid 33)"
+  chmod 0440 "$SMTP_FILE"; chown root:33 "$SMTP_FILE"
+  echo "✔  Written to ${SMTP_FILE} (root:33 0440, dir 0750)"
   # The mount is read-only and already in place, and PHP reads the file per
   # request, so no container restart is needed — but opcache can hold a
   # compiled copy, so nudge it.

@@ -223,12 +223,26 @@ ok "headers.load created — enables mod_headers for security headers"
 # breaking out of the string. This is the same category as vars.sh: config
 # generation with substitution, not a literal script body.
 if [ -n "${SMTP_HOST:-}" ]; then
+  # PERMISSIONS FIX (found on a live VM): this directory was root:root 0700,
+  # which meant www-data could not TRAVERSE it -- so PHP could never open the
+  # file inside, regardless of that file's own mode. The symptoms looked
+  # contradictory: `wp-mail.sh doctor` read the config fine (it runs as root
+  # via doas) while the mu-plugin silently fell back to mail(), because
+  # is_readable() was false for uid 33. sendmail then tried 127.0.0.1 and was
+  # refused.
+  #
+  # root:33 0750 lets the PHP worker traverse and read while nothing else on
+  # the system can. The file below is root-owned and group-readable rather
+  # than owned by 33, so a compromised PHP process can read the relay
+  # credentials (unavoidable -- it must, to send mail) but cannot rewrite
+  # them to point at a server it controls.
   mkdir -p /home/wpuser/wp/secrets
-  chmod 0700 /home/wpuser/wp/secrets
+  chown root:33 /home/wpuser/wp/secrets 2>/dev/null || true
+  chmod 0750 /home/wpuser/wp/secrets
   _php_q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"; }
   # Pre-create with restrictive mode so the file never exists world-readable,
   # even briefly: `cat >` truncates but preserves an existing file's mode.
-  install -m 0600 -o 33 -g 33 /dev/null /home/wpuser/wp/secrets/smtp.php
+  install -m 0600 -o 0 -g 33 /dev/null /home/wpuser/wp/secrets/smtp.php
   cat > /home/wpuser/wp/secrets/smtp.php << PHPEOF
 <?php
 // Generated at install time by 06-containers-mariadb-wordpress.sh.
@@ -247,14 +261,15 @@ return array(
     'timeout'    => 10,
 );
 PHPEOF
-  chmod 0400 /home/wpuser/wp/secrets/smtp.php
-  chown 33:33 /home/wpuser/wp/secrets/smtp.php
-  ok "SMTP credentials written (0400, uid 33, outside the web root)"
+  chmod 0440 /home/wpuser/wp/secrets/smtp.php
+  chown root:33 /home/wpuser/wp/secrets/smtp.php
+  ok "SMTP credentials written (root:33 0440, dir 0750, outside the web root)"
 else
   # Create the directory regardless so the read-only mount below always has
   # a source -- podman would otherwise create it root-owned at run time.
   mkdir -p /home/wpuser/wp/secrets
-  chmod 0700 /home/wpuser/wp/secrets
+  chown root:33 /home/wpuser/wp/secrets 2>/dev/null || true
+  chmod 0750 /home/wpuser/wp/secrets
   warn "No SMTP relay configured — WordPress cannot send mail (silently)."
   warn "  Configure later on the VM with: wp-mail.sh setup"
 fi

@@ -814,7 +814,7 @@ No — the script builds the VM from a freshly downloaded Alpine cloud image and
 
 ## Troubleshooting
 
-- **During first boot:** `qm terminal <VMID>`, then `tail -f /var/log/wp-install.log`.
+- **During first boot:** `qm terminal <VMID>`, then `tail -800 /var/log/wp-install.log`.
 - **Container status/logs:** `podman ps`, `podman logs wordpress`, `podman logs mariadb`, `podman logs crowdsec`.
 - **Something's broken and you don't know where to start:** `validate-wordpress.sh` (or `wp-validate`) for a full sweep, or `--section <name>` to isolate one area — every failure line comes with a copy-paste fix.
 - **Security feature status:** `wp-hardening.sh status`.

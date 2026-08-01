@@ -66,7 +66,7 @@ show_status() {
   echo ""
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
-  echo "          geoip-test [ip]"
+  echo "          geoip-test [ip] | proxy-check"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
@@ -193,6 +193,64 @@ case "${1:-status}" in
         fi ;;
       *) echo "Usage: wp-hardening.sh crowdsec-whitelist [list|add <ip>|remove <ip>]" >&2; exit 1 ;;
     esac ;;
+
+  proxy-check)
+    # Answers the one question that decides every "works on the LAN IP but
+    # not through the domain" report: what address does Apache believe the
+    # client is? Everything else (slug, wp-admin restriction, CSP) keys off
+    # that, so guessing at those first wastes time.
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    DBG=/home/wpuser/wp/logs/remoteip-debug.log
+    echo ""
+    echo "Reverse-proxy / client IP diagnosis"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ -z "${PROXY_IP:-}" ]; then
+      echo "  No PROXY_IP configured — mod_remoteip is not loaded."
+      echo "  Apache uses the raw connection address as the client IP."
+      exit 0
+    fi
+    echo "  Trusted proxy (RemoteIPTrustedProxy) : ${PROXY_IP}"
+    echo "  wp-admin allowed                     : ${ADMIN_CIDR:-none} ${ALLOWED_ADMIN_IP:-}"
+    echo ""
+    if [ ! -s "$DBG" ]; then
+      echo "  ${DBG} is empty."
+      echo "  Make one request through the domain, then re-run this."
+      exit 0
+    fi
+    echo "  Last 15 requests (peer = who connected, interpreted = who Apache thinks it is):"
+    tail -15 "$DBG" | sed 's/^/    /'
+    echo ""
+    # The decisive comparison: if peer never equals the configured proxy,
+    # mod_remoteip cannot trust anything and the X-Forwarded-For header is
+    # ignored regardless of whether the proxy sent one.
+    _peers=$(sed -n 's/.*peer=\([^ ]*\).*/\1/p' "$DBG" | sort -u | head -8)
+    echo "  Distinct peers seen: $(printf '%s' "$_peers" | tr '\n' ' ')"
+    if printf '%s\n' "$_peers" | grep -qx "$PROXY_IP"; then
+      echo "  ✔ ${PROXY_IP} does connect — mod_remoteip will trust its header."
+      _bad=$(grep "peer=${PROXY_IP} " "$DBG" | sed -n 's/.*interpreted=\([^ ]*\).*/\1/p' \
+             | grep -x "$PROXY_IP" | head -1)
+      if [ -n "$_bad" ]; then
+        echo "  ✗ But interpreted is ALSO ${PROXY_IP} on some requests, which means the"
+        echo "    proxy did not send a usable X-Forwarded-For. Apache then treats the"
+        echo "    proxy as the client, and the wp-admin rules reject it."
+        echo "    Fix in the proxy, not here: enable X-Forwarded-For on that host."
+      else
+        echo "  ✔ interpreted differs from the peer — the header is being honoured."
+        echo "    If wp-admin still 403s, compare the interpreted value above against"
+        echo "    the allowed list at the top: that address must appear in it."
+      fi
+    else
+      echo "  ✗ Nothing has connected from ${PROXY_IP}."
+      echo "    The proxy reaches this VM from a DIFFERENT address than configured"
+      echo "    — common when the proxy runs in a container or has several"
+      echo "    interfaces, so its management IP is not its egress IP."
+      echo "    Use one of the peers listed above as the trusted proxy:"
+      echo "      edit PROXY_IP in /etc/wp-install/vars.sh, then re-run"
+      echo "      wp-geoip-setup.sh or recreate the container to regenerate config."
+    fi
+    echo ""
+    echo "  Status codes are the last field of each line; 403 on a /wp-login.php"
+    echo "  or /wp-admin request means the interpreted address was not allowed." ;;
 
   geoip-test)
     # Functional test of country filtering. validate-wordpress.sh only checks

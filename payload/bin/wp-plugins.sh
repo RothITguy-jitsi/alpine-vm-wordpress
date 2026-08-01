@@ -144,14 +144,27 @@ _wf_fetch_one() {
 
 _wf_refresh() {
   mkdir -p "$VULN_CACHE"
-  _rc=0
   case "$WORDFENCE_FEED" in
-    both)       _wf_fetch_one scanner "${1:-}" || _rc=1
-                _wf_fetch_one production "${1:-}" || _rc=1 ;;
-    production) _wf_fetch_one production "${1:-}" || _rc=1 ;;
-    *)          _wf_fetch_one scanner "${1:-}" || _rc=1 ;;
+    both)
+      # Succeed if EITHER feed is usable. The first version returned failure
+      # when the second fetch failed, which threw away a perfectly good
+      # scanner feed and aborted the whole scan -- observed in the field as
+      # "Rate limited (429)" with no results at all, despite scanner having
+      # downloaded seconds earlier.
+      _ok=0
+      _wf_fetch_one scanner "${1:-}" && _ok=1
+      # Two large downloads back to back is what triggers the rate limit; the
+      # production feed is 100 MB+ and the request lands immediately after
+      # scanner. A short pause is the difference between both feeds arriving
+      # and the second being refused.
+      [ "$_ok" = 1 ] && sleep 5
+      _wf_fetch_one production "${1:-}" && _ok=1
+      [ "$_ok" = 1 ] && return 0
+      return 1 ;;
+    production) _wf_fetch_one production "${1:-}" || return 1 ;;
+    *)          _wf_fetch_one scanner "${1:-}" || return 1 ;;
   esac
-  return $_rc
+  return 0
 }
 
 _wf_do_fetch() {
@@ -183,8 +196,28 @@ _wf_do_fetch() {
         return 1 ;;
       429)
         rm -f "${_f}.tmp"
-        echo "  ⚠ Rate limited by Wordfence (HTTP 429)." >&2
-        [ -f "$_f" ] && echo "    Using the cached feed (${_age}h old)." >&2 && return 0
+        # One retry after a pause. A 429 here is usually the burst of two
+        # large feed downloads rather than a sustained quota, so waiting a
+        # few seconds generally clears it -- and giving up immediately meant
+        # `both` users effectively never got the production feed at all.
+        echo "  ⚠ Rate limited (HTTP 429) on the ${_which:-} feed — waiting 20s and retrying once…" >&2
+        sleep 20
+        _code=$(curl -sS --max-time 180 -w '%{http_code}' \
+                  -H "Authorization: Bearer ${WORDFENCE_API_KEY}" \
+                  -o "${_f}.tmp" "$WF_FEED" 2>/dev/null || echo 000)
+        if [ "$_code" = "200" ] && [ -s "${_f}.tmp" ] && head -c1 "${_f}.tmp" | grep -q '{'; then
+          mv -f "${_f}.tmp" "$_f"; chmod 644 "$_f"
+          echo "  ✔ Retry succeeded." >&2
+          return 0
+        fi
+        rm -f "${_f}.tmp"
+        echo "  ✗ Still rate limited. Wordfence limits how often the feeds can be" >&2
+        echo "    pulled; the cache is reused for 12h precisely to stay under it." >&2
+        if [ -f "$_f" ]; then
+          echo "    Using the cached ${_which:-} feed (${_age}h old)." >&2; return 0
+        fi
+        echo "    Try again shortly, or use one feed instead of both:" >&2
+        echo "      sed -i 's/^WORDFENCE_FEED=.*/WORDFENCE_FEED=scanner/' /etc/wp-install/vuln-sources.conf" >&2
         return 1 ;;
     esac
     if [ "$_code" = "200" ] && [ -s "${_f}.tmp" ] && head -c1 "${_f}.tmp" | grep -q '{'; then
@@ -472,6 +505,14 @@ case "${1:-status}" in
     echo "       wp-plugins.sh update-plugins [slug ...]"
     echo "       wp-plugins.sh update-themes  [slug ...]"
     echo "       wp-plugins.sh update-core"
+    echo ""
+    echo "  Vulnerability scanning:"
+    echo "       wp-plugins.sh vulns                 scan against known-vulnerable versions"
+    echo "       wp-plugins.sh vulns --nvd           also query NVD (slow, noisy)"
+    echo "       wp-plugins.sh vuln-sources          which data sources are enabled"
+    echo "       wp-plugins.sh vuln-refresh          force a feed re-download"
+    echo "       wp-plugins.sh set-key wordfence <token>"
+    echo "       wp-plugins.sh set-key patchstack|wpscan <key>"
     echo ""
     echo "Why this exists: ~91% of WordPress vulnerabilities are in plugins and"
     echo "themes, which live in the mounted volume — not in the container image"

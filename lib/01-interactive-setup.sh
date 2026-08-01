@@ -809,6 +809,12 @@ if [[ -n "$WORDFENCE_API_KEY" ]]; then
   msg_ok "Wordfence feed: ${WORDFENCE_FEED}"
   [ "$WORDFENCE_FEED" = "production" ] && \
     msg_warn "  Production alone will not see vulnerabilities still under research."
+  [ "$WORDFENCE_FEED" = "both" ] && {
+    msg_warn "  'both' makes two feed requests per refresh, and the production feed"
+    msg_warn "  is 100 MB+. Wordfence rate-limits, so the first run may report 429"
+    msg_warn "  on the second feed; the scan still runs on whichever arrived."
+    msg_warn "  Feeds are cached 12h to stay well under the limit."
+  }
 else
   msg_warn "No Wordfence token — plugin vulnerability scanning will be unavailable."
   msg_warn "  Update visibility (wp-plugins.sh status) still works without it."
@@ -1042,8 +1048,18 @@ printf  "  %-18s nft SSH=%-15s  nft Web=%s\n"   "L1 Firewall:"  "${SSH_CIDR:-any
 printf  "  %-18s admin-cidr=%-18s  allowed-ip=%s\n" "L2 wp-admin:" "${ADMIN_CIDR:-none}" "${ALLOWED_ADMIN_IP:-none}"
 printf  "  %-18s %s\n"  "Site address:" "$([[ -n "$WP_DOMAIN" ]] && echo "${WP_SCHEME}://${WP_DOMAIN}" || echo "(none — will use the VM IP)")"
 printf  "  %-18s %s\n"  "Proxy IP:"    "${PROXY_IP:-direct (no proxy)}"
-printf  "  %-18s %s\n"  "Admin slug:"  "${WP_ADMIN_SLUG:+/${WP_ADMIN_SLUG} (custom)}${WP_ADMIN_SLUG:-/wp-admin (default)}"
-printf  "  %-18s %s\n"  "CS enrolment:" "${CROWDSEC_ENROLL_KEY:+key provided (auto-enrol)}${CROWDSEC_ENROLL_KEY:-manual (after install)}"
+# Was: "${WP_ADMIN_SLUG:+/${WP_ADMIN_SLUG} (custom)}${WP_ADMIN_SLUG:-/wp-admin (default)}"
+# Two bugs in one line. `${V:+X}${V:-Y}` looks like an if/else but is not:
+# when V is set, `:+` yields X *and* `:-` yields V itself, so the value got
+# appended -- "/edith (custom)edith". It read correctly when no slug was set,
+# which is why it survived until someone used the feature. It also showed
+# "/edith" while the URL actually served is "/edith-login".
+printf  "  %-18s %s\n"  "Admin slug:"  "$([ -n "$WP_ADMIN_SLUG" ] && printf '/%s-login (custom)' "$WP_ADMIN_SLUG" || printf '/wp-login.php (default)')"
+# Same ${V:+}${V:-} mistake as the slug line, and worse here: when a key WAS
+# supplied, both halves expanded and the ENROLMENT KEY ITSELF was printed into
+# the summary and the install log. It never surfaced because the key was left
+# blank in testing, which is the only branch that reads correctly.
+printf  "  %-18s %s\n"  "CS enrolment:" "$([ -n "$CROWDSEC_ENROLL_KEY" ] && printf 'key provided (auto-enrol)' || printf 'manual (after install)')"
 printf  "  %-18s WordPress + MariaDB (internal) + CrowdSec\n" "Containers:"
 printf  "  %-18s %s\n"  "Network:"     "${NET_MODE}${VM_STATIC_IP:+ ($VM_STATIC_IP/$VM_PREFIX)}"
 printf  "  %-18s %s\n"  "GeoIP:"       "$([[ $GEOIP_ENABLED -eq 1 ]] && echo "${GEOIP_MODE} (${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST})" || echo 'disabled')"

@@ -6,6 +6,140 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — `vulns` aborted on a rate limit and hid its own commands
+
+From the field:
+
+```
+wordpress:~$ wp-plugins.sh vulns
+  Fetching Wordfence Intelligence v3 scanner feed…
+  Fetching Wordfence Intelligence v3 production feed…
+  ⚠ Rate limited by Wordfence (HTTP 429).
+wordpress:~$
+```
+
+Three separate faults, all introduced with the feed-choice feature.
+
+**1. A failure on the second feed discarded the first.** With
+`WORDFENCE_FEED=both`, `_wf_refresh` returned non-zero if *either* fetch
+failed, so the whole scan aborted — despite the scanner feed having
+downloaded successfully seconds earlier. The most useful feed was in the
+cache and went unused. It now succeeds if **either** feed is available, and
+only fails when neither is.
+
+**2. `both` all but guaranteed the rate limit.** Two large downloads fired
+back to back, the second being 100 MB+. Adding the option without considering
+request rate made the default experience for anyone choosing it a 429 on
+first run. There is now a pause between the two fetches, and a 429 waits 20
+seconds and retries once — a burst limit generally clears, and giving up
+immediately meant `both` users effectively never received the production
+feed. The install prompt now says this outright rather than letting the
+operator choose blind.
+
+**3. The usage text listed none of the vulnerability commands.** Running
+`wp-plugins.sh --nvd` printed help showing only `status`, `check`, `list`,
+`doctor`, `update-plugins`, `update-themes`, `update-core` — while the
+paragraph underneath it explained that ~91% of WordPress vulnerabilities live
+in plugins. The headline feature was undiscoverable from its own help.
+`vulns`, `vulns --nvd`, `vuln-sources`, `vuln-refresh` and `set-key` are now
+listed.
+
+Failure messaging also names the specific remedy: switch to a single feed with
+the exact `sed` command, rather than leaving the operator to work out that
+`both` was the cause.
+
+---
+
+## Unreleased — `${V:+X}${V:-Y}` is not if/else (and it leaked a secret)
+
+The install summary printed:
+
+```
+  Admin slug:        /edith (custom)edith
+```
+
+`${V:+X}${V:-Y}` reads like a ternary and is not. When `V` is set and
+non-empty, `:+` yields `X` **and** `:-` yields *the value of V*, so both halves
+expand and the variable is appended to the "true" branch. When `V` is empty
+only the second half expands and the line reads perfectly — which is why it
+survived every run until someone actually used the feature.
+
+The same line also displayed `/edith` while the URL genuinely served is
+`/edith-login`. The slug itself worked correctly throughout; validation
+confirmed it serves HTTP 302 and that the default path 403s.
+
+**A check for the pattern found a second instance**, and that one was not
+cosmetic:
+
+```
+"${CROWDSEC_ENROLL_KEY:+key provided (auto-enrol)}${CROWDSEC_ENROLL_KEY:-manual (after install)}"
+```
+
+Supplying a CrowdSec enrolment key would have printed **the key itself** into
+the install summary and the log. It never surfaced because that field was left
+blank in every test run — the only branch that reads correctly.
+
+Both fixed with explicit tests.
+
+**`test/check-param-expansion.py` added**, and it needed fixing before it was
+worth having. The first version located the closing brace with `[^}]*`, which
+breaks the moment the true-branch contains a nested `${...}` — exactly the
+shape of the shipped bug. It reported CLEAN on its own test case while
+correctly flagging the CrowdSec line, which has no nesting. Rewritten to
+collect every `${VAR:+` / `${VAR:-` on a line and flag any variable used with
+both operators; no brace-matching, so nesting cannot defeat it. Verified
+against both real instances and a synthetic one.
+
+`bash -n` passes all of these. They are valid shell doing precisely what they
+were told.
+
+---
+
+## Unreleased — SMTP credentials unreadable by PHP (directory traversal)
+
+The backtick fix worked — that error is gone from the install log. The
+remaining failure was mail, and the symptoms looked contradictory:
+
+- `wp-mail.sh doctor` reported the config present and correct
+- the mu-plugin *was* loaded (its own handler logged the failure)
+- yet PHPMailer reported `Could not instantiate mail function`, which is the
+  **mail()** transport error, and sendmail then tried 127.0.0.1 and was refused
+
+**Cause: the credentials directory was `root:root 0700`.** The file inside was
+`0400` owned by uid 33 and looked correct, but www-data could not **traverse**
+the directory, so `is_readable()` returned false, `wpvm_smtp_config()` returned
+false, the `phpmailer_init` hook returned early, and PHPMailer stayed on
+`mail()`. `doctor` disagreed because it runs as root via doas — the two were
+reading with different privileges and reaching different answers.
+
+A directory mode defeating a correct file mode is exactly the kind of failure
+that points nowhere near its cause.
+
+**Fixed:** directory `root:33 0750`, file `root:33 0440`. The PHP worker can
+traverse and read; nothing else on the system can. The file is root-owned
+rather than owned by uid 33 deliberately — a compromised PHP process must be
+able to *read* the relay credentials to send mail, but now cannot rewrite
+them to point at a server it controls.
+
+**Three checks added**, because inferring from modes is what missed it:
+
+- the credential **directory** mode and ownership, not just the file's;
+- an end-to-end test — `podman exec --user 33 wordpress test -r ...` — which
+  asks PHP, as the user it actually runs as, whether it can read the file;
+- `wp-mail.sh test` now resolves the relay hostname before sending, so a
+  typo'd host reports "does not resolve" instead of surfacing PHPMailer's
+  "Could not instantiate mail function" and pointing at the mail system.
+
+That last one matters for this log specifically: the relay was entered as
+`mail.ironmail.systems`, which does not resolve. Both faults were present at
+once, and each masked the other.
+
+**Also:** the closing summary and README now suggest
+`tail -800 /var/log/wp-install.log` rather than `tail -f`, so the whole
+install is visible rather than only what arrives after you start watching.
+
+---
+
 ## Unreleased — Backticks in an unquoted heredoc executed nft on the HOST
 
 From a real install log:

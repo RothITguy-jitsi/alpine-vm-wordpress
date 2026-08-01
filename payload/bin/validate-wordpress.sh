@@ -681,13 +681,33 @@ MU_SMTP=/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php
 if [ -r "$SMTP_FILE" ]; then
   pass "SMTP relay is configured"
 
-  _pm=$(stat -c '%a %u' "$SMTP_FILE" 2>/dev/null)
+  _pm=$(stat -c '%a %u %g' "$SMTP_FILE" 2>/dev/null)
   case "$_pm" in
-    "400 33") pass "Credential file is 0400, owned by uid 33" ;;
-    *) fail "Credential file is '${_pm}', expected '400 33'" \
-            "The relay password may be readable by other accounts on this VM." \
-            "chmod 400 ${SMTP_FILE} ; chown 33:33 ${SMTP_FILE}" ;;
+    "440 0 33") pass "Credential file is 0440 root:www-data" ;;
+    *) fail "Credential file is '${_pm}', expected '440 0 33'" \
+            "Too open exposes the relay password; too closed and PHP cannot read it." \
+            "chown root:33 ${SMTP_FILE} ; chmod 440 ${SMTP_FILE}" ;;
   esac
+  # The DIRECTORY is what actually broke this in the field: root:root 0700
+  # meant the PHP worker could not traverse it, so the file's own mode was
+  # irrelevant and mail silently fell back to sendmail. Checked explicitly,
+  # because the failure it causes points nowhere near permissions.
+  _dm=$(stat -c '%a %u %g' "$(dirname "$SMTP_FILE")" 2>/dev/null)
+  case "$_dm" in
+    "750 0 33") pass "Credential directory is 0750 root:www-data (PHP can traverse)" ;;
+    *) fail "Credential directory is '${_dm}', expected '750 0 33'" \
+            "If www-data cannot traverse this directory, wp_mail() silently falls back to sendmail and every message fails." \
+            "chown root:33 $(dirname "$SMTP_FILE") ; chmod 750 $(dirname "$SMTP_FILE")" ;;
+  esac
+  # Prove it end to end rather than inferring from modes: ask PHP, as the
+  # user it actually runs as, whether it can read the file.
+  if podman exec --user 33 wordpress test -r /var/www/private/smtp.php 2>/dev/null; then
+    pass "PHP (uid 33) can actually read the credential file"
+  else
+    fail "PHP (uid 33) CANNOT read /var/www/private/smtp.php" \
+         "This is the condition that makes wp_mail() fall back to sendmail and fail. Modes may look right while directory traversal is denied." \
+         "chown root:33 /home/wpuser/wp/secrets ; chmod 750 /home/wpuser/wp/secrets"
+  fi
 
   if [ -e /home/wpuser/wp/html/smtp.php ]; then
     fail "A copy of smtp.php exists inside the web root" \
