@@ -71,7 +71,7 @@ done
 [ "$_diff" -eq 0 ] && echo "  ✔ All installed tools match their staged originals"
 
 echo "  Checking staged payload against the signed manifest…"
-_bad=$(cd "$SRC" 2>/dev/null && sha256sum -c --quiet MANIFEST.sha256 2>&1 | grep -c "FAILED" || echo 0)
+_bad=$(cd "$SRC" 2>/dev/null && sha256sum -c --quiet MANIFEST.sha256 2>&1 | grep -c "FAILED") || _bad=0
 if [ "${_bad:-0}" -eq 0 ]; then
   echo "  ✔ Staged payload matches the signed manifest"
 else

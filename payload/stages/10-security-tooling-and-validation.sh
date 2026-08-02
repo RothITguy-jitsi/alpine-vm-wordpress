@@ -301,7 +301,9 @@ check "nftables active"   "$(nft list tables 2>/dev/null | grep -c filter | tr -
 check "CS firewall bouncer"   "$(rc-service cs-firewall-bouncer status 2>/dev/null | grep -c started | tr -d ' ')" "1"
 
 # 8G firewall .htaccess present
-check "8G .htaccess installed"   "$([ -f /home/wpuser/wp/htaccess/.htaccess ] && grep -c '8G FIREWALL' /home/wpuser/wp/htaccess/.htaccess || echo 0)" "1"
+_8g=0
+[ -f /home/wpuser/wp/htaccess/.htaccess ] && { _8g=$(grep -c '8G FIREWALL' /home/wpuser/wp/htaccess/.htaccess) || _8g=0; }
+check "8G .htaccess installed"   "$_8g" "1"
 
 # Trivy available
 check "Trivy scanner"   "$(command -v trivy >/dev/null 2>&1 && echo ok || echo missing)"

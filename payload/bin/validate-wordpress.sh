@@ -654,16 +654,55 @@ fi
 # CrowdSec whitelist visibility. A ban applies at nftables and drops SSH as
 # well as HTTP, so "am I about to lock myself out" is a question the validator
 # should answer rather than leave to be discovered the hard way.
+# ── Is mod_remoteip actually substituting the real client address? ──────────
+# One root cause with four symptoms, so it is checked once, explicitly, rather
+# than left to be inferred from four separate oddities:
+#   wp-admin restriction — would allow everyone if the proxy is inside the
+#                          admin CIDR (now fails closed, but still wrong)
+#   login rate limiting  — every visitor shares one counter; five failures
+#                          from anyone lock out everyone
+#   CrowdSec             — bans the proxy (site-wide outage) or, if the proxy
+#                          is whitelisted, detects nothing at all
+#   GeoIP                — sees an RFC1918 address and exempts it, so country
+#                          filtering does nothing
+if [ -n "${PROXY_IP:-}" ]; then
+  _dbg=/home/wpuser/wp/logs/remoteip-debug.log
+  if [ -s "$_dbg" ]; then
+    # Anchored with ( |$) rather than a bare trailing space: the space is
+    # present in this log format today, but relying on it means a format
+    # change silently turns this check into "always passes". The alternation
+    # also stops 192.168.100.11 matching 192.168.100.112.
+    _tot=$(grep -cE "peer=${PROXY_IP}( |\$)" "$_dbg" 2>/dev/null) || _tot=0
+    _bad=$(grep -E "peer=${PROXY_IP}( |\$)" "$_dbg" 2>/dev/null | grep -cE "interpreted=${PROXY_IP}( |\$)") || _bad=0
+    if [ "${_tot:-0}" -eq 0 ]; then
+      note "No requests seen from the configured proxy ${PROXY_IP} yet — browse the site through the domain, then re-run"
+    elif [ "${_bad:-0}" -gt 0 ]; then
+      fail "mod_remoteip is NOT substituting the client address on ${_bad} of ${_tot} proxied requests" \
+           "Every visitor then appears to be the proxy. That defeats the wp-admin restriction, the login rate limiter, CrowdSec and GeoIP simultaneously — all four key off this address." \
+           "wp-hardening.sh proxy-check   # then enable X-Forwarded-For on the proxy"
+    else
+      pass "mod_remoteip is substituting real client addresses (${_tot} proxied requests checked)"
+    fi
+  else
+    note "remoteip-debug.log is empty — cannot confirm client-IP handling yet"
+  fi
+  if grep -q "REMOTEIP-BROKEN" /home/wpuser/wp/logs/error.log 2>/dev/null; then
+    fail "The login guard has logged REMOTEIP-BROKEN" \
+         "PHP saw the proxy as the client. Rate limiting is counting every visitor as one." \
+         "grep REMOTEIP-BROKEN /home/wpuser/wp/logs/error.log | tail -5"
+  fi
+fi
+
 _CSWL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
 if [ -r "$_CSWL" ]; then
-  _n=$(grep -c '^    - "' "$_CSWL" 2>/dev/null || echo 0)
+  _n=$(grep -c '^    - "' "$_CSWL" 2>/dev/null) || _n=0
   pass "CrowdSec whitelist present (${_n} address(es) never banned)"
 else
   warn "No CrowdSec whitelist configured" \
        "CrowdSec bans at nftables, which drops SSH too. A mistyped admin password five times can lock you out of the VM entirely; recovery is via the Proxmox console." \
        "wp-hardening.sh crowdsec-whitelist add <your-admin-ip>"
 fi
-_CSBAN=$(podman exec crowdsec cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || echo 0)
+_CSBAN=$(podman exec crowdsec cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c .) || _CSBAN=0
 if [ "${_CSBAN:-0}" -gt 0 ]; then
   note "CrowdSec is currently banning ${_CSBAN} address(es) — wp-hardening.sh crowdsec-whitelist list"
 fi

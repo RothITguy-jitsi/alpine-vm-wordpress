@@ -310,6 +310,16 @@ else
   warn "SMTP transport mu-plugin FAILED to install — wp_mail() will fail silently"
 fi
 
+# The mu-plugin needs to know the proxy's address to notice when it has
+# become the apparent client -- the symptom of mod_remoteip not applying.
+# Written next to the SMTP config because that directory is already mounted
+# read-only into the container; it is not a secret, just a fact PHP needs.
+if [ -n "${PROXY_IP:-}" ]; then
+  printf '%s\n' "$PROXY_IP" > /home/wpuser/wp/secrets/proxy.txt
+  chmod 0444 /home/wpuser/wp/secrets/proxy.txt
+  chown root:33 /home/wpuser/wp/secrets/proxy.txt 2>/dev/null || true
+fi
+
 WP_EXTRA_VOLS="-v /home/wpuser/wp/secrets:/var/www/private:ro"
 WP_VOL_ARGS="${WP_VOL_ARGS} ${WP_EXTRA_VOLS}"
 

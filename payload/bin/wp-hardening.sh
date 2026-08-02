@@ -66,7 +66,7 @@ show_status() {
   echo ""
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
-  echo "          geoip-test [ip] | proxy-check"
+  echo "          geoip-test [ip] | proxy-check | nginx-snippet"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
@@ -194,6 +194,111 @@ case "${1:-status}" in
       *) echo "Usage: wp-hardening.sh crowdsec-whitelist [list|add <ip>|remove <ip>]" >&2; exit 1 ;;
     esac ;;
 
+  nginx-snippet)
+    # Prints proxy-side configuration filled in with THIS VM's actual values.
+    # Generated rather than documented because the useful version needs the
+    # admin CIDR, the extra allowed IP, the login slug and the VM's address --
+    # and a snippet transcribed by hand with one of those wrong is worse than
+    # none, since it looks configured.
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    _vmip=$(ip -4 addr show scope global 2>/dev/null \
+            | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+    _slug="${WP_ADMIN_SLUG:-}"
+    # Written out rather than as ${_slug:-a}${_slug:+b}. That form is correct
+    # here, but it is the same shape as a bug fixed earlier in this project --
+    # where ${V:+X}${V:-Y} was mistaken for if/else and silently appended the
+    # variable. Anything requiring a reader to reason about expansion
+    # semantics to confirm a display string is not worth the two saved lines.
+    if [ -n "$_slug" ]; then _loginpath="/${_slug}"; else _loginpath="/wp-login.php"; fi
+    cat <<SNIPPET
+
+═══════════════════════════════════════════════════════════════════
+ Nginx Proxy Manager configuration for this VM
+═══════════════════════════════════════════════════════════════════
+
+  VM address        : ${_vmip:-<unknown>}
+  Admin CIDR        : ${ADMIN_CIDR:-<none>}
+  Extra allowed IP  : ${ALLOWED_ADMIN_IP:-<none>}
+  Login path        : ${_loginpath}
+  Trusted proxy     : ${PROXY_IP:-<none configured>}
+
+───────────────────────────────────────────────────────────────────
+ 1. PROXY HOST -> Advanced tab   (the important one)
+───────────────────────────────────────────────────────────────────
+
+ Why this beats the Apache-side rule: nginx is the edge, so \$remote_addr
+ IS the client. There is no header to trust and no substitution step to
+ fail. The Apache rule stays as a second, independent layer.
+
+SNIPPET
+    printf 'location ~* ^/(wp-admin/|wp-login\\.php'
+    [ -n "$_slug" ] && printf '|%s' "$_slug"
+    printf ') {\n'
+    [ -n "${ADMIN_CIDR:-}" ]       && printf '    allow %s;\n' "$ADMIN_CIDR"
+    [ -n "${ALLOWED_ADMIN_IP:-}" ] && printf '    allow %s;\n' "$ALLOWED_ADMIN_IP"
+    printf '    deny all;\n\n'
+    printf '    # Rate limit BEFORE a request costs a WordPress bootstrap.\n'
+    printf '    # Needs the limit_req_zone from section 2 below.\n'
+    printf '    limit_req zone=wplogin burst=3 nodelay;\n'
+    printf '    limit_req_status 429;\n\n'
+    printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
+    printf '    proxy_set_header Host              \$host;\n'
+    printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
+    printf '    # REPLACE, not append. NPM defaults to\n'
+    printf '    #   \$proxy_add_x_forwarded_for\n'
+    printf '    # which appends to whatever the CLIENT sent, so a forged header\n'
+    printf '    # arrives as "<forged>, <real>". mod_remoteip should still pick\n'
+    printf '    # the right one, but only if RemoteIPTrustedProxy is exactly\n'
+    printf '    # right. Replacing it states the truth and removes the class.\n'
+    printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
+    printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
+    printf '}\n\n'
+    printf 'location = /xmlrpc.php { deny all; }\n'
+    cat <<'SNIPPET2'
+
+───────────────────────────────────────────────────────────────────
+ 2. NPM HOST -> /data/nginx/custom/http_top.conf
+───────────────────────────────────────────────────────────────────
+
+ limit_req_zone lives in the http block, which the Advanced tab cannot
+ reach. Create the file if it does not exist, then restart NPM.
+
+limit_req_zone $binary_remote_addr zone=wplogin:10m rate=6r/m;
+
+───────────────────────────────────────────────────────────────────
+ 3. Verify, in this order
+───────────────────────────────────────────────────────────────────
+
+ a) From an ALLOWED address, load the login page. It must still work.
+    Locking yourself out is the likeliest way this goes wrong.
+
+ b) From a phone on mobile data (wifi OFF):
+       expect 403 from nginx — it should not reach this VM at all
+
+ c) Back on this VM, confirm what Apache now sees:
+       wp-hardening.sh proxy-check
+    interpreted= should show the REAL client, never the proxy.
+
+ d) Rate limit, from an allowed address:
+       for i in $(seq 1 10); do curl -o /dev/null -s -w "%{http_code} "          https://YOUR-DOMAIN/YOUR-LOGIN-PATH; done; echo
+    Expect a few 200s then 429s.
+
+───────────────────────────────────────────────────────────────────
+ What this does NOT fix
+───────────────────────────────────────────────────────────────────
+
+ Restricting at nginx protects the admin paths. The login rate limiter,
+ CrowdSec and GeoIP on the VM still identify clients from
+ X-Forwarded-For, so they still depend on mod_remoteip working. Section 1
+ makes that header trustworthy; it does not remove the dependency.
+
+ The edge rate limit is the exception — it works on $remote_addr directly
+ and holds even if everything downstream is misconfigured. That is why it
+ is worth adding even though the VM already rate-limits logins.
+
+SNIPPET2
+    ;;
+
   proxy-check)
     # Answers the one question that decides every "works on the LAN IP but
     # not through the domain" report: what address does Apache believe the
@@ -247,6 +352,23 @@ case "${1:-status}" in
       echo "    Use one of the peers listed above as the trusted proxy:"
       echo "      edit PROXY_IP in /etc/wp-install/vars.sh, then re-run"
       echo "      wp-geoip-setup.sh or recreate the container to regenerate config."
+    fi
+    echo ""
+    # The check that matters most, done directly rather than inferred: does
+    # the live config actually deny the proxy's own address?
+    echo ""
+    if grep -q "Require not ip ${PROXY_IP}" /home/wpuser/wp/apache-conf/wp-security.conf 2>/dev/null; then
+      echo "  ✔ wp-admin rules deny the proxy's own address, so a mod_remoteip"
+      echo "    failure produces 403 rather than allowing everyone."
+    else
+      echo "  ✗ wp-admin rules do NOT deny ${PROXY_IP}."
+      if printf '%s' "${ADMIN_CIDR:-}" | grep -q '/'; then
+        echo "    Your admin range is ${ADMIN_CIDR}. If the proxy is inside it,"
+        echo "    then any mod_remoteip failure ALLOWS EVERY REQUEST rather than"
+        echo "    denying them — and nothing looks wrong."
+        echo "    Test it: browse to the login page from a phone on mobile data."
+        echo "    You should get 403. If you get the login form, this is live."
+      fi
     fi
     echo ""
     echo "  Status codes are the last field of each line; 403 on a /wp-login.php"

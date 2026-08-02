@@ -16,7 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'WPVM_LOGIN_SLUG' ) ) {
-    define( 'WPVM_LOGIN_SLUG', 'WPVM_SLUG_PLACEHOLDER-login' );
+    // Bare slug, no suffix. A '-login' suffix made the path findable by
+    // anything scanning for *login*, which is the entire class of thing a
+    // slug is supposed to hide it from.
+    define( 'WPVM_LOGIN_SLUG', 'WPVM_SLUG_PLACEHOLDER' );
 }
 
 /**

@@ -369,6 +369,37 @@ echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache 
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
 
+# Flag the combination that turns a mod_remoteip failure into "allow everyone".
+# A proxy on the LAN is normally inside the operator's own admin CIDR, and when
+# that is true the wp-admin restriction cannot fail safely on its own -- if the
+# real client address is not substituted, every request looks like it came from
+# an allowed address. lib/03 now emits a `Require not ip <proxy>` rule that
+# makes it fail closed; this says so, because a control that silently stopped
+# applying is worth knowing about even when it is handled.
+if [[ -n "$PROXY_IP" && -n "$ADMIN_CIDR" ]]; then
+  _pi=$(printf '%s' "$PROXY_IP" | awk -F. '{printf "%d", ($1*16777216)+($2*65536)+($3*256)+$4}')
+  _net="${ADMIN_CIDR%%/*}"; _bits="${ADMIN_CIDR##*/}"
+  case "$ADMIN_CIDR" in */*) : ;; *) _bits=32 ;; esac
+  _ni=$(printf '%s' "$_net" | awk -F. '{printf "%d", ($1*16777216)+($2*65536)+($3*256)+$4}')
+  if [[ "$_bits" -ge 0 && "$_bits" -le 32 ]]; then
+    _mask=$(( _bits == 0 ? 0 : (0xFFFFFFFF << (32 - _bits)) & 0xFFFFFFFF ))
+    if [[ $(( _pi & _mask )) -eq $(( _ni & _mask )) ]]; then
+      echo ""
+      msg_warn "The proxy (${PROXY_IP}) is inside your wp-admin range (${ADMIN_CIDR})."
+      msg_warn "  That matters: if mod_remoteip ever stops substituting the real"
+      msg_warn "  client address, every request would look like it came from the"
+      msg_warn "  proxy — which is an allowed address. The restriction would"
+      msg_warn "  silently permit everyone rather than deny everyone, so nothing"
+      msg_warn "  would look wrong."
+      msg_ok  "  Handled: the generated rules deny the proxy's own address, so"
+      msg_ok  "  that failure produces 403 instead. You cannot administer"
+      msg_ok  "  WordPress from a shell on the proxy host itself."
+      msg_info "  Verify after install:  wp-hardening.sh proxy-check"
+    fi
+  fi
+  unset _pi _net _bits _ni _mask
+fi
+
 # Offer to lock port 80/443 to the proxy now that its address is known.
 # The Web CIDR question is asked earlier, before this answer exists, so
 # without this the operator has to already know the proxy IP at that point --
@@ -707,23 +738,46 @@ echo -e "  ${YW}  REST API. It is not a secret, it is a filter.${CL}"
 echo -e "  ${YW}  Treat it as noise reduction stacked on top of the IP restriction and${CL}"
 echo -e "  ${YW}  CrowdSec — never as the thing protecting the account.${CL}"
 _sec_note
-read -rp "  wp-admin custom slug?  (blank = keep default /wp-admin) : " WP_ADMIN_SLUG
+# Wrapped in a loop so a rejected slug re-prompts. Previously a collision
+# silently cleared the answer and carried on with no slug at all -- the
+# operator asked for one, was told it was ignored, and the install proceeded
+# with the default path. Asking again is the obviously right behaviour and
+# was simply missing.
+while :; do
+read -rp "  Custom login slug?  (blank = keep default /wp-login.php) : " WP_ADMIN_SLUG
 # Sanitise: lowercase, alphanumeric + hyphen only
 WP_ADMIN_SLUG=$(echo "${WP_ADMIN_SLUG}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
+[[ -z "$WP_ADMIN_SLUG" ]] && break
 # BUG FIX (v7-14): reject slugs that collide with a real WordPress path.
 # A slug of "wp-content", "wp-admin", "wp-includes" or similar would have
 # its RewriteRule shadow (or be shadowed by) the real directory, producing
 # a site that half-works in ways that are extremely hard to diagnose — the
 # rewrite fires for some paths and the real directory wins for others.
 case "$WP_ADMIN_SLUG" in
-  wp-admin|wp-includes|wp-content|wp-login|wp-json|index|xmlrpc|feed|admin-ajax)
-    msg_warn "Slug '${WP_ADMIN_SLUG}' collides with a real WordPress path — ignoring it."
-    msg_warn "  Re-run and pick something that isn't a WordPress reserved path."
+  # Reject anything containing a word a scanner would glob for. A slug like
+  # "edith-login" or "myadmin" is found by the same wordlist that finds
+  # wp-login.php, so it hides the page from nobody -- which is the entire
+  # point of choosing one. Checked as a substring, not an exact match.
+  *login*|*admin*|*signin*|*log-in*|*wp-*|*auth*|*dashboard*|*panel*)
+    msg_warn "  '${WP_ADMIN_SLUG}' contains a word scanners look for."
+    msg_warn "  A slug is only worth having if it is not in the wordlist that"
+    msg_warn "  finds wp-login.php in the first place. Anything matching"
+    msg_warn "  *login*, *admin*, *auth*, *panel* or *dashboard* is."
+    msg_warn "  Pick an unrelated word: a place, a colour, an inside joke."
     WP_ADMIN_SLUG=""
-    ;;
+    continue ;;
+  wp-includes|wp-content|wp-json|index|xmlrpc|feed)
+    msg_warn "  '${WP_ADMIN_SLUG}' collides with a real WordPress path."
+    msg_warn "  Its rewrite would shadow, or be shadowed by, the real directory —"
+    msg_warn "  producing a site that half-works in ways that are hard to trace."
+    WP_ADMIN_SLUG=""
+    continue ;;
 esac
+break
+done
 if [[ -n "$WP_ADMIN_SLUG" ]]; then
-  msg_ok "Admin slug: /${WP_ADMIN_SLUG}-login  (default /wp-login.php will return 403)"
+  msg_ok "Login URL: /${WP_ADMIN_SLUG}   (wp-admin at /${WP_ADMIN_SLUG}/...)"
+  msg_ok "  /wp-login.php now returns 403"
   msg_info "  A must-use plugin makes WordPress emit the slug in its own login links,"
   msg_info "  so the default path is never advertised. Recovery instructions if you"
   msg_info "  ever lock yourself out are printed at the end of the install."
@@ -1281,7 +1335,7 @@ printf  "  %-18s %s\n"  "Proxy IP:"    "${PROXY_IP:-direct (no proxy)}"
 # appended -- "/edith (custom)edith". It read correctly when no slug was set,
 # which is why it survived until someone used the feature. It also showed
 # "/edith" while the URL actually served is "/edith-login".
-printf  "  %-18s %s\n"  "Admin slug:"  "$([ -n "$WP_ADMIN_SLUG" ] && printf '/%s-login (custom)' "$WP_ADMIN_SLUG" || printf '/wp-login.php (default)')"
+printf  "  %-18s %s\n"  "Login URL:"  "$([ -n "$WP_ADMIN_SLUG" ] && printf '/%s (custom)' "$WP_ADMIN_SLUG" || printf '/wp-login.php (default)')"
 # Same ${V:+}${V:-} mistake as the slug line, and worse here: when a key WAS
 # supplied, both halves expanded and the ENROLMENT KEY ITSELF was printed into
 # the summary and the install log. It never surfaced because the key was left

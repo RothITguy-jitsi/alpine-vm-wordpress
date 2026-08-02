@@ -190,7 +190,22 @@ verify_key_dns() {
     return 0
   fi
   if [[ "$published" == "$WASP_PUBKEY" ]]; then
-    echo "  ✔ Embedded key matches the one published at ${WASP_KEY_DNS}"
+    # Report whether the answer was DNSSEC-validated, rather than implying it
+    # was. `dig +dnssec` sets the AD (Authenticated Data) flag only when the
+    # resolver validated the chain; without it this lookup is spoofable on the
+    # network path and the match is weaker corroboration than it looks.
+    local _ad=""
+    if command -v dig >/dev/null 2>&1; then
+      _ad=$(dig +dnssec +timeout=5 TXT "$WASP_KEY_DNS" 2>/dev/null | grep -c "flags:.* ad[ ;]") || _ad=0
+    fi
+    if [[ "${_ad:-0}" -gt 0 ]]; then
+      echo "  ✔ Embedded key matches ${WASP_KEY_DNS} (DNSSEC-validated)"
+    else
+      echo "  ✔ Embedded key matches ${WASP_KEY_DNS}"
+      echo "    (not DNSSEC-validated — corroboration, not proof: a resolver on"
+      echo "     the network path could return this answer. Enable DNSSEC on the"
+      echo "     zone, and use a validating resolver, to strengthen it.)"
+    fi
     return 0
   fi
   echo "" >&2
@@ -218,26 +233,79 @@ verify_release() {
   local man="${dir}/MANIFEST.sha256"
   local sig="${man}.minisig"
 
+  # Whether an unverifiable release is fatal is decided by the deployment
+  # profile, not by an environment variable the operator has to remember.
+  #
+  # A third-party review put this plainly: making the strongest supply-chain
+  # control opt-in via WASP_REQUIRE_SIGNATURE=1 means it is off exactly when
+  # it matters, because nobody types it. Every other verification here already
+  # follows the profile — Alpine's SHA-512, digest pinning, the CrowdSec
+  # bouncer, sysctls, GeoIP — and signature checking is the one that was
+  # inconsistent.
+  #
+  # production : unverifiable is FATAL.
+  # standard   : warn and continue, which is right for a lab VM and stated as
+  #              such rather than presented as verified.
+  # WASP_REQUIRE_SIGNATURE=1 still forces fatal regardless, for anyone
+  # scripting installs outside the profile mechanism.
+  # DEPLOYMENT_PROFILE is deliberately NOT consulted here: it does not exist
+  # yet at this point in the run. Only an explicit environment variable can
+  # tighten this further than the default refusal below.
+  _sig_required=0
+  [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && _sig_required=1
+
+  # NOTE ON ORDERING: this runs during the self-bootstrap, before lib/01 asks
+  # for the deployment profile — so keying the decision off DEPLOYMENT_PROFILE
+  # would never fire. Verification has to happen before anything is sourced,
+  # which is exactly why it cannot consult an answer collected later.
+  #
+  # So the default is REFUSE, and proceeding requires typing a word. A warning
+  # that scrolls past is not a decision; a prompt that will not accept Enter
+  # is. Non-interactive runs abort outright, because an unattended install
+  # cannot meaningfully consent to running unverified code as root.
+  _sig_fail() {
+    echo "" >&2
+    echo "════════════════════════════════════════════════════════════" >&2
+    echo " RELEASE COULD NOT BE VERIFIED" >&2
+    echo "════════════════════════════════════════════════════════════" >&2
+    echo "  $1" >&2
+    echo "" >&2
+    echo "  This script is about to source and execute these files as root on" >&2
+    echo "  your hypervisor. Unverified, there is nothing establishing they are" >&2
+    echo "  what the project published." >&2
+    echo "" >&2
+    if [[ "$_sig_required" == "1" ]]; then
+      echo "  WASP_REQUIRE_SIGNATURE=1 is set. Refusing." >&2
+      exit 1
+    fi
+    if [[ ! -t 0 ]]; then
+      echo "  Not an interactive session, so this cannot be confirmed. Refusing." >&2
+      echo "  To install unverified deliberately, run interactively, or set" >&2
+      echo "  WASP_ACCEPT_UNVERIFIED=1 having understood the above." >&2
+      [[ "${WASP_ACCEPT_UNVERIFIED:-0}" == "1" ]] || exit 1
+      echo "  WASP_ACCEPT_UNVERIFIED=1 — continuing unverified." >&2
+      return 0
+    fi
+    printf "  Type UNVERIFIED to proceed anyway, anything else to stop: " >&2
+    read -r _uv
+    [[ "$_uv" == "UNVERIFIED" ]] || { echo "  Stopped." >&2; exit 1; }
+    echo "  Proceeding UNVERIFIED at your explicit request." >&2
+    return 0
+  }
+
   if [[ -z "$WASP_PUBKEY" ]]; then
-    echo "NOTE: this build is unsigned (no release key configured)." >&2
-    echo "  Files were fetched over HTTPS but their contents are not verified." >&2
-    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && {
-      echo "FATAL: WASP_REQUIRE_SIGNATURE=1 and there is no key to verify with." >&2; exit 1; }
+    _sig_fail "this build is unsigned — no release key is configured, so the fetched files cannot be verified."
     return 0
   fi
   if [[ ! -f "$man" || ! -f "$sig" ]]; then
-    echo "WARNING: no signed manifest in this release." >&2
-    echo "  Expected MANIFEST.sha256 and MANIFEST.sha256.minisig." >&2
-    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && { echo "FATAL: signature required." >&2; exit 1; }
+    _sig_fail "no signed manifest in this release (expected MANIFEST.sha256 and MANIFEST.sha256.minisig)."
     return 0
   fi
   if ! command -v minisign >/dev/null 2>&1; then
     # Deliberately not silently downgraded to "hashes only": hashes from an
     # unverified manifest catch corruption, not tampering, and reporting that
     # as verification would be worse than reporting nothing.
-    echo "WARNING: minisign is not installed, so the release SIGNATURE cannot be checked." >&2
-    echo "  Install it and re-run to verify:  apt install minisign" >&2
-    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && { echo "FATAL: signature required." >&2; exit 1; }
+    _sig_fail "minisign is not installed, so the release SIGNATURE cannot be checked (apt install minisign)."
     return 0
   fi
 

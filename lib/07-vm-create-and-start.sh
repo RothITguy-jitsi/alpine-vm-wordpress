@@ -160,7 +160,7 @@ echo   "  ╠══════════════════════�
   echo   "  ║  all else DROP. wp-db is --internal (MariaDB has no egress) ║"
   printf "  ║  Network:       %-44s║\n" "${_NET_DESC}"
   printf "  ║  GeoIP:         %-44s║\n" "${_GEO_DESC}"
-  [[ -n "${WP_ADMIN_SLUG}" ]] && printf "  ║  Custom slug:   %-44s║\n" "/${WP_ADMIN_SLUG}-login"
+  [[ -n "${WP_ADMIN_SLUG}" ]] && printf "  ║  Custom slug:   %-44s║\n" "/${WP_ADMIN_SLUG}"
 echo   "  ║  Background install (~15 min total):                       ║"
 echo   "  ║    qm terminal $VMID  then:  tail -800 /var/log/wp-install.log"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"

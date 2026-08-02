@@ -56,7 +56,7 @@ It's also honest about where it stops. Every control here states its own limits 
   - [Verifying what you run](#verifying-what-you-run)
 - [Login Protection](#login-protection)
 - [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
-- [Release Signing (minisign)](#release-signing-minisign)
+- [Verifying What You Run](#verifying-what-you-run-minisign)
 - [Off-VM Backup](#off-vm-backup)
 - [Self-Test](#self-test-proving-the-guarantees-hold)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
@@ -302,6 +302,18 @@ WPVM_REPO_REF=<40-char-commit-sha> ./install.sh
 
 ## Login Protection
 
+The login page moves to a slug of your choosing. **The bare slug is the login URL** — `/kestrel`, not `/kestrel-login`.
+
+```
+/kestrel            -> the login page
+/kestrel/foo        -> wp-admin/foo
+/wp-login.php       -> 403
+```
+
+A `-login` suffix would defeat the point: anything scanning for paths matching `*login*` finds it in the same pass that finds `wp-login.php`. For the same reason the installer **rejects** slugs containing `login`, `admin`, `auth`, `signin`, `panel`, `dashboard` or `wp-` and asks again — a slug drawn from the wordlist that finds the default path hides it from nobody.
+
+
+
 Replaces Limit Login Attempts and similar plugins, in two layers.
 
 **Layer 1 — `02-wpvm-login-guard.php` (mu-plugin).** Progressive lockout: 5 failures in 20 minutes locks the address for 15 minutes, and each subsequent lockout doubles, capped at 24 hours. A fixed penalty is just a rate an attacker plans around — 5 guesses every quarter hour, forever. Doubling makes sustained guessing pointless while a legitimate mistyped password still costs only the base wait.
@@ -442,74 +454,110 @@ Clean output means *no disclosed vulnerability in that feed* — not that the si
 
 ---
 
-## Release Signing (minisign)
+## Verifying What You Run (minisign)
 
-Releases can be signed with [minisign](https://jedisct1.github.io/minisign/) — Ed25519, a single-line public key, no keyring.
+`install.sh` fetches and executes code as root on your hypervisor. Every
+`curl | bash` installer asks you to trust that the bytes arriving are the
+bytes the author published — and normally there is no way to check.
 
-Signed releases ship with `MANIFEST.sha256` (SHA-256 of every file `install.sh` executes) and `MANIFEST.sha256.minisig`. `install.sh` verifies the signature, then every file hash, before sourcing anything.
+WASP releases are signed, so there is.
 
-**Verify a release yourself**, without trusting this repository's own word for it:
+### What happens automatically
+
+Nothing to configure. `install.sh` verifies before it sources a single line:
+
+```
+  ✔ Embedded key matches the one published at minisign._wasp.rothitguy.pro
+Verifying release signature…
+Verifying file hashes against the signed manifest…
+  All files match the signed manifest.
+```
+
+A bad signature or a changed file aborts the install. If you want it to refuse
+to run on anything unsigned:
 
 ```sh
-# the key, from a source that is not this repo
-dig +short TXT minisign._wasp.rothitguy.pro
-
-minisign -Vm MANIFEST.sha256 -P "RW..."   # signature
-sha256sum -c MANIFEST.sha256              # every file against it
+WASP_REQUIRE_SIGNATURE=1 ./install.sh
 ```
 
-*The release-signing tool is maintainer-side and deliberately not shipped: it only ever runs on the machine holding the secret key, so including it would add attack surface to every deployment without adding any capability to it.*
+That needs `minisign` on the Proxmox host — `apt install minisign`. Without it
+the install continues but says clearly that the signature was **not** checked,
+rather than quietly reporting success.
 
-**minisign rather than GPG** because `minisign -Vm file -P <base64-key>` takes the key **on the command line** — no keyring, no trust database, nothing to distribute but one line. That's what makes it possible to embed the key in `install.sh`, the file users fetch first.
+### Checking it yourself
 
-**What this proves, and what it doesn't.** It proves the files about to run are byte-identical to what the secret-key holder signed. It does **not** bootstrap trust on its own: a first-time user fetching `install.sh` and the release from the same repository is still trusting GitHub, and an attacker who could swap the tarball could swap the embedded key too.
-
-What it changes:
-
-- Anyone who recorded the fingerprint once can detect a later repo compromise — the key would have to change.
-- The fingerprint can be published where the repo isn't, so it's checkable against an independent source.
-- A tampered file that isn't re-signed fails, so an attacker needs the **secret key**, not just write access.
-
-Real improvement over unsigned `curl | bash`. Not the same as a trusted supply chain. Set `WASP_REQUIRE_SIGNATURE=1` to refuse to run unsigned.
-
-### Publishing the fingerprint
-
-Put the public key somewhere with **different credentials** from the repository. That distinction is the whole point — a Gist or a GitHub Pages site on the same account falls to exactly the compromise this is meant to make visible.
-
-**DNS TXT record** (machine-checkable, held at your registrar):
-
-```
-minisign._wasp.rothitguy.pro.  IN  TXT  "RW..."
-```
-
-Anyone can confirm it without trusting the project or GitHub:
+The key is published somewhere the repository is not, so you can confirm it
+without taking this repo's word for it:
 
 ```sh
 dig +short TXT minisign._wasp.rothitguy.pro
 ```
 
-`install.sh` cross-checks this automatically before verifying the signature. A mismatch warns loudly and asks for confirmation; with `WASP_REQUIRE_SIGNATURE=1` it's fatal. Skip with `WASP_SKIP_KEY_DNS=1`, or point it elsewhere with `WASP_KEY_DNS=`.
+That should match the `WASP_PUBKEY` line in `install.sh`. If it doesn't, stop:
+either the key was rotated and your copy is stale, or your copy did not come
+from this project.
 
-**Honest scope:** plain DNS is spoofable on the network path, so this is *corroboration*, not a second root of trust. It answers "does the key baked into this file match the one published under separate credentials?" — which catches a repo compromise that swapped both the release and the embedded key, and catches nothing against an attacker who also controls your resolver. DNSSEC makes it meaningfully stronger.
+To verify a release by hand:
 
-Also worth doing, at no cost:
+```sh
+minisign -Vm MANIFEST.sha256 -P "$(dig +short TXT minisign._wasp.rothitguy.pro | tr -d '"')"
+sha256sum -c MANIFEST.sha256
+```
 
-- **A page on your own domain** (`https://rothitguy.pro/wasp-signing-key/`) — different host, different credentials, and where a human will actually look.
-- **A dated public post** (Mastodon/Bluesky). Weak as truth, useful as corroboration: third-party-hosted and hard to edit retroactively, so a later key substitution becomes visible.
+### What this proves — and what it doesn't
 
-The realistic value: most people won't check. What publishing buys is that a key substitution becomes **detectable** — by you, by a client doing due diligence, or by anyone looking after something has gone wrong. Tamper-evidence, not prevention.
+It proves the files about to run are byte-identical to what the key holder
+signed. A tampered file that hasn't been re-signed fails, so an attacker needs
+the **secret key**, not merely write access to the repository.
 
-### The more valuable half: on-VM tamper detection
+It does **not** bootstrap trust on its own. If you fetch `install.sh` and the
+release from the same place, you are still trusting that place — someone who
+could swap the tarball could swap the embedded key too. What signing changes is
+that the swap becomes **detectable**: the key would have to change, and anyone
+who recorded the fingerprint — or checks DNS, held under different credentials
+— sees it.
+
+Tamper-evidence, not prevention. Worth having; not the same as a trusted supply
+chain, and this README would rather say so than imply otherwise.
+
+The DNS cross-check is corroboration for the same reason: plain DNS is
+spoofable on the network path, so it catches a repository compromise and not an
+attacker who also controls your resolver.
+
+### Checking the VM later
 
 ```sh
 wasp-verify-integrity.sh
 ```
 
-Verifying a release at install catches a tampered download — a one-off risk. Verifying the **installed** files catches something continuous and much harder to spot: an attacker with root on the VM editing `update.sh`, `wp-hardening.sh` or the malware scanner to disable a control or stop it reporting. Those edits are invisible to every other check here, because every other check trusts the scripts it's running.
+The more useful half. Verifying a download is a one-off; verifying the
+**installed** files catches an attacker with root on the VM editing
+`update.sh` or the malware scanner to disable a control. Those edits are
+invisible to every other check here, because every other check trusts the
+scripts it is running.
 
-Stated limit: an attacker with root can edit this script, the manifest and the key too. Verification from inside a compromised host catches malware that modifies files without considering the integrity check — most of it — not a determined attacker. For an authoritative answer, mount the disk from the Proxmox host and compare from there.
+Its limit is stated in the script: an attacker with root can edit the checker
+too. It catches malware that ignores integrity checking — most of it — not one
+that anticipates it. For an authoritative answer, mount the disk from the
+Proxmox host and compare from there.
 
 ---
+
+### Hardening at the proxy
+
+```sh
+wp-hardening.sh nginx-snippet
+```
+
+Prints Nginx Proxy Manager config filled in with this VM's actual admin CIDR, allowed IP, login slug and address — generated rather than documented, because a snippet transcribed by hand with one value wrong is worse than none: it looks configured.
+
+**Why restricting at nginx beats the Apache rule.** Apache only knows the client IP because a *header* told it. nginx is the edge — `$remote_addr` **is** the client. No header to trust, no substitution step to fail silently. Keep both; two layers that fail independently.
+
+It also sets `X-Forwarded-For $remote_addr` rather than NPM's default `$proxy_add_x_forwarded_for`, which **appends** to whatever the client sent — so a forged header arrives as `<forged>, <real>`. mod_remoteip should still pick correctly, but only if `RemoteIPTrustedProxy` is exactly right. Replacing states the truth and removes the class.
+
+And an edge rate limit (6/min per real IP) that costs no WordPress bootstrap — the one control here that holds even if everything downstream is misconfigured, since it never touches `X-Forwarded-For`.
+
+**What it doesn't fix:** the login guard, CrowdSec and GeoIP still identify clients from `X-Forwarded-For`, so they still depend on mod_remoteip. The snippet makes that header trustworthy; it doesn't remove the dependency. That's stated in the output too.
 
 ## Off-VM Backup
 

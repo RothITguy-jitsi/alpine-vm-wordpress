@@ -241,8 +241,48 @@ NFTEOF
 # Build wp-admin Require block
 REQUIRE_ADMIN=""
 if [[ -n "$ADMIN_CIDR" || -n "$ALLOWED_ADMIN_IP" ]]; then
-  [[ -n "$ADMIN_CIDR" ]]       && REQUIRE_ADMIN+=$'\n'"    Require ip ${ADMIN_CIDR}"
-  [[ -n "$ALLOWED_ADMIN_IP" ]] && REQUIRE_ADMIN+=$'\n'"    Require ip ${ALLOWED_ADMIN_IP}"
+  _allow=""
+  [[ -n "$ADMIN_CIDR" ]]       && _allow+=$'\n'"            Require ip ${ADMIN_CIDR}"
+  [[ -n "$ALLOWED_ADMIN_IP" ]] && _allow+=$'\n'"            Require ip ${ALLOWED_ADMIN_IP}"
+
+  if [[ -n "$PROXY_IP" ]]; then
+    # FAIL-CLOSED FIX (found in the field: an admin logged in over cellular
+    # data from an address in no allow list).
+    #
+    # When a reverse proxy fronts this VM, EVERY request arrives from the
+    # proxy's address and mod_remoteip is what replaces it with the real
+    # client. If mod_remoteip does not apply -- the module missing, the
+    # header absent because the proxy was not configured to send it, or the
+    # connection arriving from an address other than the declared
+    # RemoteIPTrustedProxy -- then Apache evaluates these rules against the
+    # PROXY'S address.
+    #
+    # And a proxy on the LAN is usually inside the operator's own admin CIDR.
+    # 192.168.100.112 is inside 192.168.100.0/24. So the failure does not
+    # deny everyone, which would be noticed within minutes; it ALLOWS
+    # everyone, and looks exactly like a working configuration.
+    #
+    # `Require not ip <proxy>` inverts that. When mod_remoteip works the
+    # client is the real visitor, never the proxy, so this passes and the
+    # allow-list below decides as intended. When mod_remoteip fails the
+    # client IS the proxy, this fails, and the request is denied. The control
+    # now breaks toward locked-out rather than wide-open.
+    #
+    # Consequence worth knowing: you cannot administer WordPress from a shell
+    # ON the proxy host itself. That is a fair trade for the restriction
+    # meaning what it says.
+    REQUIRE_ADMIN="
+    <RequireAll>
+        # Deny the proxy's own address. It is only ever the apparent client
+        # when mod_remoteip has failed — see the note above.
+        Require not ip ${PROXY_IP}
+        <RequireAny>${_allow}
+        </RequireAny>
+    </RequireAll>"
+  else
+    REQUIRE_ADMIN="${_allow}"
+  fi
+  unset _allow
 fi
 
 # Build wp-admin block strings (empty = no restriction added)
@@ -349,9 +389,16 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
     # rewritten directory target — every RewriteRule target below is a real file.
     <IfModule mod_rewrite.c>
       RewriteEngine On
-      RewriteRule ^${WP_ADMIN_SLUG}/?$ /wp-admin/index.php [L,QSA,E=WPVM_SLUG:1]
+      # The BARE slug is the login page. It used to be "<slug>-login", which
+      # defeated the only thing a slug is for: anything scanning for paths
+      # matching *login* found it immediately, so the login page was hidden
+      # from nobody. The suffix existed to separate login from wp-admin;
+      # subpaths do that just as well and leak nothing.
+      #   /edith        -> wp-login.php
+      #   /edith/       -> wp-login.php
+      #   /edith/foo    -> wp-admin/foo
+      RewriteRule ^${WP_ADMIN_SLUG}/?$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]
       RewriteRule ^${WP_ADMIN_SLUG}/(.+)$ /wp-admin/\$1 [L,QSA,E=WPVM_SLUG:1]
-      RewriteRule ^${WP_ADMIN_SLUG}-login/?$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]
 
       # v7-14: block the default login path unless the request came through
       # the slug rewrite above. Without this the slug was decorative — bots

@@ -6,6 +6,278 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Signature verification fails closed; lockout no longer punishes shared NAT
+
+A fourth evaluation, against a day-old archive. Several of its findings were
+already closed (executable PHP SMTP config, informal Trivy exceptions,
+read-only candidate account). Two were not, and both were right.
+
+**Critical — signature enforcement was fail-open.** Its wording is the useful
+part: *"the strongest production control dependent on an operator remembering
+an environment variable."* That is exactly backwards from how everything else
+here behaves.
+
+The first attempt at a fix keyed the decision off
+`DEPLOYMENT_PROFILE=production`, matching Alpine's SHA-512 check, digest
+pinning, the CrowdSec bouncer and the sysctls. **That would never have
+fired**: verification runs at install.sh line 295, during the self-bootstrap,
+and the profile is not chosen until lib/01 at line 1262. Verification has to
+happen before anything is sourced, which is precisely why it cannot consult an
+answer collected afterwards.
+
+So the default is now to **refuse**, and proceeding requires typing
+`UNVERIFIED`. A warning that scrolls past is not a decision; a prompt that will
+not accept Enter is. Non-interactive runs abort outright — an unattended
+install cannot meaningfully consent to executing unverified code as root —
+unless `WASP_ACCEPT_UNVERIFIED=1` is set deliberately.
+
+**High — IP-only lockout punished shared NAT.** Also correct, and worse than
+it sounds: under carrier-grade NAT a mobile visitor sharing an address is the
+normal case, not an edge case, so an attacker could lock out every legitimate
+user of an office or carrier network by failing five logins.
+
+Lockouts are now scoped to **IP and username together**, so hammering `admin`
+cannot lock out `editor` from the same address. A second, much looser
+address-wide tier (6× the per-account threshold) still catches username
+spraying, which a per-pair limit alone would never trip. Two thresholds, two
+purposes: the tight one protects an account, the loose one catches spraying.
+
+**Also:** the DNS key cross-check now reports whether the answer was
+**DNSSEC-validated**, by checking dig's AD flag, instead of implying that a
+match means more than it does. Without validation the lookup is spoofable on
+the network path, and the output now says so rather than printing an
+unqualified tick.
+
+Still open from that review and tracked in `TODO.md`: destination-restricted
+egress, off-VM *restore* proof (as distinct from off-VM backup, which now
+exists), authoritative verification from outside the guest, and formal key
+rotation procedure.
+
+---
+
+## Unreleased — README signing section rewritten for readers, not maintainers
+
+The signing documentation had drifted into being maintainer notes in a
+public README: how to generate a key, how to run the signing tool, what DNS
+record to create, where to back up the secret key. None of that is anything a
+reader of this project can act on, and the tool itself is no longer shipped —
+so it described a workflow using a file that is not in the repository.
+
+Rewritten as **"Verifying What You Run"**, answering the questions a reader
+actually has:
+
+- **Why this exists at all** — `install.sh` executes code as root on a
+  hypervisor, and every `curl | bash` installer asks for trust it gives no way
+  to check.
+- **What happens automatically**, including that a missing `minisign` says the
+  signature was *not* checked rather than quietly reporting success.
+- **How to check independently** — the DNS lookup and the two commands to
+  verify a release by hand.
+- **What it proves and what it does not.** Signing does not bootstrap trust
+  for someone fetching `install.sh` and the release from the same place; it
+  makes a substitution *detectable*. Tamper-evidence, not prevention — stated
+  rather than implied.
+- **`wasp-verify-integrity.sh`**, which is the more useful half, with its own
+  limit named: an attacker with root can edit the checker too.
+
+**Also fixed:** the proxy-hardening section had been inserted *inside* the
+signing section, so `nginx-snippet` appeared under a heading about release
+signatures. Moved out. And the table-of-contents anchor still pointed at the
+old heading — checked every internal link afterwards, all 48 headings resolve.
+
+---
+
+## Unreleased — The login slug no longer contains the word "login"
+
+Reported by the operator: `/edith-login` does not hide a login page from
+anything scanning for `*login*`.
+
+Correct, and it defeated the only thing a slug is for. The suffix existed to
+separate the login path from wp-admin, but subpaths do that just as well and
+leak nothing:
+
+```
+/edith        -> wp-login.php
+/edith/       -> wp-login.php
+/edith/foo    -> wp-admin/foo
+/wp-login.php -> 403
+```
+
+**The same reasoning applies to the slug itself**, so the installer now
+rejects anything containing `login`, `admin`, `auth`, `signin`, `panel`,
+`dashboard` or `wp-`, checked as a substring rather than an exact match. A
+slug like `siteadmin` or `mylogin42` is found by the same wordlist that finds
+`wp-login.php`; choosing one is worse than choosing none, because it feels
+like protection.
+
+**A pre-existing bug found while adding that:** the reserved-path check
+cleared the slug and carried on. The operator asked for a slug, was told it
+was ignored, and the install completed with the default path — no re-prompt,
+no second chance. The prompt is now a loop, so any rejection asks again. It
+had never been one.
+
+Also caught before shipping: the first version of the rejection used
+`continue` with no enclosing loop. `bash -n` accepts that, and the effect
+would have been to fall through with an empty slug — the exact behaviour being
+fixed.
+
+---
+
+## Unreleased — `wp-hardening.sh nginx-snippet`
+
+Generates reverse-proxy configuration from this VM's real values — admin CIDR,
+extra allowed IP, login slug, VM address — rather than documenting a template
+to transcribe. A snippet copied by hand with one value wrong is worse than
+none, because it looks configured.
+
+Three things it does that the VM cannot do for itself:
+
+- **Restricts the admin paths at nginx.** Apache only knows the client address
+  because a header told it; nginx is the edge, so `$remote_addr` *is* the
+  client. There is no substitution step to fail silently. Both layers are kept
+  — they fail independently, which is the point of having two.
+- **Replaces `X-Forwarded-For` instead of appending.** NPM defaults to
+  `$proxy_add_x_forwarded_for`, which appends to whatever the client sent, so a
+  forged header arrives as `<forged>, <real>`. mod_remoteip should still choose
+  correctly, but only while `RemoteIPTrustedProxy` is exactly right. Replacing
+  removes the class rather than relying on the walk being correct.
+- **Rate-limits logins at the edge**, before a request costs a WordPress
+  bootstrap. This is the only control in the whole system that holds when
+  everything downstream is misconfigured, because it never touches
+  `X-Forwarded-For`.
+
+The output ends by stating what it does **not** fix: the login guard, CrowdSec
+and GeoIP still identify clients from the header, so they still depend on
+mod_remoteip working. The snippet makes that header trustworthy; it does not
+remove the dependency.
+
+**Caught by an existing check while writing it.**
+`test/check-param-expansion.py` flagged
+`/${_slug:-wp-login.php}${_slug:+-login}` in the new code. That instance is
+actually correct — `:-` supplies the default, `:+` adds a suffix — but it is
+the same shape as a bug fixed two entries earlier, and confirming it requires
+reasoning about expansion semantics. Rewritten as an explicit `if`. A checker
+firing on a correct-but-confusing construct is doing its job; suppressing it
+would have been the wrong response.
+
+---
+
+## Unreleased — `$(grep -c ...) || echo 0` produced "0\\n0" in five places
+
+Caught by testing the remoteip detection I had just written, against data I
+made up:
+
+```
+bash: line 9: [: too many arguments
+```
+
+`grep -c` always prints a count and exits 1 *only when that count is zero*.
+So `n=$(grep -c pattern file || echo 0)` yields the string `"0\n0"` on
+no-match, and every arithmetic test on it dies — at exactly the moment the
+count is zero, which is usually the healthy case. The bug hides until
+something is working.
+
+Five instances, all written the same way, because the wrong idiom reads
+naturally. Fixed to `n=$(grep -c ...) || n=0`, which assigns on failure
+instead of appending. Added `test/check-grep-count.py`; `sh -n` passes the
+broken form, since it is valid shell that only misbehaves at runtime.
+
+**Also hardened the same check while there.** It matched
+`interpreted=<ip> ` with a trailing space, which is present in the current log
+format — meaning a format change would silently turn the check into "always
+passes". Now anchored with `( |$)`, which also stops `192.168.100.11` matching
+`192.168.100.112`. Verified against both cases.
+
+---
+
+## Unreleased — The same root cause silently defeats three more controls
+
+Asked by the operator after the wp-admin fix: does a mod_remoteip failure
+affect the login guard and CrowdSec too? It does, and the login-guard case is
+worse than the one already fixed.
+
+**One root cause, four symptoms.** Everything that identifies a client keys off
+the address mod_remoteip is responsible for substituting:
+
+| Control | What a failure does |
+|---|---|
+| wp-admin restriction | allowed everyone (fixed in the previous entry — now fails closed) |
+| **Login rate limiting** | every visitor shares one counter. **Five failed logins from anyone locks out every user.** An attacker does not need to guess a password to take the site down; they need to guess wrong, five times |
+| **CrowdSec** | bans the proxy at nftables — a site-wide outage for every visitor. Or, if the proxy is whitelisted (which the installer suggests), detects nothing at all |
+| **GeoIP** | sees an RFC1918 address, which the local-IP exemption allows, so country filtering does nothing |
+
+Each of these looks like it is working. None of them reports anything.
+
+**Neither failing open nor failing closed is right for the rate limiter.**
+Without a client identity, per-client limiting is not possible; locking
+everyone out *is* the denial of service. So the limiter keeps working — some
+limit beats none — and the condition is now logged on every occurrence as
+`REMOTEIP-BROKEN`, with the specific consequence spelled out, so it is
+discoverable rather than invisible.
+
+**`validate-wordpress.sh` now checks the root cause once, explicitly**, rather
+than leaving four separate oddities to be correlated: it reads
+`remoteip-debug.log`, counts requests where `peer` and `interpreted` are both
+the proxy, and fails with the full list of what that breaks. It also fails if
+the login guard has ever logged `REMOTEIP-BROKEN`.
+
+The general lesson worth recording: four controls depended on one mechanism,
+and nothing verified that mechanism was working. Layered defences that share
+an unchecked dependency are not four layers.
+
+---
+
+## Unreleased — SECURITY: wp-admin restriction could fail OPEN
+
+Found by the operator testing from a phone on cellular data: the login page
+was reachable from an address in no allow list. That should have been a 403.
+
+**Cause.** With a reverse proxy in front, every request arrives from the
+proxy's address, and `mod_remoteip` is what substitutes the real client. If it
+does not apply — module absent, header not sent, or the connection arriving
+from an address other than the declared `RemoteIPTrustedProxy` — Apache
+evaluates the rules against the **proxy's** address.
+
+And a proxy on the LAN is normally inside the operator's own admin CIDR.
+Here, `192.168.100.112` sits inside `192.168.100.0/24`. So the failure did not
+deny everyone, which would have been noticed within minutes. It **allowed
+everyone**, and looked exactly like a working configuration.
+
+That is the worst shape a security control can fail in: silently, in the
+permissive direction, while continuing to report success. Every other check in
+this project passed throughout — because they verify the rule is *present*,
+not that it *excludes* anything.
+
+**Fixed** by emitting `Require not ip <proxy>` inside a `RequireAll` whenever a
+proxy is configured. When `mod_remoteip` works, the client is the real
+visitor, never the proxy, so this passes and the allow-list decides as
+intended. When it fails, the client *is* the proxy, this fails, and the
+request is denied. The control now breaks toward locked-out instead of
+wide-open.
+
+Consequence, documented at the prompt: WordPress can no longer be administered
+from a shell on the proxy host itself. That is a fair trade for the
+restriction meaning what it claims.
+
+**Also added, because the fix should not be the only thing standing between
+this and a repeat:**
+
+- The installer detects when the proxy address falls inside the admin CIDR and
+  explains why that combination is dangerous, rather than leaving it as an
+  implicit property of two separately-sensible answers.
+- `wp-hardening.sh proxy-check` now greps the live config for the deny rule and
+  reports its absence directly, instead of leaving the operator to infer it —
+  and tells them the test that actually proves it: browse the login page from
+  a phone on mobile data and expect 403.
+
+Worth recording plainly: this shipped through four security evaluations and
+every automated check in the repository. It took someone opening the site on
+their phone. Configuration-dependent failures like this one — where two
+individually correct answers combine badly — are not something static analysis
+finds.
+
+---
+
 ## Unreleased — Off-VM backups can be encrypted (age, public-key mode)
 
 Flagged as a consideration when off-VM backup was designed and not implemented

@@ -307,9 +307,9 @@ show_status() {
 # syslog (not stdout mail) when something is pending, matching how every
 # other scheduled job on this VM reports.
 check_quiet() {
-  _n_plug=$(_wp plugin list --update=available --field=name 2>/dev/null | grep -c . || echo 0)
-  _n_theme=$(_wp theme list --update=available --field=name 2>/dev/null | grep -c . || echo 0)
-  _core=$(_wp core check-update --field=version --format=csv 2>/dev/null | grep -c . || echo 0)
+  _n_plug=$(_wp plugin list --update=available --field=name 2>/dev/null | grep -c .) || _n_plug=0
+  _n_theme=$(_wp theme list --update=available --field=name 2>/dev/null | grep -c .) || _n_theme=0
+  _core=$(_wp core check-update --field=version --format=csv 2>/dev/null | grep -c .) || _core=0
   if [ "${_n_plug:-0}" -gt 0 ] || [ "${_n_theme:-0}" -gt 0 ] || [ "${_core:-0}" -gt 0 ]; then
     _msg="WordPress updates pending: ${_n_plug} plugin(s), ${_n_theme} theme(s)"
     [ "${_core:-0}" -gt 0 ] && _msg="${_msg}, core update available"
@@ -387,7 +387,14 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
     done
   done
 
-  _hits=$( [ -f "$VULN_CACHE/.hits.$$" ] && sort -u "$VULN_CACHE/.hits.$$" | grep -c . || echo 0 )
+  # `grep -c` prints its count AND exits 1 when that count is zero, so
+  # `$(grep -c ...) || echo 0` yields "0\n0" and the arithmetic test below
+  # dies with "too many arguments". Assign on failure instead of appending.
+  if [ -f "$VULN_CACHE/.hits.$$" ]; then
+    _hits=$(sort -u "$VULN_CACHE/.hits.$$" | grep -c .) || _hits=0
+  else
+    _hits=0
+  fi
   rm -f "$VULN_CACHE/.hits.$$"
 
   # Opt-in sources. Queried per-slug, which is why they are opt-in and not the
