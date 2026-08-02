@@ -369,6 +369,40 @@ echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache 
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
 PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
 
+# Offer to lock port 80/443 to the proxy now that its address is known.
+# The Web CIDR question is asked earlier, before this answer exists, so
+# without this the operator has to already know the proxy IP at that point --
+# and the single best answer to that question is exactly this address.
+if [[ -n "$PROXY_IP" && -z "$WEB_CIDR" ]]; then
+  echo ""
+  echo -e "  ${BLD}Restrict web traffic to this proxy only?${CL}"
+  echo -e "  ${YW}You said earlier that ports 80/443 accept any source. Now that${CL}"
+  echo -e "  ${YW}the proxy address is known, they can be narrowed to it alone.${CL}"
+  _sec_head
+  echo -e "  ${YW}  It stops anyone reaching the site by its IP and bypassing the${CL}"
+  echo -e "  ${YW}  proxy entirely — which also bypasses whatever the proxy does:${CL}"
+  echo -e "  ${YW}  TLS termination, its own rate limits, its access rules, and${CL}"
+  echo -e "  ${YW}  the X-Forwarded-For header this VM relies on to see real${CL}"
+  echo -e "  ${YW}  client addresses. Without it, the proxy is the front door and${CL}"
+  echo -e "  ${YW}  the VM's own IP is an unlocked side door.${CL}"
+  echo -e "  ${YW}  Two consequences worth knowing before you say yes:${CL}"
+  echo -e "  ${YW}    • You can no longer test by browsing to the VM's IP. Every${CL}"
+  echo -e "  ${YW}      check has to go through the domain.${CL}"
+  echo -e "  ${YW}    • If the proxy's address ever changes, the site goes dark${CL}"
+  echo -e "  ${YW}      until this rule is updated — the failure is silent, at${CL}"
+  echo -e "  ${YW}      the packet level, with no error page to explain it.${CL}"
+  echo -e "  ${YW}  Fix either from the console: wp-hardening.sh (or edit${CL}"
+  echo -e "  ${YW}  /etc/nftables.nft and reload).${CL}"
+  _sec_note
+  read -rp "  Restrict 80/443 to ${PROXY_IP} only? [y/N] : " _WLOCK
+  case "${_WLOCK}" in
+    y|Y|yes|YES) WEB_CIDR="${PROXY_IP}"
+      msg_ok "Web ports restricted to ${PROXY_IP} — the VM's IP is no longer directly reachable" ;;
+    *) msg_ok "Web ports remain open to any source (the proxy is the intended path, not the enforced one)" ;;
+  esac
+  unset _WLOCK
+fi
+
 # ── CrowdSec whitelist ────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BLD}CrowdSec whitelist — addresses that must never be banned${CL}"
@@ -752,6 +786,184 @@ case "${_CLAM}" in
   *) msg_ok "ClamAV skipped — structural, core-integrity, YARA and database layers still run" ;;
 esac
 unset _CLAM
+
+# ── Off-VM backup ────────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Copy backups off this VM?${CL}"
+echo -e "  ${YW}Nightly database backups are written to this VM's own disk. That${CL}"
+echo -e "  ${YW}covers a bad update or a dropped table. It does not cover losing${CL}"
+echo -e "  ${YW}the VM, the disk, or the hypervisor — and it does not cover${CL}"
+echo -e "  ${YW}someone deleting the backups along with everything else.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  Sending a copy elsewhere protects against disk failure, a lost${CL}"
+echo -e "  ${YW}  VM, and a bad restore. That alone is worth doing.${CL}"
+echo -e "  ${YW}  It does NOT by itself protect against an attacker who gets root${CL}"
+echo -e "  ${YW}  here, because this VM must hold a credential that can reach the${CL}"
+echo -e "  ${YW}  destination — so they can reach it too. Encrypting the site and${CL}"
+echo -e "  ${YW}  then wiping the backups is the standard pattern, not an exotic${CL}"
+echo -e "  ${YW}  one.${CL}"
+echo -e "  ${YW}  What closes that gap is an APPEND-ONLY destination: a key that${CL}"
+echo -e "  ${YW}  can add files but not delete them.${CL}"
+echo -e "  ${YW}    SSH : command=\"rrsync -no-del /path\",restrict in authorized_keys${CL}"
+echo -e "  ${YW}    S3  : deny s3:DeleteObject, enable Versioning + Object Lock${CL}"
+echo -e "  ${YW}  You are asked below whether you have done that. Answering${CL}"
+echo -e "  ${YW}  honestly matters more than answering yes — the status output${CL}"
+echo -e "  ${YW}  tells you which kind of protection you actually have.${CL}"
+echo -e "  ${YW}  The credential is stored root-only, so WordPress (uid 33)${CL}"
+echo -e "  ${YW}  cannot read it. A web-app compromise alone does not reach it.${CL}"
+_sec_note
+OFFSITE_METHOD="none"; OFFSITE_DEST=""; OFFSITE_KEY_PATH=""
+OFFSITE_RCLONE_CONF=""; OFFSITE_APPEND_ONLY="unknown"; OFFSITE_RETAIN="14"
+read -rp "  Copy backups off this VM? [y/N] : " _OFF
+case "${_OFF}" in
+  y|Y|yes|YES)
+    echo ""
+    echo -e "  ${YW}  scp     simplest. Needs only an SSH key and a remote path.${CL}"
+    echo -e "  ${YW}  rsync   same transport, resumes interrupted transfers.${CL}"
+    echo -e "  ${YW}          Better over a slow or unreliable link.${CL}"
+    echo -e "  ${YW}  rclone  S3, B2, Wasabi, and ~40 other providers, plus SFTP.${CL}"
+    echo -e "  ${YW}          Choose this for object storage. Needs an rclone${CL}"
+    echo -e "  ${YW}          config file you have already created and tested.${CL}"
+    read -rp "  Method? [scp/rsync/rclone] : " _OM
+    case "${_OM}" in
+      rsync)  OFFSITE_METHOD="rsync" ;;
+      rclone) OFFSITE_METHOD="rclone" ;;
+      scp)    OFFSITE_METHOD="scp" ;;
+      *)      OFFSITE_METHOD="none"; msg_warn "  Unrecognised method — off-VM backup skipped." ;;
+    esac
+    if [[ "$OFFSITE_METHOD" == "scp" || "$OFFSITE_METHOD" == "rsync" ]]; then
+      echo -e "  ${YW}  Destination as user@host:/path — the remote directory must${CL}"
+      echo -e "  ${YW}  already exist and be writable by that user.${CL}"
+      read -rp "  Destination (user@host:/path) : " OFFSITE_DEST
+      echo -e "  ${YW}  Path to a private key THIS host will use. It is copied onto${CL}"
+      echo -e "  ${YW}  the VM as 0400 root-only. Use a key dedicated to backups,${CL}"
+      echo -e "  ${YW}  not your admin key — this one lives on a machine that${CL}"
+      echo -e "  ${YW}  faces the internet.${CL}"
+      read -rp "  SSH private key path on THIS Proxmox host : " OFFSITE_KEY_PATH
+      [[ -r "$OFFSITE_KEY_PATH" ]] || { msg_warn "  Cannot read ${OFFSITE_KEY_PATH} — off-VM backup skipped."; OFFSITE_METHOD="none"; }
+    elif [[ "$OFFSITE_METHOD" == "rclone" ]]; then
+      echo -e "  ${YW}  Destination as remote:bucket/path, using a remote name from${CL}"
+      echo -e "  ${YW}  your rclone config.${CL}"
+      read -rp "  Destination (remote:bucket/path) : " OFFSITE_DEST
+      read -rp "  rclone.conf path on THIS Proxmox host : " OFFSITE_RCLONE_CONF
+      [[ -r "$OFFSITE_RCLONE_CONF" ]] || { msg_warn "  Cannot read ${OFFSITE_RCLONE_CONF} — off-VM backup skipped."; OFFSITE_METHOD="none"; }
+    fi
+    if [[ "$OFFSITE_METHOD" != "none" ]]; then
+      read -rp "  Remote copies to keep [14] : " _OR
+      case "${_OR}" in ''|*[!0-9]*) OFFSITE_RETAIN=14 ;; *) OFFSITE_RETAIN="$_OR" ;; esac
+      echo ""
+      echo -e "  ${YW}  Is the destination append-only — can this key ADD backups${CL}"
+      echo -e "  ${YW}  but NOT delete or overwrite them? Answer no if unsure; it${CL}"
+      echo -e "  ${YW}  only changes what the status output claims, and claiming${CL}"
+      echo -e "  ${YW}  protection you do not have is the failure worth avoiding.${CL}"
+      echo ""
+      echo -e "  ${BLD}Encrypt backups before they leave this VM?${CL}"
+      echo -e "  ${YW}A database dump is not an opaque blob. It contains every${CL}"
+      echo -e "  ${YW}user's password hash, email and real name, private and draft${CL}"
+      echo -e "  ${YW}post content, and whatever plugins have written into${CL}"
+      echo -e "  ${YW}wp_options — API keys, form submissions, order records.${CL}"
+      echo -e "  ${YW}Unencrypted, your storage provider has all of it, and so${CL}"
+      echo -e "  ${YW}does anyone who reaches that bucket.${CL}"
+      echo ""
+      _sec_head
+      echo -e "  ${YW}  Encryption uses age in PUBLIC-KEY mode, and that is the${CL}"
+      echo -e "  ${YW}  point rather than a detail: this VM holds only the public${CL}"
+      echo -e "  ${YW}  half. It can encrypt backups and cannot read them — not${CL}"
+      echo -e "  ${YW}  the ones it sends, and not the ones already stored. An${CL}"
+      echo -e "  ${YW}  attacker with root here cannot read your backups even${CL}"
+      echo -e "  ${YW}  though they can create them.${CL}"
+      echo -e "  ${YW}  With an append-only destination they can neither read${CL}"
+      echo -e "  ${YW}  what is there nor delete it.${CL}"
+      echo -e "  ${RD}  THE COST IS REAL: lose the private key and every encrypted${CL}"
+      echo -e "  ${RD}  backup is gone for good. An encrypted backup nobody can${CL}"
+      echo -e "  ${RD}  decrypt is not a backup. Keep the private key somewhere${CL}"
+      echo -e "  ${RD}  that is neither this VM nor the storage bucket, and test${CL}"
+      echo -e "  ${RD}  a decrypt NOW rather than during an incident.${CL}"
+      echo -e "  ${YW}  The LOCAL backup stays unencrypted on purpose: it never${CL}"
+      echo -e "  ${YW}  leaves the host, and keeping it readable is what lets the${CL}"
+      echo -e "  ${YW}  weekly self-test prove a restore actually works.${CL}"
+      echo -e "  ${YW}  Generate a key on your workstation, not here:${CL}"
+      echo -e "  ${YW}    age-keygen -o wasp-backup-key.txt${CL}"
+      echo -e "  ${YW}  Paste the 'Public key: age1...' line below.${CL}"
+      _sec_note
+      OFFSITE_AGE_RECIPIENT=""
+      while :; do
+        read -rp "  age public key (age1..., blank = no encryption) : " OFFSITE_AGE_RECIPIENT
+        [[ -z "$OFFSITE_AGE_RECIPIENT" ]] && {
+          msg_warn "  Backups will leave this VM UNENCRYPTED."
+          msg_warn "  Acceptable only if the destination is hardware you control."
+          break; }
+        # An age recipient is age1 followed by bech32. Checking the shape stops
+        # a private key or a truncated paste being accepted as a recipient --
+        # which would fail at 02:00 rather than here.
+        if printf '%s' "$OFFSITE_AGE_RECIPIENT" | grep -qE '^age1[0-9a-z]{50,}$'; then
+          msg_ok "Off-VM backups will be encrypted to ${OFFSITE_AGE_RECIPIENT:0:16}…"
+          msg_warn "  Verify you can decrypt with the matching private key BEFORE relying on this."
+          break
+        fi
+        if printf '%s' "$OFFSITE_AGE_RECIPIENT" | grep -q 'AGE-SECRET-KEY'; then
+          msg_warn "  That is a PRIVATE key. Never put it on this VM — the whole"
+          msg_warn "  point is that a compromise here cannot read your backups."
+          msg_warn "  Paste the 'Public key: age1...' line instead."
+        else
+          msg_warn "  Doesn't look like an age public key (expected age1...)."
+        fi
+      done
+      read -rp "  Destination is append-only? [y/N] : " _OAO
+      case "${_OAO}" in y|Y|yes|YES) OFFSITE_APPEND_ONLY="yes" ;; *) OFFSITE_APPEND_ONLY="no" ;; esac
+      msg_ok "Off-VM backup: ${OFFSITE_METHOD} -> ${OFFSITE_DEST} (keep ${OFFSITE_RETAIN})"
+      [[ "$OFFSITE_APPEND_ONLY" == "no" ]] && \
+        msg_warn "  Not append-only: this protects against loss, not against an attacker with root here."
+      msg_info "  Test it after install:  wasp-offsite-backup.sh test"
+    fi ;;
+  *) msg_warn "Backups stay on this VM only — they will not survive losing it." ;;
+esac
+unset _OFF _OM _OR _OAO
+
+# ── Governance / compliance address ──────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Governance email (vulnerability exception notices)${CL}"
+echo -e "  ${YW}Accepting a HIGH or CRITICAL vulnerability finding in order to${CL}"
+echo -e "  ${YW}update is sometimes the right call — the fix may not exist yet.${CL}"
+echo -e "  ${YW}What must not happen is that it is a private decision nobody${CL}"
+echo -e "  ${YW}else ever sees.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  Accepting a finding requires a written justification, which is${CL}"
+echo -e "  ${YW}  recorded on the VM and emailed here. The exception is tied to${CL}"
+echo -e "  ${YW}  the exact image digest and expires — by default after 90 days${CL}"
+echo -e "  ${YW}  — so it cannot quietly become permanent policy.${CL}"
+echo -e "  ${YW}  Send it somewhere OTHER than the operator who accepts them,${CL}"
+echo -e "  ${YW}  where possible. A record that only the person making the${CL}"
+echo -e "  ${YW}  decision receives is a diary, not oversight.${CL}"
+echo -e "  ${YW}  The local log is the record; the email is a copy. Mail can${CL}"
+echo -e "  ${YW}  fail, and an audit trail that depends on delivery is not one.${CL}"
+_sec_note
+GOVERNANCE_EMAIL=""
+_gov_default="${WP_ADMIN_EMAIL:-}"
+while :; do
+  if [[ -n "$_gov_default" ]]; then
+    read -rp "  Governance email [${_gov_default}] : " GOVERNANCE_EMAIL
+    GOVERNANCE_EMAIL="${GOVERNANCE_EMAIL:-$_gov_default}"
+  else
+    read -rp "  Governance email (blank = local log only) : " GOVERNANCE_EMAIL
+  fi
+  [[ -z "$GOVERNANCE_EMAIL" ]] && {
+    msg_warn "No governance address — exceptions are logged on the VM only."
+    msg_warn "  /var/log/wasp-vuln-exceptions.log"
+    break; }
+  if printf '%s' "$GOVERNANCE_EMAIL" | grep -qE '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'; then
+    msg_ok "Exception notices go to: ${GOVERNANCE_EMAIL}"
+    [[ "$GOVERNANCE_EMAIL" == "${WP_ADMIN_EMAIL:-}" ]] && \
+      msg_warn "  Same as the admin address — consider a separate mailbox so the"
+    [[ "$GOVERNANCE_EMAIL" == "${WP_ADMIN_EMAIL:-}" ]] && \
+      msg_warn "  person accepting a risk is not the only person told about it."
+    break
+  fi
+  msg_warn "  '${GOVERNANCE_EMAIL}' doesn't look like an email address."
+done
+unset _gov_default
 
 # ── Wordfence Intelligence API key ───────────────────────────────────────────
 echo ""

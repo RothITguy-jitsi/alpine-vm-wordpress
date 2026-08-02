@@ -108,6 +108,26 @@ fi
 rm -f "${BACKUP_RAW}" "${BACKUP_RAW}.err" 2>/dev/null || true
 logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -f1))"
 
+# Replicate off this VM. Deliberately AFTER the local backup is verified and
+# rotation has run: a copy of a backup that failed verification is not worth
+# sending, and a push failure must not prevent a good local backup from being
+# kept. A failure here is reported and does not fail the local backup.
+if [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
+  if /usr/local/bin/wasp-offsite-backup.sh push "${BACKUP_FILE}" >/tmp/.offsite.log 2>&1; then
+    logger -t wp-db-backup "off-VM copy sent and size-verified"
+  else
+    logger -t wp-db-backup "OFF-VM COPY FAILED — the local backup is fine, the remote copy is not"
+    sed 's/^/  /' /tmp/.offsite.log 2>/dev/null | logger -t wp-db-backup
+    if [ -x /usr/local/bin/wp-notify.sh ]; then
+      # No cooldown: an offsite copy that has been quietly failing is the same
+      # class of problem as a backup that has been quietly failing.
+      NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-offsite \
+        "Off-VM backup copy FAILED" /tmp/.offsite.log
+    fi
+  fi
+  rm -f /tmp/.offsite.log
+fi
+
 # Step 4: rotate ONLY after a new backup passed all three verification
 # gates. If any earlier step failed, we exited above and yesterday's
 # good backup is safe.

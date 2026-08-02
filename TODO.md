@@ -33,10 +33,10 @@ That is fixed: every normal assertion now requires the command to succeed before
 | **Still open (source finding)** | **Status** | **Why it's deferred** |
 | --- | --- | --- |
 | Candidate DB isolation (17) | **DONE (light form)** — candidate runs under a temporary SELECT-only account, dropped on every exit path; `wasp-selftest.sh candidate-isolation` proves the grant refuses writes. Does NOT test migrations — see below | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
-| Production findings approval (14) | Deferred | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
-| Off-VM backup gate (18) | Deferred | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
+| Production findings approval (14) | **DONE** — the y/N override is now a recorded, digest-scoped, expiring exception with a written justification, emailed to a governance address chosen at install | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
+| Off-VM backup gate (18) | **DONE** — optional at install (scp / rsync / rclone), pushed after each verified backup, size-confirmed remotely, and checked weekly by `wasp-selftest.sh`. Append-only destination is prompted for and reported honestly rather than assumed | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
 | Egress restriction (20) | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
-| Trivy installer checksum (15) | Deferred | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
+| Trivy installer checksum (15) | **DONE** — pinned to v0.72.0 with the release checksums file anchored by SHA-256, plus a denylist refusing the known-compromised 0.69.4/0.69.5/0.69.6 builds regardless of install path | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
 | CrowdSec key in argv (21) | Deferred | Eliminating the brief argv exposure depends on whether the installed cscli supports a stdin/fd interface |
 | Backup restoration proof | **DONE** — `wasp-selftest.sh restore-test` restores the newest archive into a throwaway isolated MariaDB and verifies schema, siteurl, users and row counts against production. Weekly | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
 | Full candidate/cutover/rollback harness coverage | **DONE** — cutover proven both directions (6.9.4-php8.3 ↔ php8.4), and rollback proven by fault injection (`test/vm-rollback-test.sh`): forced post-cutover failure, automatic restore to the original image, site healthy, no leftover container | test-wordpress-vm.sh exercises the rollback trigger (section 8) and the backup script (section 7), but not a full "bad candidate → automatic rollback → verified-healthy old version" run end to end. Real hardware and a deliberately-broken candidate image are both needed to build this safely |
@@ -88,6 +88,14 @@ certification gate."* That is a fair summary and worth keeping visible here.
 | No overlap protection on scheduled jobs | `wp-cron-run.sh` and `wp-db-backup.sh` each take a `mkdir`-based lock (matching `update.sh`'s existing convention rather than introducing a second locking style), detect a stale lock from a crashed run via recorded PID + `kill -0`, and log non-zero exits through `logger` instead of failing silently |
 
 ### Still open, with reasoning
+
+**Signed release manifest — MECHANISM NOW IMPLEMENTED, awaiting a key.**
+A maintainer-side tool (not shipped) signs a manifest with minisign; `install.sh`
+verifies signature-then-hashes before sourcing anything;
+`wasp-verify-integrity.sh` re-checks the installed tooling on the VM. What
+remains is a decision only the repository owner can make: generate the key,
+embed the public half in `install.sh`, and publish the fingerprint somewhere
+that is not this repository. Original note follows.
 
 **Signed release manifest (High, raised against four separate files).** This is the
 single most-repeated finding in the evaluation and the most substantial one still

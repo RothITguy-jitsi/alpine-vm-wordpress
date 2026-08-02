@@ -136,6 +136,138 @@ else
   echo "Fetched $(find "$REPO_DIR" -type f | wc -l) files into a temp directory (removed when this script exits)."
 fi
 
+# ── Release signature verification ────────────────────────────────────────────
+# The public key is embedded here rather than fetched, because a key fetched
+# alongside the thing it verifies proves nothing. Publish this fingerprint
+# somewhere that is NOT this repository -- a project site, a release
+# announcement -- so it can be checked against an independent source once.
+# After that, a repository compromise cannot go unnoticed: the attacker would
+# have to change this line too, and anyone who recorded the key sees it.
+#
+# Honest scope: for a first-time user who fetches install.sh and the release
+# from the same place, this is not a root of trust. It is tamper-evidence
+# with a short, checkable identifier -- which is meaningfully better than an
+# unsigned curl|bash, and is not the same as a trusted supply chain.
+WASP_PUBKEY="${WASP_PUBKEY:-RWSi+SUZQWeFKd9yTC3Q7xAEADUph345WdgwOOlxK+dV40GHEqMsFTPc}"    # set to the release key; empty = unsigned build
+
+# Where the key fingerprint is published independently of this repository.
+# The point of a second location is DIFFERENT CREDENTIALS, not merely a
+# different URL: a Gist or a Pages site on the same GitHub account falls to
+# exactly the compromise this is meant to make visible. A DNS record is held
+# at the registrar, which is a separate account entirely.
+WASP_KEY_DNS="${WASP_KEY_DNS:-minisign._wasp.rothitguy.pro}"
+
+# Cross-check the embedded key against that DNS record.
+#
+# HONEST SCOPE, because this is easy to overstate: plain DNS is spoofable by
+# anyone on the network path, so this is CORROBORATION, not a second root of
+# trust. It answers "does the key baked into this file match the one published
+# under separate credentials?" -- which catches a repository compromise that
+# swapped both the release and the embedded key, and catches nothing at all
+# against an attacker who also controls your resolver. With DNSSEC on the zone
+# it is meaningfully stronger. Treat a mismatch as serious and a match as
+# reassuring rather than conclusive.
+verify_key_dns() {
+  [[ -n "$WASP_PUBKEY" ]] || return 0
+  [[ "${WASP_SKIP_KEY_DNS:-0}" == "1" ]] && return 0
+  command -v dig >/dev/null 2>&1 || command -v host >/dev/null 2>&1 || {
+    echo "  (dig/host not present — skipping the DNS key cross-check)"; return 0; }
+
+  local published=""
+  if command -v dig >/dev/null 2>&1; then
+    published=$(dig +short +timeout=5 +tries=2 TXT "$WASP_KEY_DNS" 2>/dev/null \
+                | tr -d '"' | tr -d '\r' | grep -E '^RW' | head -1)
+  else
+    published=$(host -t TXT "$WASP_KEY_DNS" 2>/dev/null \
+                | sed -n 's/.*"\(RW[^"]*\)".*/\1/p' | head -1)
+  fi
+
+  if [[ -z "$published" ]]; then
+    # Not fatal: the record may not be published yet, DNS may be filtered, or
+    # the host may have no outbound resolver. Saying so is more useful than
+    # failing on an absence that has many innocent causes.
+    echo "  No key record at ${WASP_KEY_DNS} — cross-check skipped."
+    return 0
+  fi
+  if [[ "$published" == "$WASP_PUBKEY" ]]; then
+    echo "  ✔ Embedded key matches the one published at ${WASP_KEY_DNS}"
+    return 0
+  fi
+  echo "" >&2
+  echo "  ✗ KEY MISMATCH." >&2
+  echo "      embedded in install.sh : ${WASP_PUBKEY}" >&2
+  echo "      published in DNS       : ${published}" >&2
+  echo "" >&2
+  echo "  These should be identical. Either the release key was rotated and" >&2
+  echo "  this copy of install.sh is stale, or this copy of install.sh did not" >&2
+  echo "  come from the project. Do not proceed until you know which." >&2
+  echo "  Check independently: https://rothitguy.pro/wasp-signing-key/" >&2
+  if [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
+    echo "  FATAL: WASP_REQUIRE_SIGNATURE=1." >&2; exit 1
+  fi
+  # Not fatal by default: a stale checkout after a legitimate key rotation
+  # would otherwise brick every install, and the signature check below is the
+  # control that actually decides whether these files are authentic.
+  printf "  Continue anyway? [y/N] : " >&2
+  read -r _kc
+  [[ "${_kc}" =~ ^[Yy] ]] || { echo "  Aborted." >&2; exit 1; }
+}
+
+verify_release() {
+  local dir="$1"
+  local man="${dir}/MANIFEST.sha256"
+  local sig="${man}.minisig"
+
+  if [[ -z "$WASP_PUBKEY" ]]; then
+    echo "NOTE: this build is unsigned (no release key configured)." >&2
+    echo "  Files were fetched over HTTPS but their contents are not verified." >&2
+    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && {
+      echo "FATAL: WASP_REQUIRE_SIGNATURE=1 and there is no key to verify with." >&2; exit 1; }
+    return 0
+  fi
+  if [[ ! -f "$man" || ! -f "$sig" ]]; then
+    echo "WARNING: no signed manifest in this release." >&2
+    echo "  Expected MANIFEST.sha256 and MANIFEST.sha256.minisig." >&2
+    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && { echo "FATAL: signature required." >&2; exit 1; }
+    return 0
+  fi
+  if ! command -v minisign >/dev/null 2>&1; then
+    # Deliberately not silently downgraded to "hashes only": hashes from an
+    # unverified manifest catch corruption, not tampering, and reporting that
+    # as verification would be worse than reporting nothing.
+    echo "WARNING: minisign is not installed, so the release SIGNATURE cannot be checked." >&2
+    echo "  Install it and re-run to verify:  apt install minisign" >&2
+    [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]] && { echo "FATAL: signature required." >&2; exit 1; }
+    return 0
+  fi
+
+  verify_key_dns
+  echo "Verifying release signature…"
+  local out
+  if ! out=$(minisign -Vm "$man" -P "$WASP_PUBKEY" 2>&1); then
+    echo "FATAL: the release manifest signature is NOT valid." >&2
+    echo "  ${out}" >&2
+    echo "  Either this release was not signed with the expected key, or the" >&2
+    echo "  files were altered after signing. Not proceeding." >&2
+    exit 1
+  fi
+  # The trusted comment is covered by the signature, so the version it names
+  # cannot be forged without the secret key.
+  echo "  ${out}" | grep -i "trusted comment" || true
+
+  echo "Verifying file hashes against the signed manifest…"
+  local bad=0
+  ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) || bad=1
+  if [[ $bad -ne 0 ]]; then
+    echo "FATAL: a file does not match the signed manifest." >&2
+    echo "  The signature was valid, so the manifest itself is authentic —" >&2
+    echo "  which means a shipped file was modified after signing." >&2
+    exit 1
+  fi
+  echo "  All files match the signed manifest."
+}
+verify_release "$REPO_DIR"
+
 LIB_DIR="${REPO_DIR}/lib"
 
 # ── Run each phase in order, in THIS shell (so every variable set by one ────

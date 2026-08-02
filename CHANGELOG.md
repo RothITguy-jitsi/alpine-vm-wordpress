@@ -6,6 +6,256 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Off-VM backups can be encrypted (age, public-key mode)
+
+Flagged as a consideration when off-VM backup was designed and not implemented
+then. It matters more than usual here: a WordPress dump carries every user's
+password hash, email and real name, private and draft post content, and
+whatever plugins wrote into `wp_options` — API keys, form submissions, order
+records. Unencrypted in third-party object storage, the provider has all of
+it, and so does anyone who reaches the bucket.
+
+**age in public-key mode, and the mode is the point.** The VM holds only the
+recipient (public) key, so it can encrypt backups and cannot read them — not
+the ones it sends, and not the ones already at the destination. An attacker
+with root on this VM can create backups but decrypt none of them. That
+composes with the append-only destination: they can neither read what is
+stored nor delete it.
+
+The installer rejects an `AGE-SECRET-KEY` if one is pasted by mistake and
+explains why, since putting the private half on the VM would discard the whole
+property while appearing to work.
+
+**Two deliberate limits, both stated at the prompt rather than in docs alone:**
+
+- **The local backup stays unencrypted.** It never leaves the host, and
+  keeping it readable is what lets `wasp-selftest.sh` prove a restore actually
+  works. Encrypting the copy that leaves your control while keeping the one
+  that does not preserves both properties; encrypting both would trade a
+  working restore proof for protection the VM boundary already provides.
+- **Losing the private key destroys every encrypted backup.** An encrypted
+  backup nobody can decrypt is not a backup. That warning is in red at the
+  prompt, and `restore-help` exists to make testing a decrypt an obvious thing
+  to do before it is needed rather than during an incident.
+
+If `age` cannot be installed, the upload **refuses** rather than sending
+plaintext. A silent downgrade from "encrypted offsite backup" to "the entire
+database in someone else's bucket" is not an acceptable failure.
+
+Verification accounts for the ciphertext: the `.age` artifact is what gets
+uploaded and what the remote size is compared against, since comparing a
+remote ciphertext to a local plaintext would mismatch every time.
+
+---
+
+## Unreleased — Off-VM backup, and the web restriction made usable
+
+**Off-VM backup, optional at install:** `scp`, `rsync` or `rclone` (S3, B2,
+Wasabi, ~40 providers). Pushed after each *verified* nightly backup — after
+verification and rotation deliberately, since a copy of a backup that failed
+its own checks is not worth sending, and a push failure must not stop a good
+local backup being kept. The remote copy's **size is read back and compared**
+rather than trusting the transport's exit status; a silently truncated upload
+looks fine until a restore. `wasp-selftest.sh` now also fails if the newest
+backup is missing remotely.
+
+The point given most prominence is not the transport. This VM must hold a
+credential that can reach the destination, so an attacker with root here can
+reach it too — encrypting a site and then wiping its backups is the standard
+pattern, not an exotic one. Off-VM copying protects against disk failure and
+losing the VM; **append-only** destinations are what protect against malice.
+The installer asks whether the destination is append-only and `status` reports
+which protection is actually in place, because claiming the stronger one
+without having it is worse than claiming neither. `prune` failing against a
+correctly append-only destination is documented as correct rather than as a
+fault to fix by granting delete rights.
+
+Credentials are root-owned `0400`; WordPress runs as uid 33 and cannot read
+them, so a web-application compromise alone does not reach the backup
+destination. The destination's SSH host key is captured at install from the
+Proxmox host so the VM can use `StrictHostKeyChecking=yes` — for a backup
+target, `accept-new` would let a MITM silently receive every database dump.
+
+**"Restrict Web (80/443) to a CIDR?" — the operator's reasoning was right.**
+Pointing it at the reverse proxy's address is the best answer to that
+question, not a misunderstanding: it stops anyone reaching the site by its IP
+and bypassing the proxy, which also bypasses TLS termination, the proxy's own
+rules, and the `X-Forwarded-For` header this VM depends on to see real client
+addresses.
+
+The problem was ordering. The question is asked before the proxy IP is known,
+so answering it well required knowing that address in advance. The installer
+now offers to narrow 80/443 to the proxy immediately after collecting it, and
+states both consequences plainly: the VM's IP can no longer be browsed
+directly for testing, and if the proxy's address ever changes the site goes
+dark silently at the packet level with no error page — which the operator had
+just experienced from the other direction with a NAT forward.
+
+---
+
+## Unreleased — Vulnerability exception governance, and Trivy pinned
+
+**Trivy pinned to v0.72.0, anchored by checksum, with a denylist.**
+Researching the current release surfaced why this item mattered more than it
+looked: Trivy's distribution was compromised **twice** in 2026 — a repository
+takeover on 28 February, then on 19 March a credential stealer injected into
+`trivy-action` and `setup-trivy` and **a malicious binary published as
+v0.69.4 for about three hours**. On 22 March the `aquasec/trivy` 0.69.5 and
+0.69.6 Docker Hub images were also found to contain the attacker's C2 domain.
+
+A version pin alone would not have saved anyone who happened to pin 0.69.4.
+The release's own `checksums.txt` is now anchored by a SHA-256 recorded in the
+stage file, out of band from the download, and the binary is verified against
+that. A denylist additionally refuses 0.69.4/0.69.5/0.69.6 **whichever path
+installed them**, including apk — a distribution package built from a poisoned
+upstream carries the same code. Bumps are manual by design; a stale pinned
+hash fails closed, which is the right direction to fail.
+
+**Vulnerability exceptions are now recorded rather than clicked through.**
+The y/N override became a written justification, and the operator's design was
+extended in two ways that cost nothing at the prompt:
+
+- **Digest-scoped.** The exception records the exact image digest and is only
+  honoured for that digest. Accepting a finding on one image must not silently
+  carry to the next, which has a different set of vulnerabilities. A blanket
+  "yes" that outlives its subject is how exceptions become policy by accident.
+- **Expiring**, 90 days by default, capped at 365. Without expiry the first
+  person to type a reason decides forever.
+
+An unexpired exception for the same digest is honoured without re-asking —
+re-prompting for a decision already recorded is how people learn to type
+anything to get past a prompt. An expired one says so and must be re-argued.
+Justifications under 15 characters are refused: a low bar that stops "ok" and
+"asdf", not someone determined.
+
+The record is an append-only root-owned log, and the email is explicitly a
+**copy** — mail can fail, and an audit trail that depends on delivery is not
+an audit trail. Notices route to a separate governance address collected at
+install, with a warning if it matches the admin address, because a record only
+the decision-maker receives is a diary rather than oversight.
+
+---
+
+## Unreleased — Release-signing tool removed from the distribution
+
+`wasp-sign-release.sh` is no longer shipped. It only ever runs on the machine
+holding the secret key, so including it in every deployment added attack
+surface without adding any capability there — a script present on hundreds of
+VMs that none of them can use.
+
+Nothing depended on it: the manifest it builds covers `install.sh`, `lib/` and
+`payload/`, and `tools/` was never part of the signed set, so removing it
+changes no hash and invalidates no signature.
+
+**Verification is unaffected and is what users actually need.** The README now
+documents how to check a release independently rather than how to sign one:
+
+```sh
+dig +short TXT minisign._wasp.rothitguy.pro   # key, from a source that is not this repo
+minisign -Vm MANIFEST.sha256 -P "RW..."       # signature
+sha256sum -c MANIFEST.sha256                  # every file against it
+```
+
+One reference in `wasp-verify-integrity.sh` pointed at the tool by path when
+explaining why integrity checking was unavailable; it now describes what a
+signed release contains instead of naming a file that is not there. Earlier
+changelog entries still mention the tool, which is correct — they record what
+happened at the time.
+
+Worth noting for later: since the tool now lives only on the maintainer's
+machine, improvements made here will not reach it. If the signing format or
+the manifest's file selection ever changes, that copy needs updating by hand
+or `install.sh` will reject its output.
+
+---
+
+## Unreleased — install.sh cross-checks the signing key against DNS
+
+The embedded public key answers "was this release signed by the key in this
+file?" — but not "is the key in this file the project's key?" `install.sh` now
+also looks up a TXT record (`minisign._wasp.<domain>` by default) and compares.
+
+The reason a second location helps at all is **different credentials**, not a
+different URL. A Gist or a GitHub Pages site on the same account falls to
+precisely the compromise this is meant to expose; a DNS record lives at the
+registrar, which is a separate login entirely. That reasoning is in the code
+comment, the signing tool's output and the README, because "publish it
+somewhere else" without it invites the useless version.
+
+**Stated as corroboration, not a root of trust.** Plain DNS is spoofable on
+the network path, so this catches a repository compromise that swapped both
+the release and the embedded key, and catches nothing against an attacker who
+also controls the resolver. DNSSEC strengthens it. That caveat is in the
+script rather than only the docs.
+
+Failure handling is deliberately graded: no key, no record, or no `dig`
+skips with a note — an absent record has many innocent causes and failing on
+it would be noise. A genuine **mismatch** warns loudly with both values and
+requires confirmation, and is fatal under `WASP_REQUIRE_SIGNATURE=1`. It is
+not fatal by default because a legitimate key rotation would otherwise brick
+every stale checkout, and the signature check immediately after is the control
+that actually decides authenticity.
+
+`wasp-sign-release.sh --init` now prints the exact TXT record to publish and
+the `dig` command to confirm it, so the fingerprint does not end up published
+only in the repository it is meant to vouch for.
+
+TXT parsing verified against `dig` output (including a zone with other TXT
+records present) and `host` output.
+
+---
+
+## Unreleased — Release signing with minisign
+
+The signed-manifest item has been the largest open blocker since the
+repository was first split, and it was stuck on the wrong thing: I framed it
+as needing GPG, and GPG's keyring and trust model made the bootstrap awkward
+enough that it stayed unimplemented.
+
+minisign removes that. `minisign -Vm file -P <base64-key>` takes the public
+key **on the command line** — no keyring, no trust database, nothing to
+distribute but one line of text — so the key can be embedded directly in
+`install.sh`, the file a user fetches first.
+
+- `tools/wasp-sign-release.sh` builds a SHA-256 manifest of every file
+  `install.sh` executes and signs it. Documentation is deliberately excluded:
+  signing it would mean a README typo invalidates the release, which trains
+  people to ignore failures.
+- The signature carries a **trusted comment** with version and timestamp.
+  minisign's own documentation recommends this specifically to prevent
+  downgrade attacks — a bare signature cannot distinguish a current release
+  from a correctly-signed older one.
+- `install.sh` verifies the signature, then the hashes, before sourcing
+  anything. Failure modes are distinguished rather than collapsed: an invalid
+  signature or a hash mismatch is always fatal; a missing key, missing
+  manifest or absent minisign warns and is fatal only under
+  `WASP_REQUIRE_SIGNATURE=1`. Notably, a missing minisign is **not** silently
+  downgraded to hash-only checking — hashes from an unverified manifest catch
+  corruption, not tampering, and calling that "verified" would be worse than
+  reporting nothing.
+- `wasp-verify-integrity.sh` re-checks the installed tooling on the VM.
+
+That last one is the more valuable half. Verifying a release at install
+catches a tampered download, which is a one-off risk. Verifying the installed
+files catches an attacker with root on the VM editing `update.sh` or the
+malware scanner to disable a control — invisible to every other check here,
+because every other check trusts the scripts it is running. Its limit is
+stated in the script: an attacker with root can edit the checker too, so it
+catches malware that ignores the integrity check rather than one that
+anticipates it.
+
+**The honest scope is documented in three places** rather than only the
+commit message: signing does not bootstrap trust for a first-time user
+fetching `install.sh` and the release from the same repository. It makes
+tampering evident to anyone who recorded the fingerprint, and it forces an
+attacker to need the secret key rather than write access.
+
+Verified the chain end to end: an edited file fails `sha256sum -c`; an
+attacker who also rewrites the manifest defeats the hashes but not the
+signature, so `install.sh` aborts before it ever reads them.
+
+---
+
 ## Unreleased — SMTP credentials are no longer an executable PHP file
 
 A third-party evaluation raised, as High: *"Setup writes executable PHP secret

@@ -6,7 +6,28 @@
 # contents, PAYLOAD_DIR, etc.) that the dispatcher and earlier stages set up.
 
 ts "Installing Trivy vulnerability scanner"
-TRIVY_VER="v0.71.2"
+# Pinned to a specific release, with the release's own checksums file pinned
+# by hash. This is not routine hygiene -- Trivy's distribution was compromised
+# TWICE in 2026:
+#   * 28 Feb 2026 — repository takeover
+#   * 19 Mar 2026 — a malicious binary published as v0.69.4 for ~3 hours, and
+#                   credential-stealing code injected into trivy-action and
+#                   setup-trivy
+#   * 22 Mar 2026 — the aquasec/trivy 0.69.5 and 0.69.6 Docker Hub images were
+#                   also found to contain the attacker's C2 domain
+# A version pin alone would not have helped anyone who happened to pin 0.69.4.
+# Verifying the download against a hash recorded here, out of band from the
+# download itself, is the control that would have.
+TRIVY_VER="v0.72.0"
+# SHA-256 of trivy_0.72.0_checksums.txt from the GitHub release. The binary is
+# then verified against that file, so this single hash anchors the whole
+# download. Re-record it by hand when bumping TRIVY_VER; a stale value fails
+# closed, which is the correct direction to fail.
+TRIVY_CHECKSUMS_SHA256="ebe9d19a774b950e240b1017a038e9b5a002ea068e02023369ff6d241c10c580"
+# Versions known to have shipped attacker-controlled code. Refused no matter
+# how they arrived -- including via apk, since a distro package built from a
+# poisoned upstream would be just as compromised.
+TRIVY_DENYLIST="0.69.4 0.69.5 0.69.6"
 TRIVY_CACHE_DIR="/var/cache/trivy"
 mkdir -p "${TRIVY_CACHE_DIR}"; chmod 755 "${TRIVY_CACHE_DIR}"
 
@@ -37,6 +58,20 @@ fi
 
 if command -v trivy >/dev/null 2>&1; then
   ok "Trivy $(trivy --version 2>/dev/null | head -1) ready"
+# Refuse a known-compromised build regardless of how it got here. Checked
+# after installation rather than only at download time, because the apk path
+# does not go through the checksum verification above and a distribution
+# package built from a poisoned upstream would carry the same code.
+if command -v trivy >/dev/null 2>&1; then
+  _tv=$(trivy --version 2>/dev/null | head -1 | sed -n 's/.*[Vv]ersion:* *v\{0,1\}\([0-9.]*\).*/\1/p')
+  for _bad in $TRIVY_DENYLIST; do
+    if [ "$_tv" = "$_bad" ]; then
+      err "Trivy ${_tv} is a KNOWN-COMPROMISED release (March 2026 supply-chain incident) and contains attacker C2 code. Refusing to use it. Remove it and install ${TRIVY_VER}: apk del trivy"
+    fi
+  done
+  [ -n "$_tv" ] && ok "Trivy ${_tv} is not on the known-compromised list"
+fi
+
   ok "  Pre-seeding vulnerability DB (~100 MB, takes 30-90s)..."
   trivy image --cache-dir "${TRIVY_CACHE_DIR}" --download-db-only --quiet 2>/dev/null \
     && ok "  Trivy DB cached at ${TRIVY_CACHE_DIR}" \

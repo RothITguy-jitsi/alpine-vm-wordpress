@@ -29,6 +29,28 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/wasp-verify-integrity.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
+# Only install what the chosen method needs. rclone is ~50 MB, so it is not
+# pulled onto a VM that will never use it.
+# age is installed only when encryption was actually configured -- and if it
+# cannot be installed, the backup script REFUSES to upload rather than falling
+# back to plaintext. A silent downgrade from "encrypted offsite backup" to
+# "the whole database in someone else's bucket" is not an acceptable failure.
+if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
+  apk add --no-cache age >/dev/null 2>&1 \
+    && ok "age installed — off-VM backups will be encrypted" \
+    || warn "age could not be installed; encrypted off-VM backup will REFUSE to upload rather than send plaintext"
+fi
+case "${OFFSITE_METHOD:-none}" in
+  rsync)  apk add --no-cache rsync openssh-client >/dev/null 2>&1 \
+            && ok "rsync + ssh installed for off-VM backup" ;;
+  scp)    apk add --no-cache openssh-client >/dev/null 2>&1 \
+            && ok "ssh client installed for off-VM backup" ;;
+  rclone) apk add --no-cache rclone >/dev/null 2>&1 \
+            && ok "rclone installed for off-VM backup" \
+            || warn "rclone could not be installed — off-VM backup will not work" ;;
+esac
 # msmtp sends host-side, so alerts still go out when WordPress or MariaDB is
 # down -- which is exactly when an alert matters. Credentials are read from
 # the same smtp.ini the mu-plugin uses; no second config file is written.

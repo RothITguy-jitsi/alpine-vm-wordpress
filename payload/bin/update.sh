@@ -494,6 +494,107 @@ setup_trivy() {
   fi
 }
 
+# ── Vulnerability exception governance ───────────────────────────────────────
+# Replaces a bare y/N. A yes/no leaves no record of WHO accepted WHAT, WHY, or
+# WHEN it should be revisited -- so an accepted CVE silently becomes permanent
+# and nobody can later reconstruct the decision.
+#
+# The design goes slightly beyond "type a reason and email it", at no extra
+# cost to the operator, because a reason alone still has two gaps:
+#
+#   SCOPE   The exception records the exact IMAGE DIGEST and is only honoured
+#           for that digest. Accepting a finding on one image must not silently
+#           carry over to the next image, which will have a different set of
+#           vulnerabilities. A blanket "yes" that outlives its subject is how
+#           exceptions become policy by accident.
+#   EXPIRY  Exceptions expire (default 90 days) and then have to be re-argued.
+#           Without this, the first person to type a reason decides forever.
+#
+# The record is append-only and root-owned; the email is a copy, not the
+# record, because mail can fail and an audit trail that depends on delivery is
+# not an audit trail.
+trivy_exception() {
+  local img="$1"
+  local log=/var/log/wasp-vuln-exceptions.log
+  local digest who reason days until existing
+
+  digest=$(printf '%s' "$img" | sed -n 's/.*@\(sha256:[0-9a-f]*\).*/\1/p')
+  [ -n "$digest" ] || digest="$img"
+
+  # An unexpired exception for THIS exact digest is honoured without asking
+  # again -- re-prompting for a decision already made and recorded is how
+  # people learn to type anything to get past the prompt.
+  if [ -r "$log" ]; then
+    existing=$(grep -F "digest=${digest}" "$log" 2>/dev/null | tail -1)
+    if [ -n "$existing" ]; then
+      until=$(printf '%s' "$existing" | sed -n 's/.*until=\([0-9-]*\).*/\1/p')
+      if [ -n "$until" ] && [ "$(date -u +%Y-%m-%d)" \< "$until" ]; then
+        echo "  ℹ  An accepted exception already covers this exact image digest,"
+        echo "     valid until ${until}:"
+        printf '     %s\n' "$(printf '%s' "$existing" | sed 's/.*reason=//')"
+        return 0
+      fi
+      echo "  ⚠  A previous exception for this digest EXPIRED on ${until}."
+      echo "     It has to be re-argued rather than silently renewed."
+    fi
+  fi
+
+  echo ""
+  echo "  Accepting this requires a written justification. It is recorded to"
+  echo "  ${log} and emailed to the governance address."
+  echo "  Leave the reason empty to abort the update instead."
+  echo ""
+  printf "  Reason for accepting these findings: "
+  read -r reason
+  # A reason nobody can act on later is the same as no reason. This is a low
+  # bar deliberately -- it stops "ok" and "asdf", not someone determined.
+  if [ ${#reason} -lt 15 ]; then
+    echo "  ✗ No usable justification given — update aborted." >&2
+    echo "    (A recorded exception has to mean something to whoever reads it" >&2
+    echo "     in six months, including you.)" >&2
+    return 1
+  fi
+
+  printf "  Days until this expires and must be re-reviewed [90]: "
+  read -r days
+  case "$days" in ''|*[!0-9]*) days=90 ;; esac
+  [ "$days" -gt 365 ] && { days=365; echo "  (capped at 365)"; }
+  until=$(date -u -d "+${days} days" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)
+
+  who="${SUDO_USER:-${DOAS_USER:-${USER:-unknown}}}"
+  printf "  Accepted by [%s]: " "$who"
+  read -r _w; [ -n "$_w" ] && who="$_w"
+
+  mkdir -p "$(dirname "$log")"
+  printf '%s | who=%s | image=%s | digest=%s | until=%s | reason=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$img" "$digest" "$until" "$reason" >> "$log"
+  chmod 600 "$log" 2>/dev/null || true
+  echo "  ✔ Exception recorded (expires ${until})"
+
+  if [ -x /usr/local/bin/wp-notify.sh ]; then
+    _eb=$(mktemp)
+    {
+      printf 'A HIGH/CRITICAL vulnerability finding was ACCEPTED on this host.\n\n'
+      printf '  Host    : %s\n' "$(hostname)"
+      printf '  Image   : %s\n' "$img"
+      printf '  Digest  : %s\n' "$digest"
+      printf '  By      : %s\n' "$who"
+      printf '  Expires : %s\n\n' "$until"
+      printf 'Stated reason:\n  %s\n\n' "$reason"
+      printf 'The exception applies ONLY to this image digest and lapses on the\n'
+      printf 'date above, after which it must be re-argued.\n\n'
+      printf 'Full record: %s\n' "$log"
+    } > "$_eb"
+    # No cooldown: every acceptance is a separate governance event, and
+    # de-duplicating them would hide exactly the pattern worth seeing.
+    NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-vuln-exception \
+      "Vulnerability exception accepted on $(hostname)" "$_eb" \
+      || echo "  ⚠ Exception recorded locally but the notification failed to send." >&2
+    rm -f "$_eb"
+  fi
+  return 0
+}
+
 scan_image() {
   local img="$1" rc
   if ! command -v trivy >/dev/null 2>&1; then
@@ -548,7 +649,7 @@ scan_image() {
       rm -f "${_trivy_err}"
       echo "  ⚠  HIGH or CRITICAL vulnerabilities detected in ${img}"
       echo "     Review the findings above before updating."
-      ask_yn "  Proceed with update anyway? (not recommended)" || {
+      trivy_exception "$img" || {
         echo "  Update aborted. Check for a newer image version."
         return 1
       }

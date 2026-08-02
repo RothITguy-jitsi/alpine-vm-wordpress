@@ -56,6 +56,8 @@ It's also honest about where it stops. Every control here states its own limits 
   - [Verifying what you run](#verifying-what-you-run)
 - [Login Protection](#login-protection)
 - [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
+- [Release Signing (minisign)](#release-signing-minisign)
+- [Off-VM Backup](#off-vm-backup)
 - [Self-Test](#self-test-proving-the-guarantees-hold)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional)](#outbound-firewall-optional)
@@ -437,6 +439,138 @@ doas wp-plugins.sh vulns                   # run it now
 Clean output means *no disclosed vulnerability in that feed* — not that the site is safe. Around 46% of plugin vulnerabilities have no patch when disclosed, and a plugin nobody has audited has no CVEs by definition.
 
 *Vulnerability data from Wordfence Intelligence; records sourced from MITRE remain © MITRE Corporation.*
+
+---
+
+## Release Signing (minisign)
+
+Releases can be signed with [minisign](https://jedisct1.github.io/minisign/) — Ed25519, a single-line public key, no keyring.
+
+Signed releases ship with `MANIFEST.sha256` (SHA-256 of every file `install.sh` executes) and `MANIFEST.sha256.minisig`. `install.sh` verifies the signature, then every file hash, before sourcing anything.
+
+**Verify a release yourself**, without trusting this repository's own word for it:
+
+```sh
+# the key, from a source that is not this repo
+dig +short TXT minisign._wasp.rothitguy.pro
+
+minisign -Vm MANIFEST.sha256 -P "RW..."   # signature
+sha256sum -c MANIFEST.sha256              # every file against it
+```
+
+*The release-signing tool is maintainer-side and deliberately not shipped: it only ever runs on the machine holding the secret key, so including it would add attack surface to every deployment without adding any capability to it.*
+
+**minisign rather than GPG** because `minisign -Vm file -P <base64-key>` takes the key **on the command line** — no keyring, no trust database, nothing to distribute but one line. That's what makes it possible to embed the key in `install.sh`, the file users fetch first.
+
+**What this proves, and what it doesn't.** It proves the files about to run are byte-identical to what the secret-key holder signed. It does **not** bootstrap trust on its own: a first-time user fetching `install.sh` and the release from the same repository is still trusting GitHub, and an attacker who could swap the tarball could swap the embedded key too.
+
+What it changes:
+
+- Anyone who recorded the fingerprint once can detect a later repo compromise — the key would have to change.
+- The fingerprint can be published where the repo isn't, so it's checkable against an independent source.
+- A tampered file that isn't re-signed fails, so an attacker needs the **secret key**, not just write access.
+
+Real improvement over unsigned `curl | bash`. Not the same as a trusted supply chain. Set `WASP_REQUIRE_SIGNATURE=1` to refuse to run unsigned.
+
+### Publishing the fingerprint
+
+Put the public key somewhere with **different credentials** from the repository. That distinction is the whole point — a Gist or a GitHub Pages site on the same account falls to exactly the compromise this is meant to make visible.
+
+**DNS TXT record** (machine-checkable, held at your registrar):
+
+```
+minisign._wasp.rothitguy.pro.  IN  TXT  "RW..."
+```
+
+Anyone can confirm it without trusting the project or GitHub:
+
+```sh
+dig +short TXT minisign._wasp.rothitguy.pro
+```
+
+`install.sh` cross-checks this automatically before verifying the signature. A mismatch warns loudly and asks for confirmation; with `WASP_REQUIRE_SIGNATURE=1` it's fatal. Skip with `WASP_SKIP_KEY_DNS=1`, or point it elsewhere with `WASP_KEY_DNS=`.
+
+**Honest scope:** plain DNS is spoofable on the network path, so this is *corroboration*, not a second root of trust. It answers "does the key baked into this file match the one published under separate credentials?" — which catches a repo compromise that swapped both the release and the embedded key, and catches nothing against an attacker who also controls your resolver. DNSSEC makes it meaningfully stronger.
+
+Also worth doing, at no cost:
+
+- **A page on your own domain** (`https://rothitguy.pro/wasp-signing-key/`) — different host, different credentials, and where a human will actually look.
+- **A dated public post** (Mastodon/Bluesky). Weak as truth, useful as corroboration: third-party-hosted and hard to edit retroactively, so a later key substitution becomes visible.
+
+The realistic value: most people won't check. What publishing buys is that a key substitution becomes **detectable** — by you, by a client doing due diligence, or by anyone looking after something has gone wrong. Tamper-evidence, not prevention.
+
+### The more valuable half: on-VM tamper detection
+
+```sh
+wasp-verify-integrity.sh
+```
+
+Verifying a release at install catches a tampered download — a one-off risk. Verifying the **installed** files catches something continuous and much harder to spot: an attacker with root on the VM editing `update.sh`, `wp-hardening.sh` or the malware scanner to disable a control or stop it reporting. Those edits are invisible to every other check here, because every other check trusts the scripts it's running.
+
+Stated limit: an attacker with root can edit this script, the manifest and the key too. Verification from inside a compromised host catches malware that modifies files without considering the integrity check — most of it — not a determined attacker. For an authoritative answer, mount the disk from the Proxmox host and compare from there.
+
+---
+
+## Off-VM Backup
+
+Optional at install. Nightly backups are written to the VM's own disk, which covers a bad update or a dropped table — and nothing else.
+
+| Method | Use when |
+|---|---|
+| `scp` | Simplest. An SSH key and a remote path. |
+| `rsync` | Same transport, resumes interrupted transfers. Better over a slow link. |
+| `rclone` | S3, B2, Wasabi and ~40 other providers, plus SFTP. Object storage. |
+
+```sh
+wasp-offsite-backup.sh test      # prove the destination works, end to end
+wasp-offsite-backup.sh verify    # is the newest local backup actually there?
+wasp-offsite-backup.sh list
+wasp-offsite-backup.sh status
+```
+
+Sent automatically after each verified nightly backup, and `wasp-selftest.sh` checks the newest backup exists remotely at the right size.
+
+### Encryption
+
+Optional, using [age](https://age-encryption.org) in **public-key mode** — and that mode is the point, not a detail.
+
+The VM holds only the **public** key. It can encrypt backups and **cannot read them** — not the ones it sends, not the ones already stored. An attacker with root here can create backups but not decrypt any of them.
+
+Combined with an append-only destination: they can neither read what's there nor delete it.
+
+```sh
+# On your workstation, NOT the VM:
+age-keygen -o wasp-backup-key.txt
+# Paste the "Public key: age1..." line at the installer prompt.
+```
+
+The installer rejects a private key if you paste one by mistake — putting `AGE-SECRET-KEY` on the VM would defeat the entire property.
+
+> **The cost is real.** Lose the private key and every encrypted backup is gone permanently. An encrypted backup nobody can decrypt is not a backup. Keep the key somewhere that is neither this VM nor the storage bucket — an attacker may already hold both. **Test a decrypt now**, not during an incident: `wasp-offsite-backup.sh restore-help`.
+
+**The local backup stays unencrypted deliberately.** It never leaves the host, it's already behind the VM boundary, and keeping it readable is what allows `wasp-selftest.sh` to prove a restore actually works. Encrypting the copy that leaves your control while keeping the one that doesn't is what preserves both properties.
+
+If `age` can't be installed, the backup script **refuses to upload** rather than falling back to plaintext. A silent downgrade from "encrypted offsite backup" to "the whole database in someone else's bucket" isn't an acceptable failure mode.
+
+### The part that matters more than the transport
+
+This VM must hold a credential that can reach the destination — so **an attacker with root here can reach it too**. Copying backups off the VM protects against disk failure and losing the VM. On its own it does *not* protect against ransomware, because encrypting the site and then wiping the backups is the standard pattern.
+
+What closes that gap is making the destination **append-only** — the key can add backups but not delete or overwrite them:
+
+```sh
+# SSH: in the remote authorized_keys
+command="rrsync -no-del /srv/backups/wasp",restrict ssh-ed25519 AAAA...
+
+# S3: IAM policy grants s3:PutObject + s3:ListBucket, denies s3:DeleteObject
+#     Bucket has Versioning + Object Lock enabled
+```
+
+The installer asks whether you've done this, and `status` reports which kind of protection you actually have. Answering honestly matters more than answering yes — `prune` will *fail* against a properly append-only destination, and that failure is correct rather than something to fix by granting delete rights.
+
+**Credentials** live in `/etc/wp-install/`, root-owned `0400`. WordPress runs as uid 33 and cannot read them, so a web-application compromise alone doesn't reach the backup destination. Only a root compromise does.
+
+**Host keys are pinned at install** from the Proxmox host, so the VM uses `StrictHostKeyChecking=yes`. For a backup target, `accept-new` would let a MITM silently receive every database dump.
 
 ---
 

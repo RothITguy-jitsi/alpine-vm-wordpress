@@ -60,6 +60,12 @@ _cfg() {
 }
 
 _recipient() {
+  # Vulnerability exceptions go to the governance mailbox when one is set --
+  # deliberately a different destination from operational alerts, so a risk
+  # acceptance is not filed alongside disk-space warnings.
+  if [ "${1:-}" = "wasp-vuln-exception" ] && [ -n "${GOVERNANCE_EMAIL:-}" ]; then
+    printf '%s' "$GOVERNANCE_EMAIL"; return
+  fi
   # Explicit override first, then the admin address given at install, then
   # the relay account itself -- which is always a real mailbox, so alerts
   # have somewhere to go even if nobody configured a destination.
@@ -72,7 +78,7 @@ _configured() { [ -r "$SMTP_FILE" ] && [ -n "$(_cfg host)" ] && [ -n "$(_recipie
 
 send_mail() {
   _tag="$1"; _subject="$2"; _bodyfile="${3:-}"
-  _to=$(_recipient)
+  _to=$(_recipient "$_tag")
   _host=$(_cfg host); _port=$(_cfg port); _user=$(_cfg user)
   _from=$(_cfg from); [ -n "$_from" ] || _from="$_user"
   _enc=$(_cfg encryption)

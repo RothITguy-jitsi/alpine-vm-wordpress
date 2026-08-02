@@ -67,6 +67,12 @@ ADMIN_CIDR=$(_vars_q "${ADMIN_CIDR:-}")
 ALLOWED_ADMIN_IP=$(_vars_q "${ALLOWED_ADMIN_IP:-}")
 INSTALL_CLAMAV=$(_vars_q "${INSTALL_CLAMAV:-0}")
 WORDFENCE_FEED=$(_vars_q "${WORDFENCE_FEED:-scanner}")
+OFFSITE_AGE_RECIPIENT=$(_vars_q "${OFFSITE_AGE_RECIPIENT:-}")
+OFFSITE_METHOD=$(_vars_q "${OFFSITE_METHOD:-none}")
+OFFSITE_DEST=$(_vars_q "${OFFSITE_DEST:-}")
+OFFSITE_RETAIN=$(_vars_q "${OFFSITE_RETAIN:-14}")
+OFFSITE_APPEND_ONLY=$(_vars_q "${OFFSITE_APPEND_ONLY:-unknown}")
+GOVERNANCE_EMAIL=$(_vars_q "${GOVERNANCE_EMAIL:-}")
 WORDFENCE_API_KEY=$(_vars_q "${WORDFENCE_API_KEY:-}")
 CROWDSEC_WHITELIST=$(_vars_q "${CROWDSEC_WHITELIST:-}")
 RESTRICT_EGRESS=$(_vars_q "${RESTRICT_EGRESS:-0}")
@@ -121,6 +127,61 @@ for _p in "${REPO_DIR}"/payload/*/; do
   cp -a "$_p" "$MNT/etc/wp-install/payload/$_name"
 done
 cp -a "${REPO_DIR}/payload/stages/." "$MNT/etc/wp-install/stages/"
+
+# Copy the signed manifest and the release key onto the VM. This is not for
+# the install -- install.sh already verified them on the host. It is so the
+# VM can re-verify its own tooling MONTHS later, which is the more valuable
+# use: it detects an attacker who got root on the VM and edited update.sh or
+# wp-hardening.sh to disable a control or hide their presence. Release
+# integrity is a one-off; tamper-evidence on a live host is continuous.
+if [[ -f "${REPO_DIR}/MANIFEST.sha256" ]]; then
+  cp -a "${REPO_DIR}/MANIFEST.sha256" "$MNT/etc/wp-install/" 2>/dev/null || true
+  [[ -f "${REPO_DIR}/MANIFEST.sha256.minisig" ]] && \
+    cp -a "${REPO_DIR}/MANIFEST.sha256.minisig" "$MNT/etc/wp-install/" 2>/dev/null || true
+  printf '%s\n' "${WASP_PUBKEY:-}" > "$MNT/etc/wp-install/release.pub"
+  chmod 644 "$MNT/etc/wp-install/MANIFEST.sha256" "$MNT/etc/wp-install/release.pub" 2>/dev/null || true
+  msg_ok "Signed manifest staged for on-VM integrity checking"
+fi
+
+# ── Off-VM backup credentials ────────────────────────────────────────────────
+# Copied with 0400/0600 root ownership. WordPress runs as uid 33 and cannot
+# read them, so a compromise of the web application alone does not reach the
+# backup destination -- only a root compromise does, which is exactly why the
+# destination should also be append-only.
+if [[ "${OFFSITE_METHOD:-none}" != "none" ]]; then
+  {
+    printf 'OFFSITE_METHOD=%s\n'      "$OFFSITE_METHOD"
+    printf 'OFFSITE_DEST=%s\n'        "$OFFSITE_DEST"
+    printf 'OFFSITE_RETAIN=%s\n'      "${OFFSITE_RETAIN:-14}"
+    printf 'OFFSITE_APPEND_ONLY=%s\n' "${OFFSITE_APPEND_ONLY:-unknown}"
+    # The recipient is a PUBLIC key, so it is not a secret; it lives in the
+    # same 0600 file purely to keep the off-VM settings in one place.
+    printf 'OFFSITE_AGE_RECIPIENT=%s\n' "${OFFSITE_AGE_RECIPIENT:-}"
+  } > "$MNT/etc/wp-install/offsite.conf"
+  chmod 600 "$MNT/etc/wp-install/offsite.conf"
+
+  if [[ -n "${OFFSITE_KEY_PATH:-}" && -r "$OFFSITE_KEY_PATH" ]]; then
+    install -m 0400 "$OFFSITE_KEY_PATH" "$MNT/etc/wp-install/offsite-key"
+    # Capture the destination host key NOW, from the Proxmox host, so the VM
+    # can use StrictHostKeyChecking=yes rather than trusting whatever answers
+    # on first contact. For a backup target, accept-new would mean a MITM
+    # could silently receive every database dump.
+    _oh="${OFFSITE_DEST#*@}"; _oh="${_oh%%:*}"
+    if ssh-keyscan -T 10 "$_oh" > "$MNT/etc/wp-install/offsite-known_hosts" 2>/dev/null \
+       && [[ -s "$MNT/etc/wp-install/offsite-known_hosts" ]]; then
+      chmod 644 "$MNT/etc/wp-install/offsite-known_hosts"
+      msg_ok "Off-VM backup key installed; ${_oh} host key pinned"
+    else
+      msg_warn "Could not reach ${_oh} to capture its host key."
+      msg_warn "  Backups will fail until it is added on the VM:"
+      msg_warn "    ssh-keyscan ${_oh} >> /etc/wp-install/offsite-known_hosts"
+    fi
+  fi
+  if [[ -n "${OFFSITE_RCLONE_CONF:-}" && -r "$OFFSITE_RCLONE_CONF" ]]; then
+    install -m 0600 "$OFFSITE_RCLONE_CONF" "$MNT/etc/wp-install/rclone.conf"
+    msg_ok "rclone configuration installed (0600, root-only)"
+  fi
+fi
 chmod -R go-w "$MNT/etc/wp-install/payload" "$MNT/etc/wp-install/stages"
 msg_ok "payload/ staged to /etc/wp-install/{payload,stages} ($(find "$MNT/etc/wp-install/payload" "$MNT/etc/wp-install/stages" -type f | wc -l) files)"
 

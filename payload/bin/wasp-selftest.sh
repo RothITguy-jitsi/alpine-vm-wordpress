@@ -174,6 +174,18 @@ restore_test() {
 
   cleanup_scratch
   _p "Scratch instance destroyed"
+
+  # A restorable backup that exists only on this VM still dies with the VM.
+  if [ -x /usr/local/bin/wasp-offsite-backup.sh ] && [ -r /etc/wp-install/offsite.conf ]; then
+    if /usr/local/bin/wasp-offsite-backup.sh verify >/dev/null 2>&1; then
+      _p "Newest backup is also present off-VM, same size"
+    else
+      _f "Newest backup is NOT present off-VM" \
+         "The local backup restores correctly and the offsite copy is missing or wrong — which looks healthy until the VM is gone. wasp-offsite-backup.sh verify"
+    fi
+  else
+    _i "Off-VM backup not configured — this backup dies with the VM"
+  fi
 }
 
 # ── Candidate isolation proof ────────────────────────────────────────────────
