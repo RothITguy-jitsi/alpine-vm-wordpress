@@ -47,3 +47,8 @@
 # dump. Emails only on failure -- a guarantee that stops holding is exactly
 # the thing worth interrupting someone for.
 30 5 * * 0 /usr/local/bin/wasp-selftest.sh all >/tmp/wasp-selftest.out 2>&1 || { logger -t wasp-selftest "SELF-TEST FAILED — a stated guarantee is not holding"; [ -x /usr/local/bin/wp-notify.sh ] && NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-selftest "Self-test FAILED: backup restore or DB isolation" /tmp/wasp-selftest.out; }
+# Weekly review prompt for vulnerability exceptions (Monday 08:00 UTC).
+# An exception expires 90 days after it was accepted; 14 days' notice is
+# enough to re-argue it before an update is blocked. Silent unless something
+# is actually approaching, so it stays worth reading.
+0 8 * * 1 /usr/local/bin/wp-hardening.sh exceptions-check >/dev/null 2>&1

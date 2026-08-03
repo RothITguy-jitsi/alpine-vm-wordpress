@@ -148,7 +148,7 @@ fi
 # from the same place, this is not a root of trust. It is tamper-evidence
 # with a short, checkable identifier -- which is meaningfully better than an
 # unsigned curl|bash, and is not the same as a trusted supply chain.
-WASP_PUBKEY="${WASP_PUBKEY:-RWSi+SUZQWeFKd9yTC3Q7xAEADUph345WdgwOOlxK+dV40GHEqMsFTPc}"    # set to the release key; empty = unsigned build
+WASP_PUBKEY="${WASP_PUBKEY:-}"    # set to the release key; empty = unsigned build
 
 # Where the key fingerprint is published independently of this repository.
 # The point of a second location is DIFFERENT CREDENTIALS, not merely a

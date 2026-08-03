@@ -67,6 +67,26 @@ _p() { PASS=$((PASS+1)); printf '  \033[32m[PASS]\033[0m %s\n' "$1"; RESULTS="${
 _f() { FAIL=$((FAIL+1)); printf '  \033[31m[FAIL]\033[0m %s\n' "$1"
        [ -n "${2:-}" ] && printf '         %s\n' "$2"; RESULTS="${RESULTS}FAIL|$1\n"; }
 _i() { printf '  [info] %s\n' "$1"; }
+# Run SQL inside the mariadb container.
+#
+# MARIADB_ROOT_PASSWORD and WORDPRESS_TABLE_PREFIX exist in the CONTAINER's
+# environment, not on this host. Expanding them here yields an empty string,
+# and `mariadb -p""` then fails in a way that looks like "no data" rather than
+# "no password" -- which is exactly how this shipped: the self-test reported
+# an empty options table and missing users against a restore that was fine.
+#
+# The command is single-quoted so the shell inside the container expands them.
+_mdb() {
+  podman exec mariadb sh -c \
+    'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -N -B "$@"' _ "$@" 2>/dev/null
+}
+# The table prefix is randomised at install (wp<hex>_), so a hardcoded "wp_"
+# matches nothing. Read it from the container rather than guessing.
+_wp_prefix() {
+  podman exec mariadb sh -c 'printf %s "${WORDPRESS_TABLE_PREFIX:-wp_}"' 2>/dev/null \
+    || printf 'wp_'
+}
+
 _hdr(){ printf '\n\033[1m── %s\033[0m\n' "$1"; }
 
 cleanup_scratch() {
@@ -145,7 +165,9 @@ restore_test() {
        "A WordPress schema has ~12. The dump may be partial."
   fi
 
-  _pfx="${WORDPRESS_TABLE_PREFIX:-wp_}"
+  # Read the real prefix; it is randomised per install.
+  _pfx=$(_wp_prefix)
+  _i "Table prefix: ${_pfx}"
   # The specific rows that make a restore *useful*: without siteurl and a
   # user, you have a schema, not a site.
   _su=$(_q "SELECT option_value FROM ${WPDB}.${_pfx}options WHERE option_name='siteurl' LIMIT 1;")
@@ -160,8 +182,7 @@ restore_test() {
   _i "Restored posts: ${_posts:-0}"
 
   # Compare against production so a silently-shrinking backup is visible.
-  _live=$(podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD:-}" -N -B \
-            -e "SELECT COUNT(*) FROM ${WPDB}.${_pfx}posts;" 2>/dev/null)
+  _live=$(_mdb -e "SELECT COUNT(*) FROM \`${WPDB}\`.${_pfx}posts;")
   if [ -n "$_live" ] && [ "${_posts:-0}" -gt 0 ]; then
     _delta=$(( _live - _posts )); [ "$_delta" -lt 0 ] && _delta=$(( -_delta ))
     if [ "$_live" -gt 0 ] && [ $(( _delta * 100 / _live )) -gt 25 ]; then
@@ -192,16 +213,18 @@ restore_test() {
 candidate_isolation() {
   _hdr "Candidate DB isolation (read-only account)"
 
-  if [ -z "${MARIADB_ROOT_PASSWORD:-}" ]; then
-    _f "No database root password available" "Cannot create the test account"
+  if ! _mdb -e "SELECT 1" >/dev/null 2>&1; then
+    _f "Cannot reach the database as root" "Is the mariadb container running?"
     return
   fi
   _u="wasp_rotest_$$"
   _pw=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
   _scratch="wasp_rotest_db_$$"
 
-  _root() { podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD}" -N -B -e "$1" 2>&1; }
+  _root() { _mdb -e "$1"; }
   _asuser() { podman exec mariadb mariadb -u "$_u" -p"$_pw" -N -B -e "$1" 2>&1; }
+  # The read-only test account is created here, so its password IS a host
+  # variable and expanding it here is correct.
 
   # A scratch database so the write attempts never target real data, even if
   # the grant is wrong -- which is the very thing being tested.

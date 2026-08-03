@@ -44,6 +44,11 @@ fi
 # execute anything -- see the note in 01-wpvm-smtp.php for why that changed.
 # Legacy smtp.php is still read if present so an existing VM keeps working
 # until `setup` migrates it.
+# Defined here rather than inherited: this script does not source wp-mail.sh,
+# and the _cfg() helper was copied across from it complete with a reference to
+# a variable that only exists there. Every notification path failed with
+# "SECRETS_DIR: parameter not set".
+SECRETS_DIR="${SECRETS_DIR:-/home/wpuser/wp/secrets}"
 SMTP_FILE="${SECRETS_DIR}/smtp.ini"
 SMTP_FILE_LEGACY="${SECRETS_DIR}/smtp.php"
 _cfg() {

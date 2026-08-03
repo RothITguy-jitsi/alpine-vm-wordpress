@@ -47,7 +47,7 @@ case "${OFFSITE_METHOD:-none}" in
             && ok "rsync + ssh installed for off-VM backup" ;;
   scp)    apk add --no-cache openssh-client >/dev/null 2>&1 \
             && ok "ssh client installed for off-VM backup" ;;
-  rclone) apk add --no-cache rclone >/dev/null 2>&1 \
+  s3|rclone) apk add --no-cache rclone >/dev/null 2>&1 \
             && ok "rclone installed for off-VM backup" \
             || warn "rclone could not be installed — off-VM backup will not work" ;;
 esac

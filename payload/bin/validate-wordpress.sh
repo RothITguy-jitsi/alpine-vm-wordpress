@@ -109,6 +109,10 @@ want_section() {
   return 1
 }
 
+# Defined alongside the other reporters. It was previously declared far
+# below its first use, so `note` was 'not found' at runtime while bash -n
+# passed -- shell functions must exist before the line that calls them runs.
+note() { printf "     %s\n" "$1"; }
 pass() {
   PASS=$((PASS+1))
   [ "$QUIET" = "1" ] && return 0
@@ -708,7 +712,6 @@ if [ "${_CSBAN:-0}" -gt 0 ]; then
 fi
 
 if want_section mail; then
-note() { printf "     %s\n" "$1"; }
 section mail "Outbound email"
 
 # Config and wiring checks run every time -- they are free and catch the

@@ -876,13 +876,16 @@ case "${_OFF}" in
     echo -e "  ${YW}  scp     simplest. Needs only an SSH key and a remote path.${CL}"
     echo -e "  ${YW}  rsync   same transport, resumes interrupted transfers.${CL}"
     echo -e "  ${YW}          Better over a slow or unreliable link.${CL}"
-    echo -e "  ${YW}  rclone  S3, B2, Wasabi, and ~40 other providers, plus SFTP.${CL}"
-    echo -e "  ${YW}          Choose this for object storage. Needs an rclone${CL}"
-    echo -e "  ${YW}          config file you have already created and tested.${CL}"
-    read -rp "  Method? [scp/rsync/rclone] : " _OM
+    echo -e "  ${YW}  s3      Object storage via an S3-compatible API — Cloudflare R2,${CL}"
+    echo -e "  ${YW}          Backblaze B2, Wasabi, MinIO, AWS. Guided setup here;${CL}"
+    echo -e "  ${YW}          no rclone config needed in advance.${CL}"
+    echo -e "  ${YW}  rclone  Any of rclone's ~40 backends, using a config file you${CL}"
+    echo -e "  ${YW}          have already created and tested elsewhere.${CL}"
+    read -rp "  Method? [scp/rsync/s3/rclone] : " _OM
     case "${_OM}" in
       rsync)  OFFSITE_METHOD="rsync" ;;
       rclone) OFFSITE_METHOD="rclone" ;;
+      s3|S3)  OFFSITE_METHOD="s3" ;;
       scp)    OFFSITE_METHOD="scp" ;;
       *)      OFFSITE_METHOD="none"; msg_warn "  Unrecognised method — off-VM backup skipped." ;;
     esac
@@ -896,6 +899,56 @@ case "${_OFF}" in
       echo -e "  ${YW}  faces the internet.${CL}"
       read -rp "  SSH private key path on THIS Proxmox host : " OFFSITE_KEY_PATH
       [[ -r "$OFFSITE_KEY_PATH" ]] || { msg_warn "  Cannot read ${OFFSITE_KEY_PATH} — off-VM backup skipped."; OFFSITE_METHOD="none"; }
+    elif [[ "$OFFSITE_METHOD" == "s3" ]]; then
+      # Generates the rclone config rather than asking for one. S3-compatible
+      # providers differ only in endpoint and provider hint, so the operator
+      # supplies the four things they actually have from the provider console.
+      echo ""
+      echo -e "  ${YW}  Which provider?${CL}"
+      echo -e "  ${YW}    1  Cloudflare R2      2  Backblaze B2 (S3 API)${CL}"
+      echo -e "  ${YW}    3  Wasabi             4  AWS S3${CL}"
+      echo -e "  ${YW}    5  Other S3-compatible (MinIO, Ceph, …)${CL}"
+      read -rp "  Provider [1] : " _S3P
+      case "${_S3P:-1}" in
+        1) S3_PROVIDER="Cloudflare"
+           echo -e "  ${YW}  Your R2 account ID is in the Cloudflare dashboard URL, and on${CL}"
+           echo -e "  ${YW}  the R2 overview page as part of the S3 API endpoint.${CL}"
+           read -rp "  Cloudflare account ID : " _S3ACC
+           S3_ENDPOINT="https://${_S3ACC}.r2.cloudflarestorage.com"
+           S3_REGION="auto" ;;
+        2) S3_PROVIDER="Backblaze"
+           read -rp "  B2 S3 endpoint (e.g. s3.us-west-004.backblazeb2.com) : " _S3EP
+           S3_ENDPOINT="https://${_S3EP#https://}"; S3_REGION="" ;;
+        3) S3_PROVIDER="Wasabi"
+           read -rp "  Wasabi endpoint (e.g. s3.eu-central-1.wasabisys.com) : " _S3EP
+           S3_ENDPOINT="https://${_S3EP#https://}"; S3_REGION="" ;;
+        4) S3_PROVIDER="AWS"; S3_ENDPOINT=""
+           read -rp "  AWS region (e.g. eu-west-2) : " S3_REGION ;;
+        *) S3_PROVIDER="Other"
+           read -rp "  S3 endpoint URL : " _S3EP
+           S3_ENDPOINT="https://${_S3EP#https://}"
+           read -rp "  Region (blank if none) : " S3_REGION ;;
+      esac
+      echo ""
+      echo -e "  ${YW}  Create the credential with WRITE but NOT DELETE permission if${CL}"
+      echo -e "  ${YW}  your provider allows it. On R2 that is an API token scoped to${CL}"
+      echo -e "  ${YW}  'Object Read & Write' on one bucket; on AWS, an IAM policy${CL}"
+      echo -e "  ${YW}  granting s3:PutObject and s3:ListBucket but denying${CL}"
+      echo -e "  ${YW}  s3:DeleteObject. That is what stops an attacker with root on${CL}"
+      echo -e "  ${YW}  this VM deleting the backups as well as encrypting the site.${CL}"
+      read -rp "  Access key ID : " S3_KEY
+      read -rsp "  Secret access key : " S3_SECRET; echo
+      read -rp "  Bucket name : " S3_BUCKET
+      read -rp "  Path inside the bucket [wasp/$(hostname -s 2>/dev/null || echo vm)] : " _S3PATH
+      _S3PATH="${_S3PATH:-wasp/$(hostname -s 2>/dev/null || echo vm)}"
+      OFFSITE_DEST="wasp-s3:${S3_BUCKET}/${_S3PATH}"
+      if [[ -z "$S3_KEY" || -z "$S3_SECRET" || -z "$S3_BUCKET" ]]; then
+        msg_warn "  Incomplete S3 details — off-VM backup skipped."
+        OFFSITE_METHOD="none"
+      else
+        msg_ok "S3 destination: ${OFFSITE_DEST}"
+        msg_info "  Config is written on the VM at /etc/wp-install/rclone.conf (0600)"
+      fi
     elif [[ "$OFFSITE_METHOD" == "rclone" ]]; then
       echo -e "  ${YW}  Destination as remote:bucket/path, using a remote name from${CL}"
       echo -e "  ${YW}  your rclone config.${CL}"

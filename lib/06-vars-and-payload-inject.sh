@@ -68,6 +68,12 @@ ALLOWED_ADMIN_IP=$(_vars_q "${ALLOWED_ADMIN_IP:-}")
 INSTALL_CLAMAV=$(_vars_q "${INSTALL_CLAMAV:-0}")
 WORDFENCE_FEED=$(_vars_q "${WORDFENCE_FEED:-scanner}")
 OFFSITE_AGE_RECIPIENT=$(_vars_q "${OFFSITE_AGE_RECIPIENT:-}")
+# S3 secret is NOT written to vars.sh — it goes only into rclone.conf at 0600.
+# vars.sh is sourced by several tools and read during troubleshooting; a
+# storage credential does not belong somewhere that widely handled.
+S3_PROVIDER=$(_vars_q "${S3_PROVIDER:-}")
+S3_ENDPOINT=$(_vars_q "${S3_ENDPOINT:-}")
+S3_REGION=$(_vars_q "${S3_REGION:-}")
 OFFSITE_METHOD=$(_vars_q "${OFFSITE_METHOD:-none}")
 OFFSITE_DEST=$(_vars_q "${OFFSITE_DEST:-}")
 OFFSITE_RETAIN=$(_vars_q "${OFFSITE_RETAIN:-14}")
@@ -176,6 +182,24 @@ if [[ "${OFFSITE_METHOD:-none}" != "none" ]]; then
       msg_warn "  Backups will fail until it is added on the VM:"
       msg_warn "    ssh-keyscan ${_oh} >> /etc/wp-install/offsite-known_hosts"
     fi
+  fi
+  if [[ "${OFFSITE_METHOD:-}" == "s3" ]]; then
+    # Written directly rather than asking the operator to compose rclone
+    # config. The remote name is fixed (wasp-s3) so OFFSITE_DEST built at
+    # prompt time always resolves.
+    {
+      printf '[wasp-s3]\n'
+      printf 'type = s3\n'
+      [[ -n "${S3_PROVIDER:-}" ]] && printf 'provider = %s\n' "$S3_PROVIDER"
+      printf 'access_key_id = %s\n'     "$S3_KEY"
+      printf 'secret_access_key = %s\n' "$S3_SECRET"
+      [[ -n "${S3_ENDPOINT:-}" ]] && printf 'endpoint = %s\n' "$S3_ENDPOINT"
+      [[ -n "${S3_REGION:-}" ]]   && printf 'region = %s\n'   "$S3_REGION"
+      printf 'acl = private\n'
+      printf 'no_check_bucket = true\n'
+    } > "$MNT/etc/wp-install/rclone.conf"
+    chmod 600 "$MNT/etc/wp-install/rclone.conf"
+    msg_ok "rclone S3 configuration written (0600, root-only)"
   fi
   if [[ -n "${OFFSITE_RCLONE_CONF:-}" && -r "$OFFSITE_RCLONE_CONF" ]]; then
     install -m 0600 "$OFFSITE_RCLONE_CONF" "$MNT/etc/wp-install/rclone.conf"

@@ -33,7 +33,7 @@ That is fixed: every normal assertion now requires the command to succeed before
 | **Still open (source finding)** | **Status** | **Why it's deferred** |
 | --- | --- | --- |
 | Candidate DB isolation (17) | **DONE (light form)** — candidate runs under a temporary SELECT-only account, dropped on every exit path; `wasp-selftest.sh candidate-isolation` proves the grant refuses writes. Does NOT test migrations — see below | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
-| Production findings approval (14) | **DONE** — the y/N override is now a recorded, digest-scoped, expiring exception with a written justification, emailed to a governance address chosen at install | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
+| Production findings approval (14) — CLOSED | **DONE** — the y/N override is now a recorded, digest-scoped, expiring exception with a written justification, emailed to a governance address chosen at install | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
 | Off-VM backup gate (18) | **DONE** — optional at install (scp / rsync / rclone), pushed after each verified backup, size-confirmed remotely, and checked weekly by `wasp-selftest.sh`. Append-only destination is prompted for and reported honestly rather than assumed | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
 | Egress restriction (20) | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
 | Trivy installer checksum (15) | **DONE** — pinned to v0.72.0 with the release checksums file anchored by SHA-256, plus a denylist refusing the known-compromised 0.69.4/0.69.5/0.69.6 builds regardless of install path | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
@@ -198,3 +198,26 @@ An operator whose compliance regime requires full isolation can compose the
 two: restore into a scratch instance with `restore-test`, then point a
 candidate at it. The pieces are there; wiring them into every update by
 default is the part that is not worth the cost.
+
+## Vulnerability exception governance — final shape
+
+No approval workflow is implemented, and that is a decision rather than a gap.
+Request-and-approve belongs in whatever process the operator already runs;
+a half-built version inside an installer would add ceremony without adding
+oversight, and would be trusted as though it were real.
+
+What is implemented is everything that makes an out-of-band approval
+*reviewable* afterwards:
+
+- a written justification, minimum length enforced
+- scoped to the exact image digest, so it cannot silently cover a later image
+- the accepted CVEs recorded, so a reviewer can judge whether the reason holds
+- attributed and dated
+- expiring, with the decision required again rather than renewed by default
+- append-only root-owned log, with the email explicitly a copy of it
+- a reader (`wp-hardening.sh exceptions`) so the log is not write-only
+- a weekly warning 14 days before lapse
+
+The remaining gap is inherent: nothing here can verify that the stated
+justification was actually discussed with anyone. That is a property of the
+process around this system, not of this system.

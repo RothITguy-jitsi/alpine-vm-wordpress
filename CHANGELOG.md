@@ -6,6 +6,372 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — A shipped file was unsigned, and the manifest design caused it
+
+Raised as the most urgent defect in a fifth evaluation:
+`payload/mariadb-conf/wp.cnf` is not in the signed manifest.
+
+Correct, and the file is not the interesting part. The manifest selected files
+by **extension allowlist** — `*.sh`, `*.php`, `*.yar`, `*.yaml`, `*.conf`,
+`*.ini`, `*.tmpl`, `*.cron` — and `.cnf` was not among them. An allowlist
+inverts the failure mode: anything it does not name is silently unsigned, and
+nothing complains. A modified MariaDB config could weaken the database — bind
+address, `local-infile`, TLS settings — while every signature check passed.
+
+The selection is now **everything under `install.sh`, `lib/` and `payload/`**
+with no extension filter, because that is exactly the set `install.sh`
+executes or copies onto the VM. Documentation lives outside those paths, so
+nothing needed excluding; the filter added risk for no benefit.
+
+**`test/check-manifest-coverage.py` added.** It re-derives the shipped set and
+fails if a manifest exists that does not cover all of it, and also flags stale
+entries for files that no longer exist. Verified against a tree reproducing
+the exact gap. It runs automatically, since `run-all-checks.sh` discovers
+`test/check-*.py`.
+
+**`INCIDENT-PLAYBOOK.md` added**, also from that evaluation. Written for the
+person on call rather than someone holding the whole system in their head:
+what each alert means, what to do first, and what **not** to do — several of
+the tempting moves (deleting the malicious file, updating to "clean" it,
+restoring immediately) destroy the evidence of the entry point, and a restored
+site with the original vulnerability is compromised again within days.
+
+It includes a **RACI**, expressed as roles so it survives someone leaving.
+Two separations are deliberate and stated: a vulnerability exception is the
+operator's to make and governance's to own, because the system can enforce the
+record but not that a conversation happened; and taking a site offline is the
+site owner's call, because the commercial consequence is theirs. Agreeing that
+threshold in advance is the point — 02:00 is the wrong time to discover nobody
+can authorise it.
+
+---
+
+## Unreleased — The 503 was my nginx rate limit, and it was mine twice over
+
+Resolved from the VM's own output. `wp-login.php` returns **403** when queried
+from inside the container, `apache2ctl configtest` says **Syntax OK**, and
+there is no 503 anywhere in the error log. Apache never emitted one. The
+`Require not ip` rule was innocent, as was every other thing suspected on the
+VM side.
+
+**`limit_req` returns HTTP 503 by default**, and the snippet applied
+`rate=6r/m burst=3` to a location matching
+`^/(wp-admin/|wp-login\.php|SLUG)` — which matches every asset the login page
+loads: `login.min.css`, `load-styles.php`, `load-scripts.php`, the logo, the
+spinner. A single page load is a dozen or more requests against a six-per-
+minute budget. It exhausted itself, and everything after got 503. The front
+page kept working because it did not match the location, which is exactly the
+reported symptom.
+
+Two separate errors in one snippet:
+
+- **Scope.** Rate limiting an admin path counts static assets. Fixed with a
+  `map $request_method` so the zone keys on POST only — an empty key is not
+  rate limited, so GETs pass freely and only the actual login submission is
+  counted, which is the thing worth limiting.
+- **Status.** `limit_req_status 429` was present in the location block but
+  commented out along with the rate limit in the previous fix, leaving the
+  default. A rate-limited client should be told to slow down, not that the
+  service is broken — and a 503 sent an operator hunting a backend outage that
+  did not exist.
+
+The rate limit is now uncommented by default, because it is safe once
+POST-scoped.
+
+**Also added:** a triage step that settles nginx-versus-VM in one command, by
+querying `wp-login.php` from inside the container. A 403 there is the *correct*
+answer — the request comes from an address not in the allow list — and proves
+the VM is healthy.
+
+Worth recording: three guesses preceded this (the proxy IP, the zone ordering,
+the strict authz rule), all plausible, all wrong. One command run on the
+affected machine settled it. The diagnostic should have come first.
+
+---
+
+## Unreleased — 503 narrowed to wp-login.php; live rule toggle added
+
+More detail from the operator changed the diagnosis: the site loads,
+`/wp-admin/install.php` works, and only the custom slug and the login page
+return 503 — on the LAN and off it.
+
+That rules out most of what was suspected. Apache is running. The IP
+restriction is passing, or `install.php` would fail too, since it sits inside
+the same `<DirectoryMatch>`. What the two failing paths share is that both end
+at **wp-login.php**: the slug rewrites to it, and `/wp-admin/` redirects to it
+when not logged in. `install.php` does neither.
+
+Nothing in the generated config emits 503 explicitly, so it is coming from
+Apache's authorization layer or from PHP — and the honest position is that it
+cannot be determined from the source alone. Guessing again would be the second
+wrong guess this session, after a fix keyed to `DEPLOYMENT_PROFILE` that could
+never have fired.
+
+**`wp-hardening.sh admin-rule [show|strict|simple]` added** so the question can
+be answered in one command instead of a reinstall. It switches the
+wp-admin/wp-login authorization between the fail-closed form (which uses
+`Require not ip`) and the plain allow-list, live, keeping a timestamped backup.
+If `simple` clears the 503, the `Require not ip` construct is the cause on this
+Apache build and can be replaced with something equivalent. If it does not, the
+cause is elsewhere and the strict rule is exonerated.
+
+`simple` states plainly that it restores the fail-OPEN behaviour and is for
+isolating a fault, not for living in.
+
+**Documentation:** a full Nginx Proxy Manager reference section, since
+"recommended settings" had only existed as generated output. It covers the
+ordering constraint that caused the earlier 503 (zone file first, restart,
+confirm, then the location block), the admin-path restriction at the edge,
+`X-Forwarded-For $remote_addr` rather than NPM's appending default, denials for
+`wp-config.php`/dotfiles/executable uploads, which NPM toggles matter and why,
+and a 503 triage sequence that starts by saying 503 is not the IP restriction.
+
+---
+
+## Unreleased — The nginx snippet could 503 the entire host
+
+Reported: blocked from the admin path on cellular *and* getting **503 on the
+LAN**. The 503 is the part that matters — a `Require` denial returns 403, so
+this was never the IP restriction. 503 is nginx reporting it could not reach
+the backend, or that its own configuration failed to load.
+
+The Apache side checks out: `<RequireAll>` containing `Require not ip` plus a
+nested `<RequireAny>` is valid 2.4 syntax, and renders correctly for both the
+`wp-admin` and `wp-login.php` blocks.
+
+**The snippet I generated had an ordering trap.** It printed the `location`
+block as section 1 and the `limit_req_zone` definition as section 2. Anyone
+following it top to bottom pastes a server block naming a zone that does not
+exist yet — and nginx refuses to load that block entirely, so NPM answers 503
+for the **whole host**, not just the admin path. The site goes down.
+
+Three changes so a partial application cannot do that:
+
+- The zone file is now **section 1** and the location block **section 2**,
+  with an explicit instruction to restart NPM and confirm the site still loads
+  in between.
+- The `limit_req` lines are **commented out by default**, with the reason
+  inline. Uncommenting them is a deliberate step taken after the zone exists.
+- A "If you get 503 after applying this" section states plainly that 503 is
+  not the IP restriction, and says to clear the Advanced tab first and reapply
+  one piece at a time.
+
+Worth recording as a general point: a configuration snippet with a
+cross-file dependency is a snippet that will be applied wrongly. Printing the
+dependency second made that near-certain, and the failure mode was the whole
+site rather than the feature.
+
+---
+
+## Unreleased — Container variables expanded on the host: four features were inert
+
+From a real VM session. Several failures with one root cause, and it is the
+most consequential bug class in this project so far because everything
+affected reported success.
+
+**`MARIADB_ROOT_PASSWORD` only exists inside the mariadb container.** The
+original scripts knew this — `wp-db-backup.sh` and `mariadb-health-check.sh`
+single-quote the command so the container's shell expands it. Every script I
+added since expanded it on the host, where it is empty, producing
+`mariadb -p""`.
+
+That fails as **"no rows"**, not "access denied". So:
+
+- `wasp-selftest.sh` reported *"siteurl missing from the restored options
+  table"* and *"restored users table is empty"* against a restore that was
+  perfectly fine
+- `wp-malware-scan.sh`'s database layer returned clean on every run without
+  ever querying anything
+- `update.sh`'s read-only candidate account was never created — the feature
+  guarded itself on a variable that is always empty, so it silently did nothing
+- the Trivy exception CVE capture returned nothing
+
+Four features that appeared to work and did not. Fixed with a shared `_mdb`
+helper that runs the query inside the container, plus the same pattern applied
+in `update.sh`.
+
+**The table prefix was also wrong.** Installs generate `wp<hex>_`, randomised
+per install; the new code defaulted to `wp_`, which matches no table. Now read
+from the container.
+
+**`wp-notify.sh` was entirely broken:** `SECRETS_DIR: parameter not set`. The
+`_cfg()` helper was copied from `wp-mail.sh` complete with a reference to a
+variable only that script defines. Every notification path failed — so none of
+the email alerting worked. A one-line default, and a reminder that copying a
+helper between scripts copies its assumptions too.
+
+**`note: not found`** in `validate-wordpress.sh`: the function was defined at
+line 711 and called at 687. Shell resolves a function name when the call
+executes, so `bash -n` accepts it and it fails at runtime. Moved up beside the
+other reporters.
+
+**`test/check-function-order.py` added** for that last class. Its first version
+used indentation as a proxy for nesting and reported four false positives —
+calls inside function bodies, which are resolved when that function runs and
+are therefore fine. Rewritten to track brace depth and consider only true
+top-level calls. Verified it still catches the real shape while passing the
+clean tree.
+
+---
+
+## Unreleased — Exception governance: closing the loop, not adding a workflow
+
+The operator's read was right — approval belongs out of band, and a
+request-and-approve workflow built into an installer would add ceremony
+without adding oversight while being trusted as though it were real. So no
+workflow was added. Three gaps that stopped the existing design working as a
+review process were closed instead.
+
+**1. The record said a decision happened, not what was decided.** The log and
+the email carried the image, the reason and the expiry, but not *which
+vulnerabilities* were accepted — so a reviewer could not judge whether the
+reason still applied, which is the only question a review asks. Trivy is now
+re-run in JSON to enumerate the accepted CVEs (cheap, the cache is warm), and
+they go into both the log line and the email body.
+
+**2. The log was write-only.** Nothing read it back. A governance process that
+records decisions and never surfaces them is a filing cabinet.
+`wp-hardening.sh exceptions` now lists every exception with its status —
+active, expiring within 14 days, or expired — with the CVEs, the reason, who
+accepted it and when.
+
+**3. Expiry happened silently.** An exception lapsed and nobody knew until an
+update was blocked by it, which is the worst moment to be re-arguing a
+decision. A weekly job now emails 14 days ahead, and stays silent otherwise —
+including about entries that have *already* lapsed, which are not news.
+
+Verified the date classification against real dates: an exception 80 days out
+reads active, one 7 days out reads expiring, one from April reads expired, and
+the cron would email about exactly one of the three.
+
+The remaining gap is recorded in `TODO.md` rather than papered over: nothing
+here can verify that the stated justification was genuinely discussed with
+anyone. That is a property of the process around this system, not of the
+system.
+
+---
+
+## Unreleased — Reverted on-VM key generation; documented it properly instead
+
+Generating the age keypair on the VM was convenient and it weakened the one
+property that made public-key mode worth choosing: that this host holds only
+the public half and cannot read what it sends. Even generating into a shell
+variable rather than a file, the secret existed on the VM and on its terminal.
+Reverted at the operator's call, which was the right one.
+
+`init` now prompts for the public key and **refuses** an `AGE-SECRET-KEY` —
+refuses, not warns — because accepting one would discard the property silently
+while appearing to work perfectly.
+
+**Everything else from that change is kept.** SSH key generation stays on the
+VM: a key made where it is used and never transmitted has no window in which
+it existed elsewhere, and only the public half travels. `restore` stays in
+full — fetch, decrypt with a key supplied for that one operation, verify gzip
+integrity, and either write to a file or replace the live database behind a
+pre-restore backup and a typed `REPLACE`.
+
+**Key creation is now documented per platform**, since "generate it on your
+own machine" is only actionable if the reader knows how on theirs: Debian,
+Ubuntu, Fedora, RHEL, Arch, openSUSE, Alpine, immutable Fedora variants via
+Homebrew, macOS via Homebrew or MacPorts, Windows 11 via winget or Scoop, and
+Windows Server via the release zip — including the TLS 1.2 line older Server
+builds need before `Invoke-WebRequest` will reach GitHub.
+
+Each section says where to read the public key back out if the terminal has
+scrolled, states that the private key belongs in a **third** location — not the
+VM, not the backup bucket, since an attacker may hold both — and ends with the
+decrypt test to run before relying on any of it.
+
+**A structural error was introduced and caught during the revert:** removing
+the generation block also removed a `case`/`esac` and a closing `fi`, leaving
+the function unparseable. `sh -n` failed immediately, which is the one class of
+bug it reliably catches.
+
+---
+
+## Unreleased — `wasp-offsite-backup.sh init` and `restore`
+
+**`init`** sets up transport and encryption in one pass: generates the SSH key
+on the VM, prints the `authorized_keys` line to install remotely, generates an
+age keypair, pins the destination host key, and writes the config.
+
+The `authorized_keys` line it prints includes the
+`command="rrsync -no-del ...",restrict` prefix, with an explanation of why —
+without it the key can run anything, and anyone who takes root on the VM can
+delete every backup it ever sent. That prefix is the difference between a copy
+that survives a compromise and one that only survives a disk failure, and it
+is the part an operator is most likely to omit when following instructions
+from memory.
+
+**On generating the age key here at all.** The security property of
+public-key mode is that this VM holds only the public half and cannot read
+what it sends. Generating the keypair on the VM puts the private half here,
+however briefly, which is a real weakening of that. It is done as carefully as
+the convenience allows: `age-keygen` writes to a shell variable rather than a
+file, so the secret never touches this VM's disk — it exists in process memory
+and on the terminal. The operator must type `SAVED` before it is dropped, and
+the caveat that a logged terminal captures it is stated rather than glossed.
+Pasting a key generated elsewhere remains available and remains stronger.
+
+**`restore`** closes the loop the encryption opened. The VM cannot decrypt on
+its own, so the private key is supplied for that one operation: read into a
+variable with echo off, written to a temp directory only for the duration of
+the `age -d` call, removed immediately. `--key-file` covers the
+non-interactive case.
+
+Two safeguards on `--to-database`, which replaces the live database:
+
+- **A backup of the current state is taken first, unprompted**, and the
+  restore refuses to proceed if that fails. Restoring the wrong archive is
+  recoverable only while the thing being overwritten still exists.
+- Typing `REPLACE` is required, after the pre-restore backup has succeeded.
+
+Gzip integrity is checked after decryption and before anything is loaded, so a
+wrong key or a truncated download fails without touching the database.
+
+---
+
+## Unreleased — ARCHITECTURE.md brought current (it had drifted badly)
+
+Asked directly: had the diagrams been updated? They had not, and the gap was
+worse than a missing box. Signing, off-VM backup, the self-test, the notifier
+and the integrity checker were all absent — the evaluation's *"signing
+architecture is not fully represented"* was understated.
+
+Documentation that describes a system as it was two weeks ago is worse than
+none: a reader trusts it, and it is confidently wrong.
+
+**New: section 3, the release trust chain.** Signing had been implemented but
+never *drawn*, so a reader could not see where trust starts or stops. The
+diagram now shows the secret key never leaving the maintainer's machine, the
+public half published under separate credentials at the registrar, the
+embedded key in `install.sh`, both verification gates and what each refusal
+does — and says in prose that a first-time user fetching `install.sh` and the
+release from the same repository is still trusting that repository. Signing
+makes a swap *detectable*, not impossible. Where it stops is stated as plainly
+as where it starts.
+
+**Component diagram** gains the backup path and the off-VM destination,
+annotated `append-only recommended` since that is what separates protection
+from loss and protection from malice.
+
+**Update diagram** gains the temporary SELECT-only database account, so the
+candidate step no longer implies it runs against production data unrestricted.
+
+**Tooling map** gains `wasp-offsite-backup.sh`, `wasp-selftest.sh`,
+`wasp-verify-integrity.sh` and `wp-notify.sh`, each with the property worth
+knowing — that the VM cannot decrypt what it uploads, that the restore proof
+uses a real restore, that notification is host-side so it survives WordPress
+being down.
+
+Validated after every edit: subgraph/`end` pairing, every `style` target
+resolving to a declared node, balanced fences. One error was introduced and
+caught this way — an inserted `end` closed the VM subgraph early, leaving the
+backup nodes outside it, which would have rendered as a detached fragment
+rather than failing visibly.
+
+---
+
 ## Unreleased — Signature verification fails closed; lockout no longer punishes shared NAT
 
 A fourth evaluation, against a day-old archive. Several of its findings were

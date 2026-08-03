@@ -566,8 +566,22 @@ trivy_exception() {
   read -r _w; [ -n "$_w" ] && who="$_w"
 
   mkdir -p "$(dirname "$log")"
-  printf '%s | who=%s | image=%s | digest=%s | until=%s | reason=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$img" "$digest" "$until" "$reason" >> "$log"
+  # Record WHICH vulnerabilities are being accepted, not merely that some
+  # were. Without it the record says a decision happened and not what was
+  # decided -- so a later reviewer cannot tell whether the reason still
+  # applies, which is the only question a review asks. Trivy's cache makes
+  # this second pass cheap.
+  _cves=""
+  if command -v trivy >/dev/null 2>&1; then
+    _cves=$(trivy image --quiet --no-progress --scanners vuln \
+              --severity HIGH,CRITICAL --format json "$img" 2>/dev/null \
+            | sed -n 's/.*"VulnerabilityID": *"\([^"]*\)".*/\1/p' \
+            | sort -u | head -40 | tr '\n' ' ')
+  fi
+  [ -n "$_cves" ] || _cves="(could not enumerate — see the scan output above)"
+
+  printf '%s | who=%s | image=%s | digest=%s | until=%s | cves=%s | reason=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$img" "$digest" "$until" "$_cves" "$reason" >> "$log"
   chmod 600 "$log" 2>/dev/null || true
   echo "  ✔ Exception recorded (expires ${until})"
 
@@ -580,9 +594,14 @@ trivy_exception() {
       printf '  Digest  : %s\n' "$digest"
       printf '  By      : %s\n' "$who"
       printf '  Expires : %s\n\n' "$until"
+      printf 'Accepted vulnerabilities:\n'
+      printf '%s' "$_cves" | tr ' ' '\n' | sed 's/^/  /' | grep . || printf '  (none enumerated)\n'
+      printf '\n'
       printf 'Stated reason:\n  %s\n\n' "$reason"
       printf 'The exception applies ONLY to this image digest and lapses on the\n'
       printf 'date above, after which it must be re-argued.\n\n'
+      printf 'Review every active exception on this host:\n'
+      printf '  wp-hardening.sh exceptions\n\n'
       printf 'Full record: %s\n' "$log"
     } > "$_eb"
     # No cooldown: every acceptance is a separate governance event, and
@@ -891,10 +910,13 @@ do_wp_update() {
   # Write failures in the candidate's log during this window are EXPECTED and
   # are the mechanism working, not a fault.
   local CAND_DB_USER="" CAND_DB_PASS="" CAND_DB_ARGS=""
-  if [ "${CANDIDATE_DB_READONLY:-1}" = "1" ] && [ -n "${MARIADB_ROOT_PASSWORD:-}" ]; then
+  # Reachability is the real precondition, not a host variable that does not
+  # exist -- checking the latter silently disabled this feature entirely.
+  if [ "${CANDIDATE_DB_READONLY:-1}" = "1" ] \
+     && podman exec mariadb sh -c 'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "SELECT 1"' >/dev/null 2>&1; then
     CAND_DB_USER="wp_cand_$$"
     CAND_DB_PASS=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    if podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD}" -e "
+    if podman exec mariadb sh -c 'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "$1"' _ "
           CREATE USER '${CAND_DB_USER}'@'%' IDENTIFIED BY '${CAND_DB_PASS}';
           GRANT SELECT ON \`${WORDPRESS_DB_NAME:-wordpress}\`.* TO '${CAND_DB_USER}'@'%';
           FLUSH PRIVILEGES;" >/dev/null 2>&1; then
@@ -912,8 +934,8 @@ do_wp_update() {
   # leftover account would be a standing credential nobody knows about.
   _drop_cand_user() {
     [ -n "$CAND_DB_USER" ] || return 0
-    podman exec mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD}" \
-      -e "DROP USER IF EXISTS '${CAND_DB_USER}'@'%'; FLUSH PRIVILEGES;" >/dev/null 2>&1 || \
+    podman exec mariadb sh -c 'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -e "$1"' _ \
+      "DROP USER IF EXISTS '${CAND_DB_USER}'@'%'; FLUSH PRIVILEGES;" >/dev/null 2>&1 || \
       echo "  ⚠ Could not drop temporary DB user ${CAND_DB_USER} — remove it by hand" >&2
     CAND_DB_USER=""
   }

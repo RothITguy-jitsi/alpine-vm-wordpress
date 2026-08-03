@@ -67,6 +67,8 @@ show_status() {
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
   echo "          geoip-test [ip] | proxy-check | nginx-snippet"
+  echo "          exceptions | exceptions-check"
+  echo "          admin-rule [show|strict|simple]"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
@@ -237,9 +239,12 @@ SNIPPET
     [ -n "${ADMIN_CIDR:-}" ]       && printf '    allow %s;\n' "$ADMIN_CIDR"
     [ -n "${ALLOWED_ADMIN_IP:-}" ] && printf '    allow %s;\n' "$ALLOWED_ADMIN_IP"
     printf '    deny all;\n\n'
-    printf '    # Rate limit BEFORE a request costs a WordPress bootstrap.\n'
-    printf '    # Needs the limit_req_zone from section 2 below.\n'
-    printf '    limit_req zone=wplogin burst=3 nodelay;\n'
+    printf '    # Rate limiting is SAFE here now: the zone keys on POST only,\n'
+    printf '    # so the assets this page loads are never counted. Requires the\n'
+    printf '    # map + limit_req_zone from section 1 to exist first.\n'
+    printf '    limit_req zone=wplogin burst=5 nodelay;\n'
+    printf '    # 429, not the default 503. A rate-limited client should be told\n'
+    printf '    # to slow down, not that the service is broken.\n'
     printf '    limit_req_status 429;\n\n'
     printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
     printf '    proxy_set_header Host              \$host;\n'
@@ -263,7 +268,19 @@ SNIPPET
  limit_req_zone lives in the http block, which the Advanced tab cannot
  reach. Create the file if it does not exist, then restart NPM.
 
-limit_req_zone $binary_remote_addr zone=wplogin:10m rate=6r/m;
+# Keyed on POST only. An empty key is not rate limited, so GETs — every
+# CSS, JS and image the login page pulls — pass freely.
+#
+# The earlier version keyed on $binary_remote_addr and the location
+# matched the whole admin tree. A single login page load is a dozen or
+# more requests, so the budget was spent by the page loading itself and
+# nginx answered 503 — its DEFAULT status for limit_req — for everything
+# after. The front page kept working because it did not match.
+map $request_method $wplogin_limit_key {
+    POST    $binary_remote_addr;
+    default "";
+}
+limit_req_zone $wplogin_limit_key zone=wplogin:10m rate=6r/m;
 
 ───────────────────────────────────────────────────────────────────
  3. Verify, in this order
@@ -298,6 +315,173 @@ limit_req_zone $binary_remote_addr zone=wplogin:10m rate=6r/m;
 
 SNIPPET2
     ;;
+
+  exceptions)
+    # A reader for the exception log. Without one the log is write-only: a
+    # governance process that records decisions and never surfaces them again
+    # is a filing cabinet, not oversight. This is what a periodic review reads.
+    _log=/var/log/wasp-vuln-exceptions.log
+    _today=$(date -u +%Y-%m-%d)
+    echo ""
+    echo "Vulnerability exceptions"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ ! -s "$_log" ]; then
+      echo "  None recorded. Every HIGH/CRITICAL finding has either been fixed"
+      echo "  by an update or has blocked one — which is the intended state."
+      exit 0
+    fi
+    _act=0; _exp=0; _soon=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      _when=$(printf '%s' "$line" | awk -F' \\| ' '{print $1}')
+      _who=$(printf  '%s' "$line" | sed -n 's/.*who=\([^|]*\).*/\1/p' | sed 's/ *$//')
+      _dig=$(printf  '%s' "$line" | sed -n 's/.*digest=\([^|]*\).*/\1/p' | sed 's/ *$//')
+      _unt=$(printf  '%s' "$line" | sed -n 's/.*until=\([^|]*\).*/\1/p' | sed 's/ *$//')
+      _cve=$(printf  '%s' "$line" | sed -n 's/.*cves=\([^|]*\).*/\1/p' | sed 's/ *$//')
+      _rsn=$(printf  '%s' "$line" | sed -n 's/.*reason=//p')
+      if [ "$_today" \> "$_unt" ]; then
+        _st="EXPIRED"; _exp=$((_exp+1))
+      else
+        _st="active"; _act=$((_act+1))
+        # 14 days is enough notice to re-argue an exception before the next
+        # update run is blocked by it.
+        _warn=$(date -u -d "+14 days" +%Y-%m-%d 2>/dev/null || echo "$_today")
+        [ "$_warn" \> "$_unt" ] && { _st="EXPIRING SOON"; _soon=$((_soon+1)); }
+      fi
+      echo ""
+      printf '  [%s]  accepted %s by %s\n' "$_st" "${_when%T*}" "${_who:-unknown}"
+      printf '    image digest : %s\n' "${_dig:-?}"
+      printf '    expires      : %s\n' "${_unt:-?}"
+      printf '    CVEs         : %s\n' "${_cve:-not recorded}"
+      printf '    reason       : %s\n' "${_rsn:-none given}"
+    done < "$_log"
+    echo ""
+    echo "  ────────────────────────────────────────────────────────"
+    printf '  %s active, %s expiring within 14 days, %s expired\n' "$_act" "$_soon" "$_exp"
+    echo ""
+    echo "  An EXPIRED entry does not block anything by itself — it means the"
+    echo "  next update touching that image will ask for the decision again."
+    echo "  That is the intended behaviour: an exception nobody re-argues"
+    echo "  should lapse rather than quietly become permanent policy."
+    if [ "$_soon" -gt 0 ]; then
+      echo ""
+      echo "  ${_soon} exception(s) lapse within 14 days. Re-review them now,"
+      echo "  rather than at the moment an update is blocked." >&2
+    fi ;;
+
+  exceptions-check)
+    # Cron entry point. Silent unless something needs attention, so a weekly
+    # job does not train the operator to ignore it.
+    _log=/var/log/wasp-vuln-exceptions.log
+    [ -s "$_log" ] || exit 0
+    _today=$(date -u +%Y-%m-%d)
+    _warn=$(date -u -d "+14 days" +%Y-%m-%d 2>/dev/null || echo "$_today")
+    _due=$(mktemp)
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      _unt=$(printf '%s' "$line" | sed -n 's/.*until=\([^|]*\).*/\1/p' | sed 's/ *$//')
+      [ -n "$_unt" ] || continue
+      [ "$_today" \> "$_unt" ] && continue          # already lapsed; not news
+      if [ "$_warn" \> "$_unt" ]; then
+        printf '  expires %s : %s\n' "$_unt" \
+          "$(printf '%s' "$line" | sed -n 's/.*reason=//p')" >> "$_due"
+      fi
+    done < "$_log"
+    if [ -s "$_due" ]; then
+      _n=$(grep -c . "$_due") || _n=0
+      logger -t wasp-exceptions "${_n} vulnerability exception(s) lapse within 14 days"
+      if [ -x /usr/local/bin/wp-notify.sh ]; then
+        _b=$(mktemp)
+        {
+          printf 'Vulnerability exceptions on %s lapse within 14 days.\n\n' "$(hostname)"
+          cat "$_due"
+          printf '\nWhen one lapses, the next update touching that image asks for the\n'
+          printf 'decision again. Re-review now rather than at the moment an update\n'
+          printf 'is blocked.\n\n'
+          printf 'Full detail:  wp-hardening.sh exceptions\n'
+        } > "$_b"
+        /usr/local/bin/wp-notify.sh wasp-vuln-exception \
+          "${_n} vulnerability exception(s) expiring on $(hostname)" "$_b"
+        rm -f "$_b"
+      fi
+    fi
+    rm -f "$_due" ;;
+
+  admin-rule)
+    # Switch the wp-admin/wp-login authorization rule between two forms,
+    # live, without reinstalling. Exists because the fail-closed form uses
+    # `Require not ip`, and if that turns out to be what returns 503 on this
+    # Apache build there needs to be a way back that does not involve
+    # rebuilding the VM.
+    _conf=/home/wpuser/wp/apache-conf/wp-security.conf
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    _mode="${2:-show}"
+    [ -r "$_conf" ] || { echo "✗ ${_conf} not found" >&2; exit 1; }
+
+    case "$_mode" in
+      show|"")
+        echo ""
+        echo "wp-admin authorization rule"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if grep -q "Require not ip" "$_conf"; then
+          echo "  Mode: STRICT (fail-closed)"
+          echo "    Denies the proxy's own address, so a mod_remoteip failure"
+          echo "    produces 403 instead of allowing everyone."
+        else
+          echo "  Mode: SIMPLE (allow-list only)"
+          echo "    ⚠ If ${PROXY_IP:-the proxy} is inside ${ADMIN_CIDR:-the admin range},"
+          echo "      a mod_remoteip failure would ALLOW every request rather than"
+          echo "      deny them — silently."
+        fi
+        echo ""
+        sed -n '/<Files "wp-login.php">/,/<\/Files>/p' "$_conf" | sed 's/^/    /'
+        echo ""
+        echo "  Switch:  wp-hardening.sh admin-rule strict|simple"
+        echo "  Then:    podman restart wordpress" ;;
+
+      simple)
+        # Strip the RequireAll wrapper, leaving the positive allow-list.
+        cp "$_conf" "${_conf}.bak-$(date -u +%Y%m%d%H%M%S)"
+        awk '
+          /<RequireAll>/     { inall=1; next }
+          /<\/RequireAll>/   { inall=0; next }
+          /Require not ip/   { next }
+          /<RequireAny>/     { if (inall) next }
+          /<\/RequireAny>/   { if (inall) next }
+          { print }
+        ' "$_conf" > "${_conf}.new" && mv -f "${_conf}.new" "$_conf"
+        echo "✔ Switched to SIMPLE. Backup kept alongside the original."
+        echo "  ⚠ This restores the fail-OPEN behaviour: if mod_remoteip stops"
+        echo "    substituting the client address and your proxy sits inside the"
+        echo "    admin range, everyone is allowed. Use it to isolate a 503, not"
+        echo "    as a resting state."
+        echo "  podman restart wordpress" ;;
+
+      strict)
+        grep -q "Require not ip" "$_conf" && { echo "Already strict."; exit 0; }
+        [ -n "${PROXY_IP:-}" ] || { echo "✗ No PROXY_IP configured; strict mode has nothing to deny." >&2; exit 1; }
+        cp "$_conf" "${_conf}.bak-$(date -u +%Y%m%d%H%M%S)"
+        awk -v proxy="$PROXY_IP" '
+          /Require ip/ && !done {
+            print "    <RequireAll>"
+            print "        Require not ip " proxy
+            print "        <RequireAny>"
+            buf = 1
+          }
+          /Require ip/ { print "    " $0; next }
+          buf && !/Require ip/ {
+            print "        </RequireAny>"
+            print "    </RequireAll>"
+            buf = 0; done = 1
+          }
+          { print }
+        ' "$_conf" > "${_conf}.new" && mv -f "${_conf}.new" "$_conf"
+        echo "✔ Switched to STRICT. Backup kept alongside the original."
+        echo "  podman exec wordpress apache2ctl configtest   # check BEFORE restarting"
+        echo "  podman restart wordpress" ;;
+
+      *) echo "Usage: wp-hardening.sh admin-rule [show|strict|simple]" >&2; exit 1 ;;
+    esac ;;
 
   proxy-check)
     # Answers the one question that decides every "works on the LAN IP but

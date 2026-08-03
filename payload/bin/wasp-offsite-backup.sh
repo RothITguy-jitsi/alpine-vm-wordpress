@@ -140,7 +140,7 @@ push_one() {
       # a nightly dump over a slow link should not have to be perfect first time.
       rsync -q --partial --timeout=300 -e "ssh $(_ssh_opts)" \
             "$_f" "${OFFSITE_DEST}/" 2>/tmp/.offsite.err ;;
-    rclone)
+    s3|rclone)
       rclone --config "$RCLONE_CONF" copyto --quiet \
              "$_f" "${OFFSITE_DEST}/${_b}" 2>/tmp/.offsite.err ;;
     *)
@@ -178,7 +178,7 @@ remote_size() {
     scp|rsync)
       ssh $(_ssh_opts) "${OFFSITE_DEST%%:*}" \
         "stat -c %s '${OFFSITE_DEST#*:}/${_n}' 2>/dev/null" 2>/dev/null | tr -d '\r' ;;
-    rclone)
+    s3|rclone)
       rclone --config "$RCLONE_CONF" size --json "${OFFSITE_DEST}/${_n}" 2>/dev/null \
         | sed -n 's/.*"bytes":[[:space:]]*\([0-9]*\).*/\1/p' ;;
   esac
@@ -189,9 +189,273 @@ list_remote() {
     scp|rsync)
       ssh $(_ssh_opts) "${OFFSITE_DEST%%:*}" \
         "ls -lh '${OFFSITE_DEST#*:}' 2>/dev/null" 2>/dev/null ;;
-    rclone)
+    s3|rclone)
       rclone --config "$RCLONE_CONF" lsl "${OFFSITE_DEST}" 2>/dev/null ;;
   esac
+}
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+do_init() {
+  echo ""
+  echo "Off-VM backup setup"
+  echo "━━━━━━━━━━━━━━━━━━━"
+  mkdir -p /etc/wp-install; chmod 755 /etc/wp-install
+
+  # ── SSH key ────────────────────────────────────────────────────────────────
+  # Generated HERE rather than copied in. A key made on this host and never
+  # transmitted has no window in which it existed somewhere else, and the
+  # public half is the only part that needs to travel.
+  if [ -f "$SSH_KEY" ]; then
+    echo "  SSH key already exists at ${SSH_KEY} — keeping it."
+  else
+    printf "  Generate an SSH key for backup transport? [Y/n] : "
+    read -r _a
+    case "${_a:-y}" in
+      n|N) : ;;
+      *)
+        ssh-keygen -t ed25519 -N "" -C "wasp-backup-$(hostname)" -f "$SSH_KEY" >/dev/null 2>&1 \
+          || { _bad "ssh-keygen failed"; return 1; }
+        chmod 400 "$SSH_KEY"; chmod 444 "${SSH_KEY}.pub"
+        echo "  ✔ Key generated (private key is 0400 root-only)"
+        ;;
+    esac
+  fi
+  if [ -f "${SSH_KEY}.pub" ]; then
+    echo ""
+    echo "  ── Install this on the BACKUP HOST ──────────────────────────────"
+    echo ""
+    echo "  Append to ~/.ssh/authorized_keys there, WITH the forced command:"
+    echo ""
+    printf '    command="rrsync -no-del /srv/backups/wasp",restrict %s\n' "$(cat "${SSH_KEY}.pub")"
+    echo ""
+    echo "  The command= prefix is the part that matters. Without it this key"
+    echo "  can run anything, and anyone who takes root on this VM can delete"
+    echo "  every backup it ever sent. With it, the key can add files and"
+    echo "  nothing else — which is what makes the copy survive a compromise"
+    echo "  here rather than merely surviving a disk failure."
+    echo ""
+    echo "  rrsync ships with rsync; on Debian it is at"
+    echo "  /usr/share/doc/rsync/scripts/rrsync (may need chmod +x)."
+    echo ""
+  fi
+
+  # ── age encryption ─────────────────────────────────────────────────────────
+  echo "  ── Encryption ───────────────────────────────────────────────────"
+  if [ -n "${AGE_RECIPIENT:-}" ]; then
+    echo "  Already configured for: ${AGE_RECIPIENT}"
+    echo "  Re-running would orphan every backup already encrypted to the old key."
+  else
+    echo "  This VM must NOT hold the private key. That is the whole property:"
+    echo "  holding only the public half means an attacker with root here can"
+    echo "  create backups and cannot read any of them — not the ones it sends,"
+    echo "  and not the ones already stored."
+    echo ""
+    echo "  Generate the keypair on YOUR machine and paste the PUBLIC line here."
+    echo "  Platform-by-platform instructions are in the README under"
+    echo "  \"Off-VM Backup -> Creating the encryption key\"."
+    echo ""
+    echo "    age-keygen -o wasp-backup-key.txt"
+    echo ""
+    echo "  That prints a line starting 'Public key: age1...'. Paste that."
+    echo "  Keep wasp-backup-key.txt somewhere that is neither this VM nor the"
+    echo "  backup destination — an attacker may already hold both."
+    echo ""
+    while :; do
+      printf "  age public key (age1..., blank = no encryption) : "
+      read -r _pk
+      [ -z "$_pk" ] && { echo "  No encryption — backups leave this VM in plaintext."; break; }
+      case "$_pk" in
+        AGE-SECRET-KEY*)
+          # Refused, not accepted-with-a-warning. Storing the private key here
+          # would silently discard the only reason this design is worth
+          # anything, while appearing to work perfectly.
+          _bad "That is a PRIVATE key. It must never be on this VM."
+          _note "Paste the line beginning 'age1', not the one beginning AGE-SECRET-KEY."
+          continue ;;
+      esac
+      if printf '%s' "$_pk" | grep -qE '^age1[0-9a-z]{50,}$'; then
+        AGE_RECIPIENT="$_pk"
+        echo "  ✔ Backups will be encrypted to ${_pk}"
+        echo "    Verify you can DECRYPT with the matching private key before"
+        echo "    relying on this:  wasp-offsite-backup.sh restore --file <name> --to-file /tmp/t.sql.gz"
+        break
+      fi
+      _bad "Doesn't look like an age public key (expected age1...)."
+    done
+  fi
+  # ── Destination ────────────────────────────────────────────────────────────
+  echo ""
+  echo "  ── Destination ──────────────────────────────────────────────────"
+  printf "  Method [scp/rsync/rclone] (blank = keep %s) : " "${OFFSITE_METHOD:-none}"
+  read -r _m
+  case "$_m" in scp|rsync|rclone) OFFSITE_METHOD="$_m" ;; esac
+  if [ "${OFFSITE_METHOD:-none}" != "none" ]; then
+    printf "  Destination (blank = keep '%s') : " "${OFFSITE_DEST:-unset}"
+    read -r _d
+    [ -n "$_d" ] && OFFSITE_DEST="$_d"
+  fi
+
+  # Pin the destination host key now, so transfers use
+  # StrictHostKeyChecking=yes. For a backup target, accept-new would let a
+  # machine-in-the-middle receive every database dump on first contact.
+  case "${OFFSITE_METHOD:-none}" in
+    scp|rsync)
+      _h="${OFFSITE_DEST#*@}"; _h="${_h%%:*}"
+      if [ -n "$_h" ] && ssh-keyscan -T 10 "$_h" > /etc/wp-install/offsite-known_hosts 2>/dev/null \
+         && [ -s /etc/wp-install/offsite-known_hosts ]; then
+        chmod 644 /etc/wp-install/offsite-known_hosts
+        echo "  ✔ Host key pinned for ${_h}"
+      else
+        _bad "Could not reach ${_h:-the destination} to capture its host key"
+        _note "Transfers will fail until: ssh-keyscan ${_h} >> /etc/wp-install/offsite-known_hosts"
+      fi ;;
+  esac
+
+  {
+    printf 'OFFSITE_METHOD=%s\n'        "${OFFSITE_METHOD:-none}"
+    printf 'OFFSITE_DEST=%s\n'          "${OFFSITE_DEST:-}"
+    printf 'OFFSITE_RETAIN=%s\n'        "${OFFSITE_RETAIN:-14}"
+    printf 'OFFSITE_APPEND_ONLY=%s\n'   "${OFFSITE_APPEND_ONLY:-unknown}"
+    printf 'OFFSITE_AGE_RECIPIENT=%s\n' "${AGE_RECIPIENT:-}"
+  } > "$CONF"
+  chmod 600 "$CONF"
+  echo ""
+  echo "  ✔ Written to ${CONF}"
+  echo ""
+  echo "  Next, in this order:"
+  echo "    1. Install the SSH key on the backup host (above)"
+  echo "    2. wasp-offsite-backup.sh test        — prove it accepts data"
+  echo "    3. wp-db-backup.sh                    — take one"
+  echo "    4. wasp-offsite-backup.sh restore --list"
+  echo "    5. Decrypt one NOW, before you need it:"
+  echo "       wasp-offsite-backup.sh restore --file <name> --to-file /tmp/t.sql.gz"
+}
+
+# ── Restore ──────────────────────────────────────────────────────────────────
+# The VM cannot decrypt on its own -- that is the point of public-key mode --
+# so the private key has to be supplied for this one operation. It is read
+# into a variable, used, and dropped; it is never written to this VM's disk.
+do_restore() {
+  _file=""; _keyfile=""; _tofile=""; _todb=0; _list=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list)        _list=1; shift ;;
+      --file)        _file="${2:-}"; shift 2 ;;
+      --key-file)    _keyfile="${2:-}"; shift 2 ;;
+      --to-file)     _tofile="${2:-}"; shift 2 ;;
+      --to-database) _todb=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  if [ "$_list" = "1" ] || [ -z "$_file" ]; then
+    echo ""
+    echo "Available backups"
+    echo "━━━━━━━━━━━━━━━━━"
+    echo "  Local (unencrypted, on this VM):"
+    ls -1t "$BACKUP_DIR"/*.sql.gz 2>/dev/null | head -10 | sed 's|.*/|    |' || echo "    (none)"
+    if _configured; then
+      echo "  Remote:"
+      list_remote 2>/dev/null | sed 's/^/    /' | head -15 || echo "    (unreadable)"
+    fi
+    echo ""
+    echo "  Restore:  wasp-offsite-backup.sh restore --file <name> --to-file /tmp/out.sql.gz"
+    echo "            add --to-database to load it (destructive — see below)"
+    return 0
+  fi
+
+  _work=$(mktemp -d) || return 1
+  trap 'rm -rf "$_work"' RETURN 2>/dev/null || true
+  _local="${BACKUP_DIR}/${_file}"
+
+  if [ -f "$_local" ]; then
+    cp "$_local" "$_work/$_file"
+    _note "Using the local copy of ${_file}"
+  else
+    _configured || { _bad "No local copy and no destination configured"; rm -rf "$_work"; return 1; }
+    _note "Fetching ${_file} from the destination…"
+    case "$OFFSITE_METHOD" in
+      scp|rsync) scp $(_ssh_opts) -q "${OFFSITE_DEST}/${_file}" "$_work/$_file" ;;
+      s3|rclone) rclone --config "$RCLONE_CONF" copyto --quiet "${OFFSITE_DEST}/${_file}" "$_work/$_file" ;;
+    esac || { _bad "Could not fetch ${_file}"; rm -rf "$_work"; return 1; }
+  fi
+
+  _src="$_work/$_file"
+  case "$_file" in
+    *.age)
+      command -v age >/dev/null 2>&1 || { _bad "age is not installed (apk add age)"; rm -rf "$_work"; return 1; }
+      if [ -n "$_keyfile" ]; then
+        [ -r "$_keyfile" ] || { _bad "Cannot read ${_keyfile}"; rm -rf "$_work"; return 1; }
+        age -d -i "$_keyfile" -o "${_src%.age}" "$_src" 2>/tmp/.age.err \
+          || { _bad "Decryption failed — wrong key? $(head -c 160 /tmp/.age.err)"; rm -rf "$_work"; return 1; }
+      else
+        echo ""
+        echo "  ${_file} is encrypted. This VM holds only the public key and"
+        echo "  cannot decrypt it — which is the property that stops an attacker"
+        echo "  here reading your backups."
+        echo ""
+        echo "  Paste the AGE-SECRET-KEY line. It is used for this restore and"
+        echo "  not written to this VM's disk."
+        printf "  Private key: "
+        stty -echo 2>/dev/null; read -r _sk; stty echo 2>/dev/null; echo
+        case "$_sk" in
+          AGE-SECRET-KEY*) : ;;
+          *) _bad "That does not look like an age private key"; _sk=""; rm -rf "$_work"; return 1 ;;
+        esac
+        _kf="$_work/k"; printf '%s\n' "$_sk" > "$_kf"; chmod 600 "$_kf"; _sk=""
+        age -d -i "$_kf" -o "${_src%.age}" "$_src" 2>/tmp/.age.err \
+          || { _bad "Decryption failed — wrong key? $(head -c 160 /tmp/.age.err)"; rm -rf "$_work"; return 1; }
+        rm -f "$_kf"
+      fi
+      rm -f /tmp/.age.err
+      _src="${_src%.age}"
+      _ok "Decrypted"
+      ;;
+  esac
+
+  gzip -t "$_src" 2>/dev/null && _ok "Archive integrity verified" \
+    || { _bad "Decrypted file is not valid gzip"; rm -rf "$_work"; return 1; }
+
+  if [ -n "$_tofile" ]; then
+    cp "$_src" "$_tofile" && _ok "Written to ${_tofile}"
+    _note "Inspect it: gzip -dc '${_tofile}' | head -20"
+    rm -rf "$_work"; return 0
+  fi
+
+  if [ "$_todb" = "1" ]; then
+    echo ""
+    echo "  ⚠  This REPLACES the live database. Everything since this backup"
+    echo "     was taken is lost."
+    echo ""
+    # A backup of the current state first, unprompted. Restoring the wrong
+    # archive is a recoverable mistake only if the thing being overwritten
+    # still exists somewhere.
+    _note "Taking a safety backup of the CURRENT database first…"
+    if /usr/local/bin/wp-db-backup.sh >/dev/null 2>&1; then
+      _ok "Current state backed up to ${BACKUP_DIR}"
+    else
+      _bad "Could not back up the current database. Refusing to overwrite it."
+      rm -rf "$_work"; return 1
+    fi
+    printf "  Type REPLACE to load %s into the live database: " "$_file"
+    read -r _c
+    [ "$_c" = "REPLACE" ] || { echo "  Cancelled — nothing changed."; rm -rf "$_work"; return 0; }
+    if gzip -dc "$_src" | podman exec -i mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD:-}" 2>/dev/null; then
+      _ok "Restored into the live database"
+      _note "Verify now: validate-wordpress.sh --section database"
+      _note "If the site misbehaves, the pre-restore backup is the newest file"
+      _note "in ${BACKUP_DIR}."
+    else
+      _bad "Restore FAILED — the database may be in a partial state"
+      _note "The pre-restore backup is the newest file in ${BACKUP_DIR}"
+      rm -rf "$_work"; return 1
+    fi
+    rm -rf "$_work"; return 0
+  fi
+
+  _note "Decrypted and verified but not written anywhere."
+  _note "Add --to-file <path> or --to-database."
+  rm -rf "$_work"
 }
 
 case "${1:-status}" in
@@ -211,7 +475,7 @@ case "${1:-status}" in
     printf '  Retention   : %s copies\n' "$OFFSITE_RETAIN"
     case "$OFFSITE_METHOD" in
       scp|rsync) [ -r "$SSH_KEY" ] && printf '  Key         : %s (%s)\n' "$SSH_KEY" "$(stat -c '%a %U' "$SSH_KEY")" ;;
-      rclone)    [ -r "$RCLONE_CONF" ] && printf '  rclone conf : %s (%s)\n' "$RCLONE_CONF" "$(stat -c '%a %U' "$RCLONE_CONF")" ;;
+      s3|rclone) [ -r "$RCLONE_CONF" ] && printf '  rclone conf : %s (%s)\n' "$RCLONE_CONF" "$(stat -c '%a %U' "$RCLONE_CONF")" ;;
     esac
     echo ""
     if [ -n "$AGE_RECIPIENT" ]; then
@@ -238,6 +502,8 @@ case "${1:-status}" in
       echo "    S3   : deny s3:DeleteObject; enable Versioning + Object Lock"
     fi ;;
 
+  init|setup) do_init ;;
+  restore)    shift 2>/dev/null || true; do_restore "$@" ;;
   push)   _configured || { _bad "Off-VM backup is not configured"; exit 1; }
           push_one "${2:-}" ;;
 
@@ -297,7 +563,7 @@ case "${1:-status}" in
         ssh $(_ssh_opts) "${OFFSITE_DEST%%:*}" \
           "ls -1t '${OFFSITE_DEST#*:}'/*.sql.gz 2>/dev/null | tail -n +$((OFFSITE_RETAIN+1)) | xargs -r rm -f" \
           2>&1 | sed 's/^/  /' ;;
-      rclone)
+      s3|rclone)
         rclone --config "$RCLONE_CONF" delete --min-age "${OFFSITE_RETAIN}d" \
                "${OFFSITE_DEST}" 2>&1 | sed 's/^/  /' ;;
     esac

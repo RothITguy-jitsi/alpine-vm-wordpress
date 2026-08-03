@@ -1,8 +1,8 @@
 # WASP — Architecture
 
-Diagrams render natively on GitHub. Four views, because one diagram covering
-all of this would be unreadable: what exists, what a request passes through,
-how it gets built, and how it changes safely.
+Diagrams render natively on GitHub. Six views, because one diagram covering all of this would be unreadable:
+what exists, what a request passes through, where trust comes from, how it
+gets built, how it changes safely, and what maintains it afterwards.
 
 ---
 
@@ -42,11 +42,19 @@ graph TB
         WP -->|"logs"| CS
         CS --> BOUNCER
         BOUNCER -->|"writes ban rules"| NFT
+
+        OFFSITE["wasp-offsite-backup.sh<br/>age-encrypted, public key only"]
+        BK["wp-db-backup.sh<br/>verified before rotation"]
+        DB --> BK --> OFFSITE
     end
 
     INTERNET(["Internet"]) -->|":80 / :443 via proxy"| NFT
     WP -->|"updates, plugin API, SMTP"| INTERNET
+    OFFSITE -->|"scp / rsync / rclone"| REMOTE[("Off-VM storage<br/>append-only recommended")]
     DB -.->|"no path exists"| INTERNET
+
+    style OFFSITE fill:#1f2937,stroke:#22c55e,color:#fff
+    style REMOTE fill:#374151,stroke:#9ca3af,color:#fff
 
     style DB fill:#1f2937,stroke:#ef4444,color:#fff
     style DBNET fill:#111827,stroke:#ef4444,color:#fff
@@ -97,7 +105,54 @@ flowchart TD
 
 ---
 
-## 3. Install flow
+## 3. Release trust chain
+
+The evaluation that prompted this section put it well: signing was implemented
+but not *represented*, so a reader could not see where trust starts or where it
+stops. It stops in a specific place, and the diagram says so.
+
+```mermaid
+flowchart TD
+    KEY(["minisign secret key<br/>maintainer's machine only"])
+    KEY -->|"signs"| MAN["MANIFEST.sha256.minisig"]
+
+    REPO["GitHub repository<br/>install.sh + lib/ + payload/<br/>+ MANIFEST + signature"]
+    MAN --> REPO
+    DNS["DNS TXT<br/>minisign._wasp.rothitguy.pro<br/>held at the registrar"]
+    KEY -.->|"public half published<br/>under DIFFERENT credentials"| DNS
+
+    REPO -->|"curl"| INST["install.sh on the Proxmox host<br/>WASP_PUBKEY embedded"]
+    DNS -.->|"cross-check<br/>corroboration, not proof"| INST
+
+    INST --> V1{"signature valid?"}
+    V1 -->|"no"| STOP1["REFUSE<br/>typing UNVERIFIED required to override;<br/>non-interactive aborts"]
+    V1 -->|"yes"| V2{"every file hash matches?"}
+    V2 -->|"no"| STOP2["REFUSE<br/>manifest authentic, so a file was<br/>changed after signing"]
+    V2 -->|"yes"| SRC["source lib/ and copy payload/"]
+
+    SRC --> VM["VM: manifest + public key staged<br/>to /etc/wp-install"]
+    VM --> LATER["wasp-verify-integrity.sh<br/>re-checks installed tooling later"]
+
+    style KEY fill:#1f2937,stroke:#ef4444,color:#fff
+    style STOP1 fill:#1f2937,stroke:#f59e0b,color:#fff
+    style STOP2 fill:#1f2937,stroke:#f59e0b,color:#fff
+    style DNS fill:#374151,stroke:#9ca3af,color:#fff
+    style LATER fill:#1f2937,stroke:#22c55e,color:#fff
+```
+
+**Where trust actually starts.** A first-time user fetching `install.sh` and
+the release from the same repository is trusting that repository — an attacker
+who could swap the tarball could swap the embedded key too. Signing does not
+change that. What it changes is that the swap becomes **detectable**: the key
+would have to change, and the DNS record is held under separate credentials.
+
+**Where it stops.** The DNS cross-check is spoofable without DNSSEC.
+`wasp-verify-integrity.sh` runs on the VM, so an attacker with root there can
+edit it. Neither is a root of trust; both make tampering evident.
+
+---
+
+## 4. Install flow
 
 Two phases, split by a reboot: the kernel switch has to happen before
 containers exist.
@@ -140,7 +195,7 @@ flowchart LR
 
 ---
 
-## 4. Update: candidate, cutover, rollback
+## 5. Update: candidate, cutover, rollback
 
 Production keeps serving throughout the risky part. The old container is not
 destroyed until the new one has proven itself — it *is* the rollback artifact.
@@ -151,7 +206,8 @@ flowchart TD
     CHK -->|"no"| STOP1["stop — nothing pulled"]
     CHK --> SCAN{"Trivy scan<br/>HIGH/CRITICAL"}
     SCAN -->|"scan incomplete<br/>+ profile=production"| STOP2["refuse<br/>unknown security state"]
-    SCAN --> CAND["start candidate<br/>127.0.0.1:18080<br/>production still on :80"]
+    SCAN --> RO["create temporary SELECT-only DB account<br/>dropped on every exit path"]
+    RO --> CAND["start candidate<br/>127.0.0.1:18080, read-only DB<br/>production still on :80"]
 
     CAND --> VAL{"candidate healthy?<br/>HTTP + PHP + DNS + DB"}
     VAL -->|"no"| STOP3["remove candidate<br/>production never touched"]
@@ -171,6 +227,7 @@ flowchart TD
     style STOP1 fill:#1f2937,stroke:#f59e0b,color:#fff
     style STOP2 fill:#1f2937,stroke:#f59e0b,color:#fff
     style STOP3 fill:#1f2937,stroke:#f59e0b,color:#fff
+    style RO fill:#374151,stroke:#f59e0b,color:#fff
     style RB fill:#1f2937,stroke:#ef4444,color:#fff
     style DONE1 fill:#1f2937,stroke:#22c55e,color:#fff
     style DONE2 fill:#1f2937,stroke:#22c55e,color:#fff
@@ -178,7 +235,7 @@ flowchart TD
 
 ---
 
-## 5. Day-2 tooling
+## 6. Day-2 tooling
 
 Each tool covers a layer the others do not. The split matters: `update.sh`
 and Trivy see the **container image**, while plugins and themes live in a
@@ -220,10 +277,29 @@ graph LR
 
     T --> B["wp-db-backup.sh"]
     B --> B1["verified dump before rotation"]
+    B --> B2["pushes off-VM after each verified backup"]
+
+    T --> O["wasp-offsite-backup.sh"]
+    O --> O1["scp / rsync / rclone"]
+    O --> O2["age public-key encryption<br/>VM cannot decrypt what it sends"]
+    O --> O3["remote size confirmed after upload"]
+
+    T --> S["wasp-selftest.sh"]
+    S --> S1["restore proof — throwaway DB, real restore"]
+    S --> S2["proves the read-only account refuses writes"]
+
+    T --> I["wasp-verify-integrity.sh"]
+    I --> I1["installed tooling vs signed manifest"]
+
+    T --> N["wp-notify.sh"]
+    N --> N1["host-side msmtp — works when WordPress is down"]
+    N --> N2["deduplicated by content, 24h"]
 
     style T fill:#1f2937,stroke:#22c55e,color:#fff
     style M1 fill:#1f2937,stroke:#22c55e,color:#fff
     style P2 fill:#1f2937,stroke:#22c55e,color:#fff
+    style S1 fill:#1f2937,stroke:#22c55e,color:#fff
+    style O2 fill:#1f2937,stroke:#22c55e,color:#fff
 ```
 
 ---

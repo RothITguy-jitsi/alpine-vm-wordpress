@@ -47,6 +47,7 @@ It's also honest about where it stops. Every control here states its own limits 
 
 - [Why I built this](#why-i-built-this)
 - [What This Is](#what-this-is)
+- [Incident Playbook](INCIDENT-PLAYBOOK.md)
 - [Architecture Diagrams](ARCHITECTURE.md)
 - [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
@@ -57,7 +58,10 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Login Protection](#login-protection)
 - [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
 - [Verifying What You Run](#verifying-what-you-run-minisign)
+- [Vulnerability Exceptions](#vulnerability-exceptions)
+- [Nginx Proxy Manager settings](#nginx-proxy-manager--recommended-configuration)
 - [Off-VM Backup](#off-vm-backup)
+  - [Creating the encryption key](#creating-the-encryption-key)
 - [Self-Test](#self-test-proving-the-guarantees-hold)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional)](#outbound-firewall-optional)
@@ -94,6 +98,14 @@ Run `install.sh` on a Proxmox VE host as root. It will:
    - *Stage 2* — install Podman, create the two segmented container networks, stand up MariaDB → WordPress → CrowdSec, generate a syntax-checked nftables ruleset, configure hourly log rotation, install Trivy and Lynis, write out the `update.sh` / `wp-hardening.sh` / `validate-wordpress.sh` / `wp-db-backup.sh` management scripts, and run a full post-install validation suite.
 
 Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real time via `qm terminal <VMID>`.
+
+---
+
+## When something reports a finding
+
+**[INCIDENT-PLAYBOOK.md](INCIDENT-PLAYBOOK.md)** — what each alert actually means, what to do first, and what *not* to do. Several of the tempting wrong moves destroy the evidence needed to stop a repeat.
+
+Covers CRITICAL malware findings, vulnerability findings, backup failures, integrity failures and being locked out — plus a RACI so it's settled in advance who decides to take a site offline. At 02:00 is the wrong time to discover nobody can authorise it.
 
 ---
 
@@ -143,6 +155,7 @@ and skips that step. Either way this is what actually gets used:
 │   ├── test-wordpress-vm.sh     # integration test harness (see test/README.md)
 │   └── README.md
 ├── ARCHITECTURE.md             # Mermaid diagrams: components, request flow, install, updates
+├── INCIDENT-PLAYBOOK.md        # what to do when a scan finds something; RACI
 ├── CHANGELOG.md                # what changed and why, including this restructuring
 ├── TODO.md                     # currently open items and why they're deferred
 ├── LICENSE                     # MIT
@@ -543,6 +556,112 @@ Proxmox host and compare from there.
 
 ---
 
+### Nginx Proxy Manager — recommended configuration
+
+Generate it filled in with your own values:
+
+```sh
+wp-hardening.sh nginx-snippet
+```
+
+What follows is the reference version. **Apply section A first, restart NPM, confirm the site still loads, then do section B.** A server block naming a `limit_req` zone that doesn't exist yet fails to load, and NPM answers **503 for the entire host** — the whole site, not just the admin path.
+
+#### A. NPM host → `/data/nginx/custom/http_top.conf`
+
+Create the file if it isn't there, then restart the NPM container.
+
+```nginx
+# POST only. An empty key is not rate limited, so every GET — the CSS, JS
+# and images the login page pulls — passes freely.
+map $request_method $wplogin_limit_key {
+    POST    $binary_remote_addr;
+    default "";
+}
+limit_req_zone $wplogin_limit_key zone=wplogin:10m rate=6r/m;
+```
+
+`limit_req_zone` lives in nginx's `http` block, which the Advanced tab cannot reach — that's why it needs its own file.
+
+> **Why the `map`, and not just `$binary_remote_addr`.** `limit_req` returns **503 by default**, and a location matching `^/(wp-admin/|wp-login\.php|SLUG)` matches every asset the login page loads — a dozen or more requests. Keyed on the address alone, a 6-per-minute budget is spent by the page loading *itself*, and everything after gets 503 while the front page keeps working. Keying on POST counts only the actual login submission, which is the thing worth limiting.
+
+#### B. Proxy host → Edit → **Advanced** tab → Custom Nginx Configuration
+
+```nginx
+# Admin paths, restricted at the EDGE.
+# nginx is the edge, so $remote_addr IS the client — there is no header to
+# trust and no substitution step that can fail silently. Apache enforces the
+# same restriction independently; two layers that fail in different ways.
+location ~* ^/(wp-admin/|wp-login\.php|YOUR-SLUG) {
+    allow 192.168.100.0/24;      # your LAN
+    allow 203.0.113.10;          # your public IP
+    deny all;
+
+    # Safe now that the zone keys on POST — assets are never counted.
+    # Requires the map + zone from section A to exist first.
+    limit_req zone=wplogin burst=5 nodelay;
+    limit_req_status 429;   # not the default 503
+
+    proxy_pass http://VM-IP:80;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 120s;
+}
+
+# Blocked in Apache too; stopping it here saves the round trip.
+location = /xmlrpc.php { deny all; }
+
+# Never serve these, whatever WordPress or a plugin thinks.
+location ~* ^/(wp-config\.php|readme\.html|license\.txt)$ { deny all; }
+location ~* /\.(git|env|svn|ht) { deny all; }
+
+# Uploads should never execute.
+location ~* ^/wp-content/uploads/.*\.(php|phtml|phar|php[0-9])$ { deny all; }
+```
+
+**On `X-Forwarded-For $remote_addr`** — NPM defaults to `$proxy_add_x_forwarded_for`, which *appends* to whatever the client sent, so a forged header arrives as `<forged>, <real>`. mod_remoteip should still choose correctly, but only while `RemoteIPTrustedProxy` is exactly right. Replacing states the truth and removes the class.
+
+#### Also worth enabling on the proxy host
+
+| Setting | Why |
+|---|---|
+| **Block Common Exploits** | Cheap, catches obvious probes before they reach the VM |
+| **Websockets Support** | Only if a plugin needs it — off otherwise |
+| **Force SSL** + **HTTP/2** + **HSTS** | The VM sets `FORCE_SSL_ADMIN` when a proxy is configured; without Force SSL you get redirect loops |
+| **Cache Assets** | Optional. Don't enable it if a plugin serves dynamic content from `/wp-content/` |
+
+#### If you get 503 after applying any of this
+
+**503 is not the IP restriction** — that returns 403. It means one of three things:
+
+1. **`limit_req` is rejecting you.** This is the common one, and its default status *is* 503. If the zone keys on the client address rather than POST, loading the login page exhausts the budget on its own assets. Use the `map` in section A and set `limit_req_status 429` so a rate limit is at least distinguishable from an outage.
+2. nginx's config failed to load — usually a `limit_req` zone that doesn't exist yet.
+3. nginx genuinely can't reach the backend.
+
+To tell 1 from 2 and 3, ask the VM directly — this bypasses nginx entirely:
+
+```sh
+doas podman exec wordpress php -r '
+$c=stream_context_create(["http"=>["timeout"=>8,"ignore_errors"=>true]]);
+@file_get_contents("http://127.0.0.1/wp-login.php",false,$c);
+echo ($http_response_header[0]??"none")."\n";'
+```
+
+**403 or 200 from inside means the VM is fine and the 503 is nginx.** A 403 there is correct — the request comes from an address that isn't in your allow list.
+
+1. Clear the Advanced tab, save, confirm the site returns
+2. Reapply **one block at a time**, restarting NPM between each
+3. The usual cause is a `limit_req` zone that doesn't exist yet
+
+If the site is still 503 with an empty Advanced tab, the problem is on the VM:
+
+```sh
+doas podman ps -a --format '{{.Names}} {{.Status}}'
+doas podman exec wordpress apache2ctl configtest
+doas podman logs --tail 40 wordpress
+```
+
 ### Hardening at the proxy
 
 ```sh
@@ -558,6 +677,36 @@ It also sets `X-Forwarded-For $remote_addr` rather than NPM's default `$proxy_ad
 And an edge rate limit (6/min per real IP) that costs no WordPress bootstrap — the one control here that holds even if everything downstream is misconfigured, since it never touches `X-Forwarded-For`.
 
 **What it doesn't fix:** the login guard, CrowdSec and GeoIP still identify clients from `X-Forwarded-For`, so they still depend on mod_remoteip. The snippet makes that header trustworthy; it doesn't remove the dependency. That's stated in the output too.
+
+## Vulnerability Exceptions
+
+Accepting a HIGH or CRITICAL finding in order to update is sometimes the right call — the fix may not exist yet. What must not happen is that it becomes a private decision nobody sees again.
+
+There is no approval workflow here, deliberately: that belongs in whatever process you already use, and a half-built one inside an installer would be worse than none. What this does is make the decision **recorded, scoped, expiring and visible**.
+
+```sh
+wp-hardening.sh exceptions          # every exception, with status
+wp-hardening.sh exceptions-check    # the weekly cron entry point
+```
+
+Accepting a finding requires a written justification of at least 15 characters, and records:
+
+| Field | Why |
+|---|---|
+| **Image digest** | The exception applies to *that image only*. A different image has different vulnerabilities; a blanket "yes" outliving its subject is how exceptions become policy by accident |
+| **The CVE list** | So a reviewer can tell whether the reason still applies — the only question a review actually asks |
+| **Who accepted it** | |
+| **Expiry** (90 days default) | Without it, the first person to type a reason decides forever |
+
+An unexpired exception for the same digest is honoured without re-asking — re-prompting for a recorded decision is how people learn to type anything to get past a prompt. An expired one says so and must be re-argued.
+
+**The log is the record; the email is a copy.** Mail fails, and an audit trail that depends on delivery isn't one. `/var/log/wasp-vuln-exceptions.log` is append-only and root-owned.
+
+Notices go to the governance address collected at install — with a warning if it matches the admin address, since a record only the decision-maker receives is a diary rather than oversight. The email now carries **the actual CVEs accepted**, so it's reviewable without SSHing in.
+
+A weekly job (Monday 08:00 UTC) emails when an exception lapses within 14 days — enough notice to re-argue it before an update is blocked by it. Silent otherwise.
+
+---
 
 ## Off-VM Backup
 
@@ -577,6 +726,156 @@ wasp-offsite-backup.sh status
 ```
 
 Sent automatically after each verified nightly backup, and `wasp-selftest.sh` checks the newest backup exists remotely at the right size.
+
+### Creating the encryption key
+
+**Do this on your own machine, not the VM.** The VM must only ever hold the
+public half — that's what makes a root compromise there unable to read your
+backups. `wasp-offsite-backup.sh init` refuses a private key if you paste one
+by mistake.
+
+<details>
+<summary><b>Linux</b></summary>
+
+| Distribution | Install |
+|---|---|
+| Debian 12+ / Ubuntu 22.04+ | `sudo apt install age` |
+| Fedora / RHEL / Rocky | `sudo dnf install age` |
+| Arch / Manjaro | `sudo pacman -S age` |
+| openSUSE | `sudo zypper install age` |
+| Alpine | `sudo apk add age` |
+| Bazzite / Silverblue (immutable) | `brew install age` — avoids `rpm-ostree` and a reboot |
+
+If your distribution's `age` is missing or old, the release binary always works:
+
+```sh
+curl -LO https://github.com/FiloSottile/age/releases/latest/download/age-v1.2.1-linux-amd64.tar.gz
+tar xzf age-v1.2.1-linux-amd64.tar.gz
+sudo install -m755 age/age age/age-keygen /usr/local/bin/
+```
+
+Check the [releases page](https://github.com/FiloSottile/age/releases) for the current version — the filename above will go stale.
+
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+```sh
+brew install age
+```
+
+Or MacPorts: `sudo port install age`
+
+No Homebrew? Use the darwin build from the [releases page](https://github.com/FiloSottile/age/releases) — `arm64` for Apple Silicon, `amd64` for Intel.
+
+</details>
+
+<details>
+<summary><b>Windows 11</b></summary>
+
+```powershell
+winget install FiloSottile.age
+```
+
+Or with Scoop: `scoop install age`
+
+If neither is available, download `age-vX.Y.Z-windows-amd64.zip` from the [releases page](https://github.com/FiloSottile/age/releases), extract it, and run the commands from that folder — or add it to `PATH`.
+
+**Close and reopen PowerShell** after installing, or `age-keygen` won't be found.
+
+</details>
+
+<details>
+<summary><b>Windows Server</b></summary>
+
+`winget` isn't present on most Server installations, so use the release binary:
+
+```powershell
+$v = "v1.2.1"   # check the releases page for the current version
+Invoke-WebRequest -Uri "https://github.com/FiloSottile/age/releases/download/$v/age-$v-windows-amd64.zip" -OutFile age.zip
+Expand-Archive age.zip -DestinationPath C:\age
+cd C:\age\age
+.\age-keygen.exe -o wasp-backup-key.txt
+```
+
+If `Invoke-WebRequest` fails on an older Server with a TLS error:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+```
+
+</details>
+
+#### Generate it
+
+Same command everywhere (`.\age-keygen.exe` on Windows):
+
+```sh
+age-keygen -o wasp-backup-key.txt
+```
+
+It prints one line to the terminal:
+
+```
+Public key: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+```
+
+**That `age1...` string is what you paste** when `init` asks. It's also in the
+file, on the `# public key:` line, if the terminal has scrolled:
+
+```sh
+grep 'public key' wasp-backup-key.txt          # Linux/macOS
+Select-String 'public key' wasp-backup-key.txt # PowerShell
+```
+
+#### Then look after the file
+
+`wasp-backup-key.txt` contains the `AGE-SECRET-KEY-...` line. **That never goes
+on the VM or in the backup bucket** — an attacker may already hold both, and
+putting it in either defeats the point entirely.
+
+A password manager is fine. So is an encrypted USB stick kept somewhere else.
+What matters is that it's a third location.
+
+Lose it and every encrypted backup is unreadable, permanently. There is no
+recovery path; that's what encryption means.
+
+#### Prove it works before you rely on it
+
+```sh
+# on the VM, after your first backup
+wasp-offsite-backup.sh restore --list
+wasp-offsite-backup.sh restore --file <name>.age --to-file /tmp/check.sql.gz
+```
+
+Paste the private key when prompted (input is hidden). It decrypts, verifies
+gzip integrity, and writes the file — touching nothing else.
+
+Do this **once, now**. An encrypted backup whose key is lost or mistyped isn't
+a backup, and an incident is the worst possible time to find that out.
+
+### Setup
+
+```sh
+wasp-offsite-backup.sh init
+```
+
+Generates the SSH key **on the VM** (never transmitted, only the public half travels), prints the exact `authorized_keys` line to install on the backup host — **with the `command="rrsync -no-del ..."` prefix**, because that's what makes the key append-only — generates an age keypair, pins the destination's host key, and writes the config.
+
+### Restore
+
+```sh
+wasp-offsite-backup.sh restore --list
+wasp-offsite-backup.sh restore --file <name> --to-file /tmp/check.sql.gz
+wasp-offsite-backup.sh restore --file <name> --to-database
+```
+
+Fetches from the destination if it isn't local, prompts for the private key (hidden input) or takes `--key-file`, decrypts in a temp directory, and verifies gzip integrity before doing anything with it.
+
+`--to-database` **replaces the live database**. It takes a backup of the current state first — unprompted, and refuses to proceed if that fails — then requires typing `REPLACE`. Restoring the wrong archive is only recoverable if what you overwrote still exists.
+
+**Do a `--to-file` restore now, before you need one.** An encrypted backup whose key is lost or wrong is not a backup, and finding that out during an incident is the worst possible time.
 
 ### Encryption
 
