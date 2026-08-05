@@ -102,9 +102,20 @@ restore_test() {
 
   _bk=$(ls -1t "$BACKUP_DIR"/*.sql.gz 2>/dev/null | head -1)
   if [ -z "$_bk" ]; then
-    _f "No backup archive found in ${BACKUP_DIR}" \
-       "Run one first: wp-db-backup.sh"
-    return
+    # Take one rather than just refusing. A first run on a fresh VM has no
+    # backup yet, and reporting a FAIL for "you have not done the thing this
+    # test needs" trains people to ignore the output. Observed exactly that:
+    # the first self-test failed, a backup was taken, the re-run passed 18/18.
+    _i "No backup archive yet — taking one now so this test can run"
+    if /usr/local/bin/wp-db-backup.sh >/dev/null 2>&1; then
+      _bk=$(ls -1t "$BACKUP_DIR"/*.sql.gz 2>/dev/null | head -1)
+      [ -n "$_bk" ] && _p "Took a backup to test with"
+    fi
+    if [ -z "$_bk" ]; then
+      _f "No backup archive in ${BACKUP_DIR} and one could not be taken" \
+         "Run wp-db-backup.sh by hand and read its output"
+      return
+    fi
   fi
   _age_h=$(( ( $(date +%s) - $(stat -c %Y "$_bk" 2>/dev/null || echo 0) ) / 3600 ))
   _i "Testing $(basename "$_bk") ($(du -h "$_bk" | cut -f1), ${_age_h}h old)"

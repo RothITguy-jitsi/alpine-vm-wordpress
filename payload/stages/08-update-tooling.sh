@@ -30,6 +30,8 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/wasp-verify-integrity.sh
+[ -f "${PAYLOAD_DIR}/bin/wasp-testreport.sh" ] && \
+  install -m 0755 "${PAYLOAD_DIR}/bin/wasp-testreport.sh" /usr/local/bin/wasp-testreport.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
 # Only install what the chosen method needs. rclone is ~50 MB, so it is not
 # pulled onto a VM that will never use it.

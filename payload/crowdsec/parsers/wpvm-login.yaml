@@ -16,9 +16,22 @@ filter: "evt.Line.Labels.type == 'wpvm-login'"
 name: rothitguy/wpvm-login-logs
 description: "Parse WPVM Login Guard authentication events"
 grok:
-  pattern: '.*\[wpvm-login\] event=%{WORD:wpvm_event} ip=%{IP:wpvm_ip} user=%{NOTSPACE:wpvm_user}'
+  # The leading [%{DATA:apache_ts}] captures Apache's own timestamp, e.g.
+  #   [Wed Aug 05 02:49:19.350824 2026]
+  # Without it every event arrived with no evt.StrTime, and cscli warned:
+  #   "Line N is missing evt.StrTime ... will prevent your logs being
+  #    processed in time-machine/forensic mode"
+  # Live detection worked regardless — CrowdSec falls back to arrival time —
+  # but replaying a log after an incident, which is exactly when you want it,
+  # would have had nothing to order events by.
+  pattern: '\[%{DATA:apache_ts}\].*\[wpvm-login\] event=%{WORD:wpvm_event} ip=%{IP:wpvm_ip} user=%{NOTSPACE:wpvm_user}'
   apply_on: message
 statics:
+  # Hand the captured timestamp to CrowdSec. s02-enrich/dateparse-enrich reads
+  # evt.StrTime and normalises it; without this the field is empty and the
+  # event is only usable in live mode.
+  - target: evt.StrTime
+    expression: "evt.Parsed.apache_ts"
   - meta: log_type
     value: wpvm_login
   - meta: source_ip

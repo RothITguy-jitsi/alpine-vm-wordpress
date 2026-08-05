@@ -76,9 +76,13 @@ else
   warn "  Add one later: /opt/crowdsec/config/postoverflows/s01-whitelist/"
 fi
 ok "Login brute-force parser + scenario installed"
-warn "  Untested against live traffic. Verify the parser once the VM is up:"
-warn "    doas podman exec crowdsec cscli explain --file /var/log/wordpress/error.log --type wpvm-login"
-warn "    doas podman exec crowdsec cscli scenarios list | grep wpvm"
+# `ok`, not `warn`. These are instructions, not failures — and a warning
+# glyph on a to-do sends the operator hunting a problem that does not exist.
+# Observed exactly that: a clean install was read as having CrowdSec errors
+# because three informational lines carried a warning marker.
+ok "  Verify the parser loaded, once the VM is up:"
+ok "    doas podman exec crowdsec cscli parsers list | grep wpvm"
+ok "    doas podman exec crowdsec cscli scenarios list | grep wpvm"
 ok "acquis.yaml: Apache logs + syslog"
 
 podman rm -f crowdsec 2>/dev/null || true

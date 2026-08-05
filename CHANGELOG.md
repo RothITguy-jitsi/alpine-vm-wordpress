@@ -6,6 +6,171 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — CrowdSec parser confirmed loaded; timestamp capture added
+
+Both custom rules are live on the VM:
+
+```
+rothitguy/wpvm-login-logs         enabled,local
+rothitguy/wpvm-login-bruteforce   enabled,local
+```
+
+That settles the earlier path bug — the files are somewhere the container can
+read, and CrowdSec has parsed and enabled them.
+
+**The 🔴 "parser failure" markers in `cscli explain` are correct behaviour, not
+a fault**, and worth writing down because they read alarmingly. `explain` took
+the last ten lines of the error log, and every one was an Apache startup
+message or an authz denial — `AH00170`, `AH00163`, `AH01630`. None contains
+`[wpvm-login]`, so this parser declines them, and 🔴 means "no parser claimed
+this line". A parser that matched Apache's own startup noise would be the bug.
+
+There are no login events to test against yet because the redirect loop has
+prevented anyone reaching the login form.
+
+**A real defect the same output exposed:** every line warned
+
+> Line N is missing evt.StrTime ... will prevent your logs being processed in
+> time-machine/forensic mode
+
+The grok captured event, IP and username but not Apache's timestamp. Live
+detection was unaffected — CrowdSec falls back to arrival time — but replaying
+a log after an incident, which is precisely when you want it, would have had
+nothing to order events by.
+
+Fixed by capturing the leading `[%{DATA:apache_ts}]` and setting
+`evt.StrTime` from it, so `s02-enrich/dateparse-enrich` can normalise it.
+Verified the pattern still matches real `failed` and `lockout` lines, extracts
+the timestamp, and still correctly declines Apache's own log lines.
+
+---
+
+## Unreleased — Three instructions were wearing a warning glyph
+
+The operator asked to look at "the CrowdSec errors". There are none. Every
+CrowdSec check in that run passed: LAPI up, bouncer key generated, service
+running, bouncer connected, container up, enrolled, whitelist written, and
+both post-install validation checks green.
+
+What produced the impression was three lines printed with `warn`:
+
+```
+⚠    Untested against live traffic. Verify the parser once the VM is up:
+⚠      doas podman exec crowdsec cscli explain ...
+⚠      doas podman exec crowdsec cscli scenarios list | grep wpvm
+```
+
+Those are a to-do, not a failure. A warning marker on an instruction sends
+someone hunting a problem that does not exist — which is precisely what
+happened, in the middle of an already-long debugging session. Changed to `ok`,
+and the command corrected to `cscli parsers list`, which is what actually
+answers "did the parser load".
+
+One other instance of the pattern was checked and left alone: the MaxMind
+block in `lib/01` uses `msg_warn` for "GeoIP will be SKIPPED" followed by the
+command to enable it later. There the warning is genuine — a control the
+operator asked for is not active — and the command is part of the remedy
+rather than a bare instruction.
+
+Small, and worth fixing: this project asks operators to read a lot of install
+output, and that only works if the severity markers mean what they say.
+
+---
+
+## Unreleased — The 502 was an infinite redirect_to loop, caused by the bare slug
+
+From the operator's session:
+
+```
+/xlzr?redirect_to=…/xlzr?redirect_to=…/xlzr?redirect_to=… &reauth=1
+502 bad gateway
+```
+
+and, decisively, *"with no custom nginx configuration still 502"* — so not the
+proxy.
+
+**Cause, and it is a consequence of removing the `-login` suffix.** With the
+bare slug, the login page and the URL WordPress redirects unauthenticated
+users to are **the same URL**. When `wp-login.php` decides a reauth is needed
+it redirects to `wp_login_url($redirect_to)`, where `$redirect_to` is the
+current `REQUEST_URI` — which already contains a `redirect_to`. Each pass
+nests another copy, the URL grows exponentially, and it eventually exceeds the
+proxy's header buffer. nginx then answers **502**, which looks like a backend
+fault and is not one.
+
+With `<slug>-login` this could not happen: the entry point and the login page
+were different URLs, so the redirect terminated. That consequence was not
+obvious when the suffix was removed, and it is recorded here rather than
+quietly patched — the obscurity argument for removing it still holds, but it
+had a cost that needed paying separately.
+
+**Fixed in the slug mu-plugin**, two independent ways:
+
+- `login_init` at priority 1 replaces a `redirect_to` that points back at the
+  login page with `admin_url()`. Being sent to the login form *after* logging
+  in is meaningless, so nothing is lost. Triggers on the login slug,
+  `wp-login.php`, any already-nested `redirect_to`, or a value over 512
+  characters — the last being a catch-all for whatever else might produce this
+  shape.
+- A `wp_redirect` filter at priority 200 refuses to emit any location
+  containing more than one `redirect_to`, stripping the query entirely.
+
+Verified against six shapes: normal and deep admin targets are preserved;
+login-slug, `wp-login.php`, already-nested and absurd-length values are
+replaced.
+
+---
+
+## Unreleased — Self-test passes 18/18 on hardware; xmlrpc status was lying
+
+`wasp-selftest.sh all` on a real VM: **18 passed, 0 failed.**
+
+Both guarantees are now proven against real data rather than reasoned about:
+
+- **Backup restore** — 12 tables restored into a throwaway instance, `siteurl`
+  present, users and posts intact, and row counts consistent with production
+  (4 vs 4), so a silently shrinking backup would have shown.
+- **Off-VM copy** — *"Newest backup is also present off-VM, same size."*
+- **Candidate DB isolation** — INSERT, UPDATE, DELETE, CREATE and DROP all
+  correctly denied, and the account cannot reach the production database.
+
+Quietly the most significant line is `Table prefix: wpebd2cd_`. That is the
+randomised per-install prefix, read from inside the container — confirming the
+fix for expanding container variables on the host, which had left four
+features inert while reporting success.
+
+**`wp-hardening.sh status` was under-reporting xmlrpc.** It grepped for
+`xmlrpc.php.*Require all denied` on a single line, but the directive spans
+three:
+
+```apache
+<Files "xmlrpc.php">
+    Require all denied
+</Files>
+```
+
+So it printed `OPEN` for a file that had been blocked since install. A status
+check that under-reports protection is worse than none — it prompts an
+operator to "fix" something already correct, and in this case appended a
+redundant second block. Replaced with a multi-line-aware check, verified
+against configs with and without the directive.
+
+**Two smaller fixes from the same session:**
+
+- `wasp-selftest.sh` now takes a backup when none exists instead of reporting
+  FAIL. The observed sequence was: first run fails, operator takes a backup,
+  re-run passes 18/18 — a FAIL for "you have not done the prerequisite" is
+  noise that teaches people to skim the output.
+- `wasp-testreport.sh` is now shipped in `payload/bin/` and installed to
+  `/usr/local/bin`. It had been delivered as a standalone file, so the VM
+  answered `command not found`.
+
+`check-grep-count.py` caught a `$(grep -c ...) || echo 0` in
+`wasp-testreport.sh` — written before that check existed. The check found it
+the first time the file entered the tree.
+
+---
+
 ## Unreleased — A shipped file was unsigned, and the manifest design caused it
 
 Raised as the most urgent defect in a fifth evaluation:

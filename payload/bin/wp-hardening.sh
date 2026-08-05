@@ -43,7 +43,17 @@ restart_wp() { PRUN restart wordpress >/dev/null 2>&1 && echo "  ✔  WordPress 
 feature_state() {
   case "$1" in
     8g)          grep -q '^# 8G DISABLED' "$HTACCESS" 2>/dev/null && echo DISABLED || echo ENABLED ;;
-    xmlrpc)      grep -q 'xmlrpc.php.*Require all denied' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
+    # Multi-line aware. The old form was a single-line grep for
+    # 'xmlrpc.php.*Require all denied', but the directive spans three lines:
+    #   <Files "xmlrpc.php">
+    #       Require all denied
+    #   </Files>
+    # so it never matched and reported OPEN on a file that had been blocked
+    # since install. A status check that under-reports protection is worse
+    # than none: it prompts an operator to "fix" something already correct,
+    # which is how a duplicate block gets appended.
+    xmlrpc)      awk '/<Files[^>]*xmlrpc\.php/{f=1} f&&/Require all denied/{print "BLOCKED"; exit} /<\/Files>/{f=0} END{if(!f)exit}' \
+                   "$APACHE_CONF" 2>/dev/null | grep -q BLOCKED && echo BLOCKED || echo OPEN ;;
     uploads-php) grep -q 'wp-content/uploads' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
     debug)       PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo UNKNOWN ;;
   esac

@@ -70,6 +70,71 @@ add_filter( 'register_url',     'wpvm_swap_login_path', 100 );
 add_filter( 'wp_redirect', 'wpvm_swap_login_path', 100 );
 
 /*
+ * Break the redirect_to loop.
+ *
+ * Since the bare slug became the login URL, the login page and the page
+ * WordPress redirects unauthenticated users to are THE SAME URL. So when
+ * wp-login.php decides a reauth is needed, it redirects to
+ * wp_login_url($redirect_to) — where $redirect_to is the current REQUEST_URI,
+ * which already contains a redirect_to. Each pass nests another copy:
+ *
+ *   /slug?redirect_to=…/slug?redirect_to=…/slug?redirect_to=…&reauth=1
+ *
+ * The URL grows exponentially until it exceeds the proxy's header buffer and
+ * the request comes back as 502 Bad Gateway — which looks like a proxy fault
+ * and is not one.
+ *
+ * With the old "<slug>-login" suffix this could not happen: the entry point
+ * and the login page were different URLs, so the redirect terminated. That is
+ * a consequence of removing the suffix which was not obvious at the time, and
+ * is worth stating rather than quietly patching.
+ *
+ * The fix: a redirect_to that points back at the login page is meaningless —
+ * nobody wants to be sent to the login form after logging in. Replace it with
+ * the admin URL, which is what was intended.
+ */
+function wpvm_break_login_redirect_loop() {
+    if ( empty( $_REQUEST['redirect_to'] ) ) {
+        return;
+    }
+    $rt = (string) $_REQUEST['redirect_to'];
+
+    $points_at_login =
+        ( defined( 'WPVM_LOGIN_SLUG' ) && WPVM_LOGIN_SLUG !== ''
+          && strpos( $rt, '/' . WPVM_LOGIN_SLUG ) !== false )
+        || strpos( $rt, 'wp-login.php' ) !== false
+        // A nested redirect_to at all means this has already bounced once.
+        || strpos( $rt, 'redirect_to' ) !== false
+        // Defensive: a legitimate redirect_to is short. Anything this long is
+        // the loop, whatever produced it.
+        || strlen( $rt ) > 512;
+
+    if ( $points_at_login ) {
+        $safe = admin_url();
+        $_REQUEST['redirect_to'] = $safe;
+        if ( isset( $_GET['redirect_to'] ) )  { $_GET['redirect_to']  = $safe; }
+        if ( isset( $_POST['redirect_to'] ) ) { $_POST['redirect_to'] = $safe; }
+    }
+}
+/* login_init fires on wp-login.php before it decides where to send anyone. */
+add_action( 'login_init', 'wpvm_break_login_redirect_loop', 1 );
+
+/*
+ * Second line of defence: refuse to emit a redirect that still contains a
+ * nested redirect_to. Priority 200 so it runs after wpvm_swap_login_path has
+ * rewritten the path.
+ */
+add_filter( 'wp_redirect', function ( $location ) {
+    if ( is_string( $location ) && substr_count( $location, 'redirect_to' ) > 1 ) {
+        $parts = wp_parse_url( $location );
+        $base  = ( $parts['scheme'] ?? 'https' ) . '://' . ( $parts['host'] ?? '' )
+               . ( $parts['path'] ?? '/' );
+        return $base;
+    }
+    return $location;
+}, 200 );
+
+/*
  * Emails — password reset and new-user notifications embed a login URL
  * built from network_site_url() in some code paths that run before the
  * filters above are registered in a multisite context.
