@@ -1,6 +1,12 @@
-# WASP — WordPress Alpine Security Platform
+<div align="center">
+  <img src="docs/wasp-logo.png" width="260" alt="WASP — WordPress Alpine Security Platform"/>
 
-*Hardened WordPress provisioning for Proxmox VE.*
+  **Secure · Harden · Protect · Monitor**
+
+  *Hardened WordPress provisioning for Proxmox VE.*
+</div>
+
+# WASP — WordPress Alpine Security Platform
 
 A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, structurally-verified automated backups (see [Known Limitations](#known-limitations) for exactly what "verified" covers), and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 

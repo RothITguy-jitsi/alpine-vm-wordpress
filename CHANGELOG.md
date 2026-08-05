@@ -6,6 +6,234 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Branding, VM notes, and a heredoc that would have run 27 commands
+
+Logo added at `docs/wasp-logo.png` and used in the README header.
+
+**The Proxmox VM description is now a real page**, not a one-line summary.
+Proxmox renders that field as Markdown and it is the first thing anyone sees
+on the VM, so it now carries the logo linked to the repository, the build
+number, **the login URL for this build**, five things to do next, a command
+cheat sheet, and a lockout table mapping 403 / 503 / 502 / SSH-refused to
+their actual causes.
+
+The login URL is there specifically because of the session that prompted
+this: a VM served `/<slug>-login` while the operator visited `/<slug>`, and
+nothing on screen said which build was installed.
+
+**The first draft of that block was a serious bug.** It used an unquoted
+heredoc containing Markdown code spans — and
+`test/check-heredoc-backticks.py` reported **27 backticked commands that would
+have executed on the Proxmox host** while building the VM description:
+`doas validate-wordpress.sh`, `qm snapshot`, `podman logs`, and the rest. The
+render confirmed it: the output was littered with "command not found".
+
+Rewritten as a **quoted** heredoc with `@@PLACEHOLDER@@` tokens substituted by
+`sed` afterwards. The document is inert; nothing in it can be interpreted.
+That is the right pattern for any generated document containing shell syntax,
+and it is what the earlier nftables incident should already have taught.
+
+Worth noting the check was written after that earlier incident and has now
+caught the same class twice — the second time in code written by the person
+who wrote the check, minutes after running it.
+
+**The installer intro now states who this is for and who it is not.** An MSP
+or consultant where a compromise is a 2am phone call; anyone running WordPress
+on their own hardware who would rather not become an incident responder. And
+not: throwaway test sites, shared hosting, or anyone wanting a one-click
+install with no decisions — several prompts here have consequences worth
+reading, and saying so is more honest than implying it is effortless.
+
+---
+
+## Unreleased — Builds are identified now, and the validator probed the wrong URL
+
+Requested after a long, avoidable diagnosis. A VM installed from an earlier
+build served its login page at `/<slug>-login`; a later build moved it to the
+bare `/<slug>`. Several hours went into imagined faults in mod_remoteip,
+nftables chains, `limit_req` and `X-Forwarded-Proto` before anyone established
+**which of the two was actually running**. The operator was simply visiting a
+URL that build did not serve.
+
+`WASP_VERSION` is now declared in `install.sh`, written to `vars.sh`, and
+printed by the install banner, the validator header and the test report —
+alongside a short note naming the behaviour most likely to differ. A log that
+does not state its build cannot be reasoned about safely, and this project has
+now proved that at cost.
+
+**A real bug found while doing it:** `validate-wordpress.sh` still probed
+`http://127.0.0.1/${WP_ADMIN_SLUG}-login`. It was never updated when the
+suffix was removed. On a current build it would report a 404 for a slug that
+works; on an older build it printed a URL that no longer exists. Both are
+routes to an operator concluding they are locked out of a working site — and
+in this case it printed the *old* URL, which was the only correct instruction
+on screen while everything I was saying was wrong.
+
+The test report now also prints the login URL derived from the installed
+configuration, so the right path is in front of the operator before anything
+else is interpreted.
+
+Two stale comments referring to `/slug-login` were corrected. Remaining
+`*-login` matches are filenames (`wpvm-login.yaml`,
+`02-wpvm-login-guard.php`) and the literal `wp-login.php`, which are correct.
+
+---
+
+## Unreleased — SECURITY: WEB_CIDR permitted the entire LAN
+
+Proven on a live VM. With `WEB_CIDR=192.168.100.101`, a curl from
+`192.168.100.148`:
+
+```
+* Established connection to 192.168.100.100 (port 80) from 192.168.100.148
+```
+
+and the loaded ruleset containing, plainly:
+
+```
+ip saddr { 192.168.100.101 } tcp dport { 80, 443 } accept
+```
+
+The rule is real, loaded and readable. It matches nothing.
+
+**Podman publishes a container port by DNAT'ing it in prerouting.** After DNAT
+the destination is the container's address rather than the host's, so the
+packet traverses the **FORWARD** hook — the filter **INPUT** chain never sees
+it. Every `WEB_CIDR` restriction written since this feature was added has been
+a no-op for the published web port, while reading as a working rule and
+passing every check.
+
+This is the third instance of the same shape: the wp-admin restriction failing
+open when mod_remoteip stopped substituting, the login rate limiter counting
+every visitor as one address, and now this. In all three the control was
+present, correct-looking, and permissive — and in all three the automated
+checks confirmed presence rather than effect.
+
+**Fixed** by enforcing in the forward chain, placed *before* the blanket
+`ip daddr 10.89.10.0/24 accept` or it would never be reached. The negated set
+excludes loopback and the container networks so host-local health probes and
+container-to-container traffic are unaffected; only genuinely external sources
+outside `WEB_CIDR` are dropped, with rate-limited logging.
+
+**The validator now checks the FORWARD chain specifically**, and fails with an
+explanation if it finds the restriction only in `input` — because "the rule
+exists somewhere in the ruleset" is precisely the evidence that made the
+broken version look correct for weeks.
+
+Worth stating plainly: this was found because the operator ran a curl, not
+because anything in this repository noticed. Every static check passed
+throughout.
+
+---
+
+## Unreleased — libmaxminddb installed with GeoIP
+
+Reported: `geoip-test 8.8.8.8` answered *"mmdblookup is not installed, so the
+address cannot be resolved"*. Fair — a diagnostic that stops to tell you to
+install a diagnostic is a poor trade for 100 KB, particularly when the thing
+it is diagnosing was just enabled in the same run.
+
+`wp-geoip-setup.sh` now installs `libmaxminddb` on the host as part of
+enabling GeoIP, so the test works the first time it is run. It is host-side
+only and touches nothing in the containers.
+
+`wp-hardening.sh geoip-test` also now offers to install it inline when it is
+missing, for VMs that predate this.
+
+---
+
+## Unreleased — Backup encryption was configured and silently not applied
+
+The most serious defect found so far, from a live test report. `vars.sh` held
+a valid recipient:
+
+```
+OFFSITE_AGE_RECIPIENT='age1ug0zyaemm56h0eweg8av4tl00untqr7tw8ugmp3vze2wtmtpfecqhquh6s'
+```
+
+and the bucket listing showed four `.sql.gz` archives and no `.age`. Database
+dumps — password hashes, user emails, private post content — had been going to
+Cloudflare R2 **in plaintext** while the operator had explicitly asked for
+encryption.
+
+**Cause: one line in the wrong place.** `AGE_RECIPIENT="${OFFSITE_AGE_RECIPIENT:-}"`
+sat at line 58; the config file it comes from is sourced at line 103. The
+variable was therefore always empty, `_encrypt_for_upload` returned the
+plaintext path unchanged, and every upload skipped encryption.
+
+What made it survive: `status` reported **"Encryption : NONE"** perfectly
+truthfully. That reads as *"you did not configure this"*, not as *"your
+setting is being ignored"* — so the honest output actively concealed the bug.
+
+Fixed by reading the value after the config loads, with the ordering
+demonstrated in the comment so it is not reintroduced.
+
+**Three false alarms in `wp-mail.sh status`, all in one screen:**
+
+- `File mode: 440 root:UNKNOWN ⚠ expected 440 root:www-data`. GID 33 is
+  `www-data` on Debian but has **no name on Alpine**, so `stat %G` returns
+  `UNKNOWN` and a name comparison can never match. The container is Debian and
+  the host is Alpine; numbers mean the same on both. Now compares `%u:%g`
+  against `0:33`. `validate-wordpress.sh` got this right and passed the same
+  file.
+- Same fault on the directory line.
+- `mu-plugin: MISSING ⚠` — `MU_PLUGIN` was **never assigned**, so the test was
+  `[ -r "" ]`, always false. The validator confirmed the same file present and
+  parsing two sections earlier. Now checks the real path and, beyond presence,
+  whether PHP can parse it.
+
+**`wp-notify.sh: NOTIFY_COOLDOWN_HOURS: parameter not set`** — the default was
+removed by an earlier edit replacing the `_cfg()` helper, and under `set -u`
+that killed `--status`: the command an operator runs to confirm notifications
+work. Restored.
+
+A status screen reporting faults that are not there is worse than one saying
+nothing. It sends someone to fix working components while a real problem —
+here, unencrypted backups leaving the VM — sits three sections below reported
+as a non-event.
+
+---
+
+## Unreleased — The login-guard test was testing the wrong thing
+
+Full report run on hardware: **12 pass, 1 fail.** The failure was in the test,
+not the guard.
+
+It POSTed to `http://127.0.0.1/wp-login.php` from inside the container and
+then looked for the resulting log line. That cannot work: `wp-login.php` is
+IP-restricted, the request originates from the container's own address, Apache
+returns **403 before PHP runs**, and the guard never executes. So it reported
+
+> no wpvm-login entries — guard may not be active
+
+for a guard that was fine, and the same VM's own diagnostic had already shown
+`wp-login.php -> HTTP/1.1 403 Forbidden` from inside, which is the correct
+answer.
+
+A test that must defeat one protection in order to exercise something else is
+testing the wrong thing. Replaced with a direct question to WordPress —
+whether the guard's functions exist and whether its `wp_login_failed` hook is
+registered — which proves it is active without needing to reach a page that is
+deliberately unreachable from there.
+
+A second, separate check now reports whether any real login events have been
+recorded, and says plainly that none is expected until someone reaches the
+login form. Where there are none it prints the two commands that prove the
+CrowdSec parser matches using a synthetic line, so the detection chain can be
+verified without a working login.
+
+**Also fixed:** the report's closing notes still told the operator to browse
+`/<slug>-login`, which stopped being the login URL when the suffix was
+removed. Stale instructions in a test report are worse than none — they send
+someone to a 404 and cast doubt on everything else in the output.
+
+**Still outstanding on that VM:** `remoteip-debug.log` is empty, so
+`proxy-check` cannot yet say whether client addresses are being substituted
+correctly. That needs one successful request through the domain, which the
+redirect loop has been preventing.
+
+---
+
 ## Unreleased — CrowdSec parser confirmed loaded; timestamp capture added
 
 Both custom rules are live on the VM:

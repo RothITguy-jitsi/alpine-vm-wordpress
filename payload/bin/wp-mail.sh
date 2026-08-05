@@ -64,14 +64,31 @@ show_status() {
   echo ""
   # Permissions are part of the status, not a separate audit: a
   # world-readable credentials file is the failure worth catching early.
-  _perm=$(stat -c '%a %U:%G' "$SMTP_FILE" 2>/dev/null || echo "?")
+  # Numeric, not names. GID 33 is www-data on Debian but has NO name on
+  # Alpine, so `stat %G` returns "UNKNOWN" and a name comparison can never
+  # match — reporting a permission fault on a perfectly correct file. The
+  # container is Debian; this host is Alpine. Numbers mean the same on both.
+  _perm=$(stat -c '%a %u:%g' "$SMTP_FILE" 2>/dev/null || echo "?")
   case "$_perm" in
-    "440 root:www-data"|"440 root:33") printf "  %-14s %s\n" "File mode:" "$_perm  ✔" ;;
-    *) printf "  %-14s %s\n" "File mode:" "$_perm  ⚠ expected 440 root:www-data" ;;
+    "440 0:33") printf "  %-14s %s\n" "File mode:" "${_perm} (root:uid33)  ✔" ;;
+    *) printf "  %-14s %s\n" "File mode:" "$_perm  ⚠ expected 440 0:33 (root, group 33)" ;;
   esac
-  [ -r "$MU_PLUGIN" ] \
-    && printf "  %-14s %s\n" "mu-plugin:" "present ✔" \
-    || printf "  %-14s %s\n" "mu-plugin:" "MISSING ⚠ — mail will fall back to PHP mail() and fail"
+  # MU_PLUGIN was never assigned, so this tested `[ -r "" ]` and always
+  # printed MISSING — on a VM where the validator confirmed the file present
+  # and parsing. A status screen that reports a fault which is not there is
+  # worse than one that says nothing: it sends the operator to fix something
+  # that works, in the middle of a real problem elsewhere.
+  _mu=/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php
+  if [ -r "$_mu" ]; then
+    # Present is not the same as loading. Ask PHP whether the hook is live.
+    if podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/01-wpvm-smtp.php >/dev/null 2>&1; then
+      printf "  %-14s %s\n" "mu-plugin:" "present and parses ✔"
+    else
+      printf "  %-14s %s\n" "mu-plugin:" "present but has a PHP SYNTAX ERROR ⚠ — mail will fail"
+    fi
+  else
+    printf "  %-14s %s\n" "mu-plugin:" "MISSING ⚠ — mail will fall back to PHP mail() and fail"
+  fi
   echo ""
   echo "  Verify delivery end-to-end:  wp-mail.sh test you@example.com"
 }

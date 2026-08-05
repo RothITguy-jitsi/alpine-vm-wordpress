@@ -48,6 +48,11 @@ fi
 # and the _cfg() helper was copied across from it complete with a reference to
 # a variable that only exists there. Every notification path failed with
 # "SECRETS_DIR: parameter not set".
+# Restored: this default was removed by an earlier edit that replaced the
+# _cfg() helper, and under `set -u` every path referencing it then died with
+# "NOTIFY_COOLDOWN_HOURS: parameter not set" — including --status, which is
+# the command an operator runs to check that notifications work.
+NOTIFY_COOLDOWN_HOURS="${NOTIFY_COOLDOWN_HOURS:-24}"
 SECRETS_DIR="${SECRETS_DIR:-/home/wpuser/wp/secrets}"
 SMTP_FILE="${SECRETS_DIR}/smtp.ini"
 SMTP_FILE_LEGACY="${SECRETS_DIR}/smtp.php"

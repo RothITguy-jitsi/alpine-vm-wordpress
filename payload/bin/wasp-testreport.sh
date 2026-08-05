@@ -60,7 +60,13 @@ run()  { printf '\n$ %s\n' "$1"; sh -c "$1" 2>&1 | sed 's/^/  /'; }
 red()  { sed -E 's/(pass[a-z_]*|secret|token|key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<REDACTED>/Ig'; }
 
 hdr "WASP TEST REPORT — $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
-inf "host: $(hostname)   mail: ${WITH_MAIL}   restore: ${WITH_RESTORE}"
+. /etc/wp-install/vars.sh 2>/dev/null || true
+inf "host: $(hostname)   build: ${WASP_VERSION:-unknown}"
+[ -n "${WASP_VERSION_NOTE:-}" ] && inf "${WASP_VERSION_NOTE}"
+inf "mail: ${WITH_MAIL}   restore: ${WITH_RESTORE}"
+# Stated up front so anyone reading this report knows which build produced it
+# before interpreting anything below.
+inf "login URL: $([ -n "${WP_ADMIN_SLUG:-}" ] && printf '/%s' "$WP_ADMIN_SLUG" || printf '/wp-login.php')"
 
 # ── 1. Baseline ──────────────────────────────────────────────────────────────
 hdr "1. BASELINE"
@@ -121,19 +127,42 @@ for f in 00-wpvm-login-slug 01-wpvm-smtp 02-wpvm-login-guard; do
     no "${f}.php MISSING"
   fi
 done
-sub "does a bad login get logged in the format CrowdSec expects?"
-inf "(this makes 1 failed login attempt against the local container)"
-podman exec wordpress php -r '
-  $c=stream_context_create(["http"=>["method"=>"POST","timeout"=>8,"ignore_errors"=>true,
-    "header"=>"Content-Type: application/x-www-form-urlencoded\r\nUser-Agent: wasp-test/1.0\r\n",
-    "content"=>"log=wasp-test-nonexistent&pwd=wrong&wp-submit=Log+In"]]);
-  @file_get_contents("http://127.0.0.1/wp-login.php",false,$c);' 2>/dev/null
-sleep 2
-if grep -q "wpvm-login" /home/wpuser/wp/logs/error.log 2>/dev/null; then
-  ok "login guard logged the attempt"
-  grep "wpvm-login" /home/wpuser/wp/logs/error.log | tail -2 | sed 's/^/  /'
+sub "is the login guard actually loaded and functioning?"
+# Was: POST to http://127.0.0.1/wp-login.php from inside the container, then
+# look for the log line. That cannot work — wp-login.php is IP-restricted, the
+# request originates from the container's own address, and Apache returns 403
+# before PHP runs. The guard never executes, and the test reported FAIL for a
+# guard that was fine.
+#
+# A test that has to defeat a protection in order to check something else is
+# testing the wrong thing. Ask WordPress directly instead.
+_lg=$(podman exec --user 33 wordpress php -r '
+  define("WP_USE_THEMES", false);
+  require "/var/www/html/wp-load.php";
+  $f = ["wpvm_login_client_ip","wpvm_login_attempts","wpvm_login_key"];
+  $missing = [];
+  foreach ($f as $fn) { if (!function_exists($fn)) $missing[] = $fn; }
+  echo $missing ? "MISSING: ".implode(",", $missing) : "LOADED";
+  echo has_action("wp_login_failed") ? " hook=yes" : " hook=NO";
+' 2>/dev/null)
+case "$_lg" in
+  LOADED*hook=yes) ok "Login guard is loaded and hooked (${_lg})" ;;
+  LOADED*)         no "Login guard loaded but its wp_login_failed hook is not registered" ;;
+  MISSING*)        no "Login guard functions absent: ${_lg}" ;;
+  *)               sk "Could not query WordPress for the login guard (${_lg:-no output})" ;;
+esac
+
+sub "have any real login events been recorded yet?"
+_n=$(grep -c "wpvm-login" /home/wpuser/wp/logs/error.log 2>/dev/null) || _n=0
+if [ "${_n:-0}" -gt 0 ]; then
+  ok "${_n} login event(s) logged — CrowdSec has data to work with"
+  grep "wpvm-login" /home/wpuser/wp/logs/error.log | tail -3 | sed 's/^/         /'
 else
-  no "no wpvm-login entries — guard may not be active, or wp-login.php is IP-blocked from inside"
+  inf "No login events yet. Expected until someone actually reaches the login"
+  inf "form; the guard only logs on a real authentication attempt."
+  inf "To prove the CrowdSec parser matches without one, feed it a sample:"
+  inf "  printf '[Wed Aug 05 12:00:00.000000 2026] [php:notice] [pid 1] [wpvm-login] event=failed ip=203.0.113.9 user=admin\\n' > /home/wpuser/wp/logs/parsertest.log"
+  inf "  podman exec crowdsec cscli explain --file /var/log/wordpress/parsertest.log --type wpvm-login"
 fi
 
 # ── 8. Mail ──────────────────────────────────────────────────────────────────
@@ -220,7 +249,7 @@ printf '  pass %s   fail %s   skip %s\n\n' "$PASS" "$FAIL" "$SKIP"
 cat <<'EOS'
 
   Not covered here, needs doing by hand:
-    • Browse https://<your-domain>/ and /<slug>-login from OUTSIDE the LAN
+    • Browse https://<your-domain>/ and /<slug> from OUTSIDE the LAN (the slug IS the login URL now)
     • Decrypt an off-VM backup on your workstation:
         age -d -i wasp-backup-key.txt -o t.sql.gz <file>.age && gzip -t t.sql.gz
     • update.sh cutover  (snapshot the VM first — it swaps containers)

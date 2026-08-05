@@ -189,7 +189,13 @@ _running() {
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  WordPress VM — Validation & Diagnostics"
-echo "  $(date '+%Y-%m-%d %H:%M:%S')   profile=${DEPLOYMENT_PROFILE:-standard}"
+echo "  $(date '+%Y-%m-%d %H:%M:%S')   build=${WASP_VERSION:-unknown}   profile=${DEPLOYMENT_PROFILE:-standard}"
+# The build line is not cosmetic. Behaviour that an operator interacts with
+# has changed between builds -- most visibly the login slug moving from
+# "/<slug>-login" to the bare "/<slug>" -- and a diagnostic that does not say
+# which build produced it cannot be reasoned about. Several hours were spent
+# on an imagined fault because of exactly that.
+[ -n "${WASP_VERSION_NOTE:-}" ] && echo "  ${WASP_VERSION_NOTE}"
 echo "═══════════════════════════════════════════════════════════"
 
 # ── CONTAINERS ─────────────────────────────────────────────────────────────
@@ -370,21 +376,28 @@ section security "Security"
 
 # --- Custom login slug: the end-to-end test this script never had ---
 if [ -n "${WP_ADMIN_SLUG}" ]; then
-  slug_code=$(_http_code "http://127.0.0.1/${WP_ADMIN_SLUG}-login")
+  # The BARE slug is the login URL. The "-login" suffix was removed because a
+  # path matching *login* is found by the same wordlist that finds
+  # wp-login.php, so it hid the page from nobody. This probe was not updated
+  # at the time and kept testing the old path — meaning on a current build it
+  # would have reported a 404 for a slug that works, and on an older build it
+  # printed a URL that no longer exists. Both are how an operator ends up
+  # locked out of a working site.
+  slug_code=$(_http_code "http://127.0.0.1/${WP_ADMIN_SLUG}")
   dflt_code=$(_http_code "http://127.0.0.1/wp-login.php")
 
   if [ "$slug_code" = "403" ] && [ "$dflt_code" = "403" ] \
      && { [ -n "${ADMIN_CIDR}" ] || [ -n "${ALLOWED_ADMIN_IP}" ]; }; then
     warn "Login slug cannot be verified from this host" \
          "Both paths return 403 because ADMIN_CIDR/ALLOWED_ADMIN_IP excludes this host's own source address. That is correct behaviour, not a fault." \
-         "Re-test from an allowed client:  curl -o /dev/null -w '%{http_code}\\n' http://<vm-ip>/${WP_ADMIN_SLUG}-login"
+         "Re-test from an allowed client:  curl -o /dev/null -w '%{http_code}\\n' http://<vm-ip>/${WP_ADMIN_SLUG}"
   else
     case "$slug_code" in
-      200|302) pass "Login slug /${WP_ADMIN_SLUG}-login serves the login page (HTTP ${slug_code})" ;;
-      404)     fail "Login slug /${WP_ADMIN_SLUG}-login returns 404" \
+      200|302) pass "Login slug /${WP_ADMIN_SLUG} serves the login page (HTTP ${slug_code})" ;;
+      404)     fail "Login slug /${WP_ADMIN_SLUG} returns 404" \
                     "The rewrite is not firing. Usually AllowOverride, a missing .htaccess mount, or mod_rewrite disabled." \
                     "grep -A6 'Custom wp-admin slug' /home/wpuser/wp/htaccess/.htaccess ; podman exec wordpress apachectl -M | grep rewrite" ;;
-      "")      fail "Login slug /${WP_ADMIN_SLUG}-login gave no response" "" \
+      "")      fail "Login slug /${WP_ADMIN_SLUG} gave no response" "" \
                     "podman logs --tail 30 wordpress" ;;
       *)       fail "Login slug returned unexpected HTTP ${slug_code}" "" \
                     "tail -20 /home/wpuser/wp/logs/error.log" ;;
@@ -669,6 +682,27 @@ fi
 #                          is whitelisted, detects nothing at all
 #   GeoIP                — sees an RFC1918 address and exempts it, so country
 #                          filtering does nothing
+# ── Is WEB_CIDR actually enforced, or merely present? ────────────────────────
+# Checked in the FORWARD chain specifically. Podman DNATs a published port
+# before the filter input hook, so an input-chain rule on dport 80 matches
+# nothing — verified on a live VM where a host outside WEB_CIDR connected
+# while the input rule claimed to allow only the proxy.
+#
+# This is why the check looks for the rule in the chain that traffic actually
+# traverses rather than anywhere in the ruleset: "present somewhere" was
+# exactly the evidence that made the broken version look correct.
+if [ -n "${WEB_CIDR:-}" ]; then
+  if nft list chain inet filter forward 2>/dev/null | grep -q "nft-web-cidr-drop"; then
+    pass "WEB_CIDR enforced in the forward chain (where published ports pass)"
+  elif nft list chain inet filter input 2>/dev/null | grep -q "tcp dport { 80, 443 }"; then
+    fail "WEB_CIDR is configured but only enforced in the INPUT chain" \
+         "Published container ports are DNAT'd and traverse FORWARD, so an input-chain rule never matches them. Any host on the LAN can reach the site despite the restriction." \
+         "Re-run the installer, or add the forward-chain rule by hand — see lib/03-dynamic-configs.sh"
+  else
+    note "WEB_CIDR is set to ${WEB_CIDR} but no matching rule was found in the live ruleset"
+  fi
+fi
+
 if [ -n "${PROXY_IP:-}" ]; then
   _dbg=/home/wpuser/wp/logs/remoteip-debug.log
   if [ -s "$_dbg" ]; then

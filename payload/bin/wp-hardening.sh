@@ -653,9 +653,21 @@ SNIPPET2
           esac
         fi
       else
-        echo "  ⚠  mmdblookup is not installed, so the address cannot be resolved here."
-        echo "     It is a small package and does not touch the containers:"
-        echo "       doas apk add libmaxminddb"
+        # Offer to install it rather than just reporting its absence. A
+        # diagnostic that stops to tell you to go and install a diagnostic is
+        # a poor trade for ~100 KB.
+        echo "  ⚠  mmdblookup is not installed, so the address cannot be resolved."
+        printf "     Install it now (~100 KB, does not touch the containers)? [Y/n] : "
+        read -r _mi
+        case "${_mi:-y}" in
+          n|N) echo "     Skipped.  doas apk add libmaxminddb" ;;
+          *)
+            if apk add --no-cache libmaxminddb >/dev/null 2>&1; then
+              echo "     ✔ Installed — re-run: wp-hardening.sh geoip-test ${_ip}"
+            else
+              echo "     ✗ Could not install. Try by hand: apk add libmaxminddb"
+            fi ;;
+        esac
       fi
     else
       echo ""

@@ -465,7 +465,7 @@ chown -R 33:33 /home/wpuser/wp/html/wp-content 2>/dev/null \
 #     any /wp-admin/ page
 #   • the "Lost your password?" and logout links
 #   • the redirect after a successful login
-# So without a WordPress-side fix, the sequence is: visit /slug-login (works,
+# So without a WordPress-side fix, the sequence is: visit the slug (works,
 # internal rewrite) -> page renders with action="http://host/wp-login.php"
 # -> submit -> POST goes to the DEFAULT path -> Apache 403s it -> login is
 # impossible. That is almost certainly the "custom slug didn't work" symptom

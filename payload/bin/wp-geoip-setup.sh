@@ -184,6 +184,14 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 mkdir -p /tmp/geolite-extract
 tar xzf /tmp/geolite2-country.tar.gz -C /tmp/geolite-extract --strip-components=1
+# mmdblookup ships in libmaxminddb and is what makes `wp-hardening.sh
+# geoip-test <ip>` able to resolve an address. Installing GeoIP without it
+# gives an operator a test command that reports "mmdblookup is not installed"
+# — telling them to go and install something in order to check the thing they
+# just enabled. It is ~100 KB and touches nothing in the containers.
+apk add --no-cache libmaxminddb >/dev/null 2>&1 \
+  && echo "  mmdblookup installed (geoip-test can resolve addresses)" \
+  || echo "  note: libmaxminddb not installed; geoip-test cannot resolve IPs"
 find /tmp/geolite-extract -name '*.mmdb' -exec cp {} /home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb \;
 rm -rf /tmp/geolite-extract /tmp/geolite2-country.tar.gz
 if [ ! -s /home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb ]; then

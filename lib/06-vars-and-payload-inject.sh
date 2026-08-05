@@ -67,6 +67,10 @@ ADMIN_CIDR=$(_vars_q "${ADMIN_CIDR:-}")
 ALLOWED_ADMIN_IP=$(_vars_q "${ALLOWED_ADMIN_IP:-}")
 INSTALL_CLAMAV=$(_vars_q "${INSTALL_CLAMAV:-0}")
 WORDFENCE_FEED=$(_vars_q "${WORDFENCE_FEED:-scanner}")
+# Build identity first in the file, so it is the first thing seen in any
+# pasted vars.sh.
+WASP_VERSION=$(_vars_q "${WASP_VERSION:-unknown}")
+WASP_VERSION_NOTE=$(_vars_q "${WASP_VERSION_NOTE:-}")
 OFFSITE_AGE_RECIPIENT=$(_vars_q "${OFFSITE_AGE_RECIPIENT:-}")
 # S3 secret is NOT written to vars.sh — it goes only into rclone.conf at 0600.
 # vars.sh is sourced by several tools and read during troubleshooting; a

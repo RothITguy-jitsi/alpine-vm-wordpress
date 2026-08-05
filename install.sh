@@ -148,6 +148,21 @@ fi
 # from the same place, this is not a root of trust. It is tamper-evidence
 # with a short, checkable identifier -- which is meaningfully better than an
 # unsigned curl|bash, and is not the same as a trusted supply chain.
+# ── Build identity ───────────────────────────────────────────────────────────
+# Written to /etc/wp-install/vars.sh at install and shown by the banner, the
+# validator and the test report.
+#
+# This exists because of a real, expensive confusion: a VM installed from an
+# earlier build served its login page at "/<slug>-login", a later build moved
+# it to the bare "/<slug>", and several hours were spent diagnosing an
+# imagined fault in mod_remoteip, nftables and nginx before anyone established
+# which of the two was actually running. Logs and diagnostics that do not
+# state their build cannot be reasoned about safely.
+#
+# Bump this whenever behaviour changes in a way an operator would notice.
+WASP_VERSION="2026.08.05"
+WASP_VERSION_NOTE="login slug is the bare /<slug> (no -login suffix)"
+
 WASP_PUBKEY="${WASP_PUBKEY:-RWSi+SUZQWeFKd9yTC3Q7xAEADUph345WdgwOOlxK+dV40GHEqMsFTPc}"    # set to the release key; empty = unsigned build
 
 # Where the key fingerprint is published independently of this repository.

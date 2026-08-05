@@ -88,7 +88,7 @@ if [ -n "${WP_ADMIN_SLUG}" ]; then
   {
     echo ""
     echo "# ── Custom wp-admin slug (mirrors wp-security.conf) ─────────────────────────"
-    echo "# BUG FIX (v7-14): the slug used to be a pure ALIAS — /slug-login served"
+    echo "# BUG FIX (v7-14): the slug used to be a pure ALIAS — the slug path served"
     echo "# the login page, but /wp-login.php stayed wide open right beside it, so"
     echo "# every credential-stuffing bot that only ever tries the default path was"
     echo "# completely unaffected. The install even printed 'direct /wp-admin access"

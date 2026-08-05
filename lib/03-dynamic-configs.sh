@@ -25,6 +25,34 @@ else
   WEB_RULE="tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 fi
 
+# ── Web restriction, enforced where published ports actually pass ────────────
+# VERIFIED BROKEN ON A LIVE VM: with WEB_CIDR=192.168.100.101, a curl from
+# 192.168.100.148 connected successfully. The input-chain rule below reads
+# correctly and matches nothing.
+#
+# Podman publishes a container port by DNAT'ing it in prerouting. After DNAT
+# the destination is the container's address, not the host's, so the packet
+# traverses the FORWARD hook — the filter INPUT chain never sees it. A
+# restriction written for `input` on dport 80 is therefore a no-op for every
+# published container port, while looking exactly like a working rule.
+#
+# This is the same failure shape as the wp-admin fail-open: the control is
+# present, readable, and permissive.
+#
+# The negated set excludes loopback and the container networks so that
+# host-local probes and container-to-container traffic are unaffected; only
+# genuinely external sources outside WEB_CIDR are dropped.
+if [[ -n "$WEB_CIDR" ]]; then
+  WEB_CIDR_FORWARD="        # Enforce WEB_CIDR here, not in input — see the note in lib/03.
+        ip daddr 10.89.10.0/24 tcp dport { 80, 443 } \
+            ip saddr != { ${WEB_CIDR}, 127.0.0.0/8, 10.89.0.0/16 } \
+            limit rate 5/minute log prefix \"nft-web-cidr-drop \" level warn
+        ip daddr 10.89.10.0/24 tcp dport { 80, 443 } \
+            ip saddr != { ${WEB_CIDR}, 127.0.0.0/8, 10.89.0.0/16 } counter drop"
+else
+  WEB_CIDR_FORWARD="        # Web ports open to any source (WEB_CIDR unset)."
+fi
+
 # ── Optional outbound (egress) restriction ────────────────────────────────────
 # Default OFF. When on, the VM and its containers may only reach the ports
 # every feature here actually needs; everything else is logged and dropped.
@@ -210,6 +238,7 @@ ${PVE_BLOCK_FORWARD}
         # reaches MariaDB across wp-front/wp-db, and a "restrict what
         # containers may send" rule placed above these would sever the
         # database connection while looking like a hardening win.
+${WEB_CIDR_FORWARD}
         ip daddr 10.89.10.0/24 accept
         ip daddr 10.89.20.0/24 accept
         # wp-db (10.89.20.0/24) is --internal: netavark never routes it to

@@ -55,7 +55,6 @@ SSH_KEY=/etc/wp-install/offsite-key
 RCLONE_CONF=/etc/wp-install/rclone.conf
 BACKUP_DIR="${BACKUP_DIR:-/root/wp-db-backups}"
 OFFSITE_RETAIN="${OFFSITE_RETAIN:-14}"
-AGE_RECIPIENT="${OFFSITE_AGE_RECIPIENT:-}"
 
 # ── Encryption before it leaves the VM ───────────────────────────────────────
 # A database dump is not an opaque blob. It contains password hashes, every
@@ -102,6 +101,15 @@ _encrypt_for_upload() {
 
 [ -r "$CONF" ] && . "$CONF"
 OFFSITE_METHOD="${OFFSITE_METHOD:-none}"
+# Read AFTER the config is sourced. It was previously assigned above the
+# `. "$CONF"` line, so it was ALWAYS empty: an operator who configured
+# encryption at install got plaintext uploads, and `status` truthfully
+# reported "Encryption : NONE" — which reads as "you did not set it up"
+# rather than "the setting is being ignored".
+#
+# Found on a live VM whose vars.sh held a valid age1 recipient while every
+# archive in the bucket was an unencrypted .sql.gz.
+AGE_RECIPIENT="${OFFSITE_AGE_RECIPIENT:-}"
 
 _ok()   { printf '  \033[32m✔\033[0m  %s\n' "$1"; }
 _bad()  { printf '  \033[31m✗\033[0m  %s\n' "$1" >&2; }
