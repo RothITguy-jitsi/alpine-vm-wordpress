@@ -83,6 +83,7 @@ OFFSITE_DEST=$(_vars_q "${OFFSITE_DEST:-}")
 OFFSITE_RETAIN=$(_vars_q "${OFFSITE_RETAIN:-14}")
 OFFSITE_APPEND_ONLY=$(_vars_q "${OFFSITE_APPEND_ONLY:-unknown}")
 GOVERNANCE_EMAIL=$(_vars_q "${GOVERNANCE_EMAIL:-}")
+CTI_ENRICH_BANS=$(_vars_q "${CTI_ENRICH_BANS:-0}")
 WORDFENCE_API_KEY=$(_vars_q "${WORDFENCE_API_KEY:-}")
 CROWDSEC_WHITELIST=$(_vars_q "${CROWDSEC_WHITELIST:-}")
 RESTRICT_EGRESS=$(_vars_q "${RESTRICT_EGRESS:-0}")
@@ -151,6 +152,19 @@ if [[ -f "${REPO_DIR}/MANIFEST.sha256" ]]; then
   printf '%s\n' "${WASP_PUBKEY:-}" > "$MNT/etc/wp-install/release.pub"
   chmod 644 "$MNT/etc/wp-install/MANIFEST.sha256" "$MNT/etc/wp-install/release.pub" 2>/dev/null || true
   msg_ok "Signed manifest staged for on-VM integrity checking"
+fi
+
+# CTI key goes only into its own 0600 file, never vars.sh -- vars.sh is
+# sourced by several tools and read during troubleshooting, and an API
+# credential does not belong somewhere that widely handled.
+if [[ -n "${CTI_API_KEY:-}" ]]; then
+  {
+    printf 'CTI_API_KEY=%s\n'         "$CTI_API_KEY"
+    printf 'CTI_MONTHLY_BUDGET=%s\n'  "${CTI_MONTHLY_BUDGET:-40}"
+    printf 'CTI_ENRICH_BANS=%s\n'     "${CTI_ENRICH_BANS:-0}"
+  } > "$MNT/etc/wp-install/cti.conf"
+  chmod 600 "$MNT/etc/wp-install/cti.conf"
+  msg_ok "CTI configuration written (0600, root-only)"
 fi
 
 # ── Off-VM backup credentials ────────────────────────────────────────────────

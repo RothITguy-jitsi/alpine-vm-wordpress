@@ -1,0 +1,84 @@
+# =============================================================================
+# WASP Lynis profile
+# =============================================================================
+# Installed to /etc/lynis/custom.prf and picked up automatically.
+#
+# Every skip below is here because Lynis is auditing a general-purpose Linux
+# server and this is not one. It is a single-purpose Alpine VM whose only job
+# is to run three containers. Findings that would be real on a shared server
+# are structurally impossible or already handled here.
+#
+# THE RULE FOR ADDING TO THIS FILE: a skip needs a reason that survives being
+# read back in six months by someone who did not write it. "Noisy" is not a
+# reason. If the honest justification is "we have not fixed it yet", it
+# belongs in TODO.md as a known gap, not here as a suppression — a profile
+# that hides real findings is worse than no profile, because the score then
+# says the opposite of the truth.
+#
+# Review this whenever the VM's design changes. A skip that made sense for a
+# container host makes no sense the day something else is installed.
+# =============================================================================
+
+# ── Partitioning ─────────────────────────────────────────────────────────────
+# Lynis wants separate /home, /tmp, /var and /var/log partitions. This VM has
+# one root filesystem by design: it is provisioned from a single qcow2 whose
+# size is set at install and grown with qm resize. Multiple partitions would
+# make that resize a manual, error-prone operation for no security gain here —
+# the containers write to bind mounts under /home/wpuser/wp, and disk
+# exhaustion is monitored rather than partitioned against.
+skip-test=FILE-6310
+
+# ── GRUB / bootloader ────────────────────────────────────────────────────────
+# Alpine on Proxmox boots via the hypervisor; there is no GRUB configuration
+# to password-protect. The equivalent control is Proxmox access itself, which
+# is out of scope for an audit run inside the guest.
+skip-test=BOOT-5122
+
+# ── Host web server ──────────────────────────────────────────────────────────
+# Lynis looks for Apache/nginx configuration on the host and reports its
+# absence or misconfiguration. Apache runs INSIDE the WordPress container and
+# is hardened there (see payload/apache-conf). There is no host web server,
+# and there should not be.
+skip-test=HTTP-6622
+skip-test=HTTP-6624
+skip-test=HTTP-6626
+skip-test=HTTP-6640
+skip-test=HTTP-6641
+skip-test=HTTP-6643
+
+# ── Mail transfer agent ──────────────────────────────────────────────────────
+# No MTA listens on this VM. Outbound mail goes through an authenticated
+# remote relay via msmtp and PHPMailer; nothing accepts mail inbound. Lynis
+# reporting a missing or unconfigured MTA is correct and irrelevant.
+skip-test=MAIL-8818
+
+# ── Name services ────────────────────────────────────────────────────────────
+# No local resolver or NIS. Container DNS is served by aardvark-dns on the
+# podman bridge; the host uses the network's resolver.
+skip-test=NAME-4028
+
+# ── Time synchronisation ─────────────────────────────────────────────────────
+# NOT skipped, deliberately. chrony matters here: TLS certificate validation
+# and log correlation both depend on the clock, and the egress firewall opens
+# 123/udp specifically for it. If Lynis reports a time problem, it is real.
+# (Recorded so nobody adds a skip later "to clean up the report".)
+
+# ── Package management ───────────────────────────────────────────────────────
+# Lynis expects a package manager with signed-update tooling in a shape it
+# recognises. Alpine's apk signs indexes and packages, and unattended upgrades
+# run nightly from cron; the test does not detect this arrangement.
+skip-test=PKGS-7398
+
+# ── Containers ───────────────────────────────────────────────────────────────
+# Lynis's Docker tests assume a Docker daemon. This VM runs rootful Podman
+# with no daemon, and container hardening is verified by
+# validate-wordpress.sh: digest pinning, cap-drop, read-only mounts and the
+# internal database network. The relevant assurance exists; Lynis simply
+# cannot see it.
+skip-test=CONT-8104
+skip-test=CONT-8106
+
+# ── Reporting ────────────────────────────────────────────────────────────────
+# Machine-readable output for wp-hardening.sh to summarise.
+show-report-solution=yes
+quick=yes

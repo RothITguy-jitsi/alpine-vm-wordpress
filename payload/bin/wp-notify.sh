@@ -4,6 +4,8 @@
 # =============================================================================
 #   wp-notify.sh <tag> <subject> [body-file]
 #   wp-notify.sh --test
+#   wp-notify.sh --heartbeat-url <url>   external dead-man's-switch
+#   wp-notify.sh --heartbeat             ping it (cron)
 #   wp-notify.sh --status
 #
 # Used by the scheduled scans. Existing as one script rather than a snippet
@@ -161,6 +163,67 @@ case "${1:-}" in
       exit 1
     fi
     rm -f "$_t" ;;
+  --heartbeat)
+    # Ping an external dead-man's-switch (healthchecks.io, Uptime Kuma,
+    # Better Stack — anything that alerts on ABSENCE).
+    #
+    # This closes the one gap nothing else here can: every other check runs
+    # ON this VM, so a VM that is powered off, unreachable, or on a dead
+    # hypervisor reports nothing at all. Silence looks identical to health.
+    #
+    # The signal is the absence of a ping, which is why it must be an
+    # external service — a check that lives on the thing being checked cannot
+    # detect the thing being gone.
+    #
+    # Deliberately checks that WordPress actually SERVES before pinging.
+    # A heartbeat that only proves cron is running would keep reporting
+    # healthy through a completely broken site, which is worse than none: it
+    # converts a real outage into a false assurance.
+    _url="${HEARTBEAT_URL:-}"
+    [ -n "$_url" ] || _url=$(sed -n 's/^HEARTBEAT_URL=//p' /etc/wp-install/heartbeat.conf 2>/dev/null | tr -d "'\"")
+    if [ -z "$_url" ]; then
+      echo "No heartbeat URL configured." >&2
+      echo "  Create a check at healthchecks.io (free) or your own Uptime Kuma," >&2
+      echo "  then:  wp-notify.sh --heartbeat-url <url>" >&2
+      exit 1
+    fi
+    _ok=1
+    podman exec wordpress php -r '
+      $c=stream_context_create(["http"=>["timeout"=>8,"ignore_errors"=>true,
+        "header"=>"User-Agent: wasp-heartbeat/1.0\r\n"]]);
+      @file_get_contents("http://127.0.0.1/",false,$c);
+      preg_match("#HTTP/[0-9.]+ ([0-9]{3})#",$http_response_header[0]??"",$m);
+      exit((($m[1]??0)>=200 && ($m[1]??0)<400)?0:1);' 2>/dev/null || _ok=0
+    podman exec mariadb sh -c \
+      'mariadb-admin ping --silent -uroot -p"$MARIADB_ROOT_PASSWORD" 2>/dev/null' >/dev/null 2>&1 || _ok=0
+
+    if [ "$_ok" = "1" ]; then
+      curl -fsS -m 15 "$_url" >/dev/null 2>&1 && exit 0
+      logger -t wasp-heartbeat "site healthy but the heartbeat could not be sent"
+      exit 1
+    fi
+    # Signal failure explicitly where the endpoint supports it; otherwise stay
+    # silent and let the missed ping speak.
+    curl -fsS -m 15 "${_url}/fail" >/dev/null 2>&1 || true
+    logger -t wasp-heartbeat "health check FAILED — heartbeat withheld"
+    exit 1 ;;
+
+  --heartbeat-url)
+    _u="${2:-}"
+    case "$_u" in
+      https://*|http://*) : ;;
+      *) echo "Usage: wp-notify.sh --heartbeat-url https://hc-ping.com/<uuid>" >&2; exit 1 ;;
+    esac
+    mkdir -p /etc/wp-install
+    printf 'HEARTBEAT_URL=%s\n' "$_u" > /etc/wp-install/heartbeat.conf
+    chmod 600 /etc/wp-install/heartbeat.conf
+    echo "✔ Heartbeat URL stored"
+    echo "  Set the check's period to 15 minutes with a 30-minute grace at the"
+    echo "  other end — cron pings every 10, so two consecutive failures alert"
+    echo "  rather than one slow run."
+    echo ""
+    echo "  Test it now:  wp-notify.sh --heartbeat" ;;
+
   --status)
     echo ""
     echo "Alert notifications"

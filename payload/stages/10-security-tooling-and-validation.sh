@@ -93,6 +93,17 @@ LYNIS_OK=0
 # Try 1: Alpine stable community (might appear in future versions)
 apk add --no-cache lynis >/dev/null 2>&1 && LYNIS_OK=1
 
+# Install the profile whichever way lynis arrived. Without it the report is
+# dominated by findings that are structurally impossible on this VM —
+# separate partitions on a single-qcow2 guest, GRUB on a hypervisor-booted
+# system, a host web server when Apache runs in a container. A score built
+# from noise gets ignored, and an ignored audit is the same as none.
+if [ -f "${PAYLOAD_DIR}/etc/lynis-custom.prf" ]; then
+  mkdir -p /etc/lynis
+  install -m 0644 "${PAYLOAD_DIR}/etc/lynis-custom.prf" /etc/lynis/custom.prf
+  ok "Lynis profile installed — exclusions documented in /etc/lynis/custom.prf"
+fi
+
 # Try 2: Alpine edge/testing (where it currently lives as of Alpine 3.24)
 if [ "$LYNIS_OK" = "0" ]; then
   apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \

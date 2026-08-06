@@ -78,7 +78,10 @@ show_status() {
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
   echo "          geoip-test [ip] | proxy-check | nginx-snippet"
   echo "          exceptions | exceptions-check"
-  echo "          admin-rule [show|strict|simple]"
+  echo "          admin-rule [show|strict|simple] | security-txt <contact>"
+  echo "          web-list | web-allow <ip> | web-deny <ip>"
+  echo "          cti [ip|--status] | cti-key <key> [budget] | cti-watch"
+  echo "          lynis [run] | disk | disk-check | tls [domain]"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
@@ -206,6 +209,51 @@ case "${1:-status}" in
       *) echo "Usage: wp-hardening.sh crowdsec-whitelist [list|add <ip>|remove <ip>]" >&2; exit 1 ;;
     esac ;;
 
+  security-txt)
+    # RFC 9116. A one-line file that tells a researcher who finds something
+    # where to send it. Without one they either give up, post publicly, or
+    # try the WHOIS address -- none of which is how you want to learn about a
+    # vulnerability in a client's site.
+    #
+    # Flagged as missing by an external scan of a live deployment.
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    _c="${2:-${WP_ADMIN_EMAIL:-}}"
+    if [ -z "$_c" ]; then
+      echo "Usage: wp-hardening.sh security-txt <contact-email-or-url>" >&2
+      echo "  e.g. wp-hardening.sh security-txt security@example.com" >&2
+      exit 1
+    fi
+    case "$_c" in
+      https://*|mailto:*) _uri="$_c" ;;
+      *@*)                _uri="mailto:${_c}" ;;
+      *)                  echo "✗ Give an email address or an https:// URL" >&2; exit 1 ;;
+    esac
+    # Expires is required by RFC 9116 and is the field everyone forgets. A
+    # stale security.txt is worse than none: it tells a researcher the contact
+    # is current when it may not be.
+    _exp=$(date -u -d "+1 year" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || \
+      _exp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    _dir=/home/wpuser/wp/html/.well-known
+    mkdir -p "$_dir"
+    {
+      printf 'Contact: %s\n' "$_uri"
+      printf 'Expires: %s\n' "$_exp"
+      printf 'Preferred-Languages: en\n'
+      [ -n "${WP_DOMAIN:-}" ] && printf 'Canonical: https://%s/.well-known/security.txt\n' "$WP_DOMAIN"
+    } > "$_dir/security.txt"
+    chown -R 33:33 "$_dir" 2>/dev/null || true
+    chmod 644 "$_dir/security.txt"
+    echo "✔ Written to ${_dir}/security.txt"
+    echo "  Contact : ${_uri}"
+    echo "  Expires : ${_exp}  (RFC 9116 requires this; re-run before it lapses)"
+    echo ""
+    echo "  Confirm it is reachable:"
+    echo "    curl -s https://${WP_DOMAIN:-your-domain}/.well-known/security.txt"
+    echo ""
+    echo "  If it 404s, the .well-known path may be blocked by the dotfile"
+    echo "  deny rule at the proxy. Add an exception ABOVE that rule:"
+    echo "    location ^~ /.well-known/ { allow all; proxy_pass http://VM-IP:80; }" ;;
+
   nginx-snippet)
     # Prints proxy-side configuration filled in with THIS VM's actual values.
     # Generated rather than documented because the useful version needs the
@@ -268,7 +316,43 @@ SNIPPET
     printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
     printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
     printf '}\n\n'
-    printf 'location = /xmlrpc.php { deny all; }\n'
+    printf 'location = /xmlrpc.php { deny all; }\n\n'
+    printf '# ── Security headers, set at the EDGE ──────────────────────────\n'
+    printf '# The VM already sets these in Apache. An external scan of a live\n'
+    printf '# deployment found NONE of them reaching the internet — only HSTS,\n'
+    printf '# which the proxy adds itself. Headers that protect the visitor are\n'
+    printf '# worth nothing if they die at the proxy, and whether they survive\n'
+    printf '# depends on proxy configuration the VM cannot see or control.\n'
+    printf '#\n'
+    printf '# proxy_hide_header first, then add_header: without hiding, nginx\n'
+    printf '# appends rather than replaces and the client receives the header\n'
+    printf '# twice, which some browsers resolve by taking the STRICTER value\n'
+    printf '# and others by taking the first. Deterministic beats lucky.\n'
+    printf '#\n'
+    printf '# always: send these on error responses too. A 403 or 500 page is\n'
+    printf '# still a page a browser renders.\n'
+    printf 'proxy_hide_header X-Frame-Options;\n'
+    printf 'proxy_hide_header X-Content-Type-Options;\n'
+    printf 'proxy_hide_header Referrer-Policy;\n'
+    printf 'proxy_hide_header Permissions-Policy;\n'
+    printf 'add_header X-Frame-Options        \"SAMEORIGIN\" always;\n'
+    printf 'add_header X-Content-Type-Options \"nosniff\" always;\n'
+    printf 'add_header Referrer-Policy        \"strict-origin-when-cross-origin\" always;\n'
+    printf 'add_header Permissions-Policy     \"camera=(), microphone=(), geolocation=(), payment=()\" always;\n'
+    printf '\n'
+    printf '# includeSubDomains added. The scan found \"max-age=63072000; preload\"\n'
+    printf '# WITHOUT it — which is not merely weaker, it is INVALID for the HSTS\n'
+    printf '# preload list. A preload submission is rejected without\n'
+    printf '# includeSubDomains, so the directive was doing nothing.\n'
+    printf '# Only add this once you are certain EVERY subdomain serves HTTPS.\n'
+    printf 'add_header Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\" always;\n'
+    printf '\n'
+    printf '# CSP is deliberately NOT set here. The VM tailors it per-path --\n'
+    printf '# wp-admin needs unsafe-eval, the public site does not -- and a\n'
+    printf '# single blanket policy at the edge would either break the admin\n'
+    printf '# interface or weaken the public site to match it. Check the VM is\n'
+    printf '# emitting it, and that the proxy forwards it:\n'
+    printf '#   curl -sI https://YOUR-DOMAIN/ | grep -i content-security\n'
     cat <<'SNIPPET2'
 
 ───────────────────────────────────────────────────────────────────
@@ -416,6 +500,498 @@ SNIPPET2
       fi
     fi
     rm -f "$_due" ;;
+
+  tls|tls-check)
+    # TLS terminates at the reverse proxy, so this VM never sees its own
+    # certificate — an openssl check against 127.0.0.1 would test nothing.
+    # It has to go out to the public endpoint, which means it is also
+    # verifying that the domain resolves and the proxy is answering.
+    #
+    # Worth having because a broken renewal is otherwise invisible until a
+    # visitor's browser warns them, and by then it has been broken for days.
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    _d="${2:-${WP_DOMAIN:-}}"
+    [ -n "$_d" ] || { echo "Usage: wp-hardening.sh tls <domain>" >&2; exit 1; }
+    command -v openssl >/dev/null 2>&1 || { echo "✗ openssl not installed: apk add openssl" >&2; exit 1; }
+
+    _end=$(echo | openssl s_client -servername "$_d" -connect "${_d}:443" 2>/dev/null \
+           | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+    if [ -z "$_end" ]; then
+      _quiet="${3:-}"
+      [ "$_quiet" = "--quiet" ] || {
+        echo ""
+        echo "✗ Could not retrieve a certificate for ${_d}."
+        echo "  Either the name does not resolve, the proxy is not answering on"
+        echo "  443, or egress to that host is blocked from this VM."
+        echo "    wp-hardening.sh egress-list"
+      }
+      exit 1
+    fi
+    _es=$(date -u -d "$_end" +%s 2>/dev/null) || _es=""
+    _days=$(( ( ${_es:-0} - $(date -u +%s) ) / 86400 ))
+    _iss=$(echo | openssl s_client -servername "$_d" -connect "${_d}:443" 2>/dev/null \
+           | openssl x509 -noout -issuer 2>/dev/null | sed 's/.*CN *= *//')
+
+    if [ "${1}" = "tls-check" ]; then
+      # Cron path: silent unless it actually matters. Let's Encrypt renews at
+      # 30 days, so warning at 30 would fire on every healthy certificate.
+      [ "$_days" -le 14 ] || exit 0
+      logger -t wasp-tls "certificate for ${_d} expires in ${_days} day(s)"
+      [ -x /usr/local/bin/wp-notify.sh ] || exit 0
+      _b=$(mktemp)
+      {
+        printf 'The TLS certificate for %s expires in %s day(s).\n\n' "$_d" "$_days"
+        printf '  Expires : %s\n  Issuer  : %s\n\n' "$_end" "${_iss:-unknown}"
+        printf 'Renewal happens at the reverse proxy, not on this VM. Automatic\n'
+        printf 'renewal has had time to run and has not — check the proxy.\n\n'
+        printf 'A common cause is an ACME HTTP-01 challenge blocked by a\n'
+        printf 'rule denying dotfile paths: /.well-known/ begins with a dot.\n'
+        printf 'Confirm it is reachable:\n'
+        printf '  curl -sI https://%s/.well-known/acme-challenge/test\n' "$_d"
+      } > "$_b"
+      NOTIFY_COOLDOWN_HOURS=72 /usr/local/bin/wp-notify.sh wasp-tls \
+        "TLS certificate for ${_d} expires in ${_days} days" "$_b"
+      rm -f "$_b"
+      exit 0
+    fi
+
+    echo ""
+    echo "TLS — ${_d}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf '  Expires : %s\n' "$_end"
+    printf '  Issuer  : %s\n' "${_iss:-unknown}"
+    if   [ "$_days" -lt 0 ]  ; then echo "  ✗ EXPIRED ${_days#-} day(s) ago."; exit 2
+    elif [ "$_days" -le 7 ]  ; then echo "  ✗ ${_days} day(s) left — renewal has failed."; exit 2
+    elif [ "$_days" -le 14 ] ; then echo "  ⚠ ${_days} day(s) left. Let's Encrypt renews at 30, so this is late."; exit 1
+    else                            echo "  ✔ ${_days} day(s) remaining."
+    fi
+    echo ""
+    echo "  Renewal is the proxy's job — this VM only observes the result." ;;
+
+  disk)
+    # Disk exhaustion is the classic "site stopped working overnight for no
+    # apparent reason". MariaDB refuses writes, backups fail, logs stop, and
+    # none of it names the disk as the cause. validate-wordpress.sh reports a
+    # percentage; this shows what is actually consuming it and what can safely
+    # be reclaimed.
+    echo ""
+    echo "Disk usage"
+    echo "━━━━━━━━━━"
+    df -h / | sed 's/^/  /'
+    _pct=$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')
+    echo ""
+    echo "  Largest consumers:"
+    for _d in /var/lib/containers /root/wp-db-backups /home/wpuser/wp/logs \
+              /var/cache/wp-vulns /var/lib/wp-quarantine /var/log; do
+      [ -d "$_d" ] && printf '    %-28s %s\n' "$_d" "$(du -sh "$_d" 2>/dev/null | cut -f1)"
+    done
+    echo ""
+    echo "  Reclaimable:"
+    _dang=$(podman images -f dangling=true -q 2>/dev/null | grep -c .) || _dang=0
+    printf '    %-28s %s image(s)\n' "unreferenced container images" "$_dang"
+    [ "${_dang:-0}" -gt 0 ] && printf '      podman image prune -f --filter dangling=true\n'
+    _oldq=$(find /var/lib/wp-quarantine -maxdepth 1 -type f -mtime +30 2>/dev/null | grep -c .) || _oldq=0
+    [ "${_oldq:-0}" -gt 0 ] && printf '    %-28s %s file(s)  →  wp-malware-scan.sh purge\n' "quarantine over 30 days" "$_oldq"
+    echo ""
+    if [ "${_pct:-0}" -ge 90 ]; then
+      echo "  ✗ CRITICAL at ${_pct}%. MariaDB will refuse writes before the disk is"
+      echo "    actually full, and the resulting errors will not mention disk."
+      exit 2
+    elif [ "${_pct:-0}" -ge 75 ]; then
+      echo "  ⚠ ${_pct}% used. Act now rather than at 95% — a full disk during a"
+      echo "    backup leaves you with neither space nor a backup."
+      exit 1
+    fi
+    echo "  ${_pct}% used — healthy." ;;
+
+  disk-check)
+    # Cron entry point. Silent below the threshold; emails once above it.
+    _pct=$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')
+    [ "${_pct:-0}" -ge 80 ] || exit 0
+    logger -t wasp-disk "root filesystem at ${_pct}%"
+    [ -x /usr/local/bin/wp-notify.sh ] || exit 0
+    _b=$(mktemp)
+    {
+      printf 'Root filesystem on %s is at %s%%.\n\n' "$(hostname)" "$_pct"
+      df -h / | sed 's/^/  /'
+      printf '\nWhat is using it:\n'
+      for _d in /var/lib/containers /root/wp-db-backups /home/wpuser/wp/logs /var/cache/wp-vulns; do
+        [ -d "$_d" ] && printf '  %-28s %s\n' "$_d" "$(du -sh "$_d" 2>/dev/null | cut -f1)"
+      done
+      printf '\nUsually reclaimable:\n'
+      printf '  podman image prune -f --filter dangling=true   # old images after updates\n'
+      printf '  wp-malware-scan.sh purge                       # quarantined samples\n'
+      printf '  wp-hardening.sh disk                           # full breakdown\n\n'
+      printf 'Acting at 80%% rather than 95%% matters: MariaDB refuses writes before\n'
+      printf 'the disk is full, and a backup that runs out of space leaves you with\n'
+      printf 'neither the space nor the backup.\n'
+    } > "$_b"
+    NOTIFY_COOLDOWN_HOURS=48 /usr/local/bin/wp-notify.sh wasp-disk \
+      "Disk at ${_pct}% on $(hostname)" "$_b"
+    rm -f "$_b" ;;
+
+  lynis)
+    # Reads the last audit rather than running one — a full audit takes
+    # minutes and already runs weekly from cron. `lynis run` forces a fresh
+    # one when that matters.
+    _rep=/var/log/lynis-report.dat
+    if [ "${2:-}" = "run" ]; then
+      command -v lynis >/dev/null 2>&1 || { echo "✗ lynis is not installed" >&2; exit 1; }
+      echo "Running an audit (this takes a few minutes)…"
+      lynis audit system --quiet --logfile /var/log/lynis.log --report-file "$_rep" >/dev/null 2>&1
+    fi
+    [ -r "$_rep" ] || { echo "No Lynis report yet. Run: wp-hardening.sh lynis run" >&2; exit 1; }
+    echo ""
+    echo "Lynis audit"
+    echo "━━━━━━━━━━━"
+    printf '  Report age : %s day(s)\n' "$(( ( $(date +%s) - $(stat -c %Y "$_rep") ) / 86400 ))"
+    _idx=$(sed -n 's/^hardening_index=//p' "$_rep" | head -1)
+    printf '  Hardening index : %s / 100\n' "${_idx:-unknown}"
+    echo ""
+    echo "  The index is a comparison against a general-purpose server profile."
+    echo "  It is a trend to watch, not a target to chase: several controls that"
+    echo "  matter here — digest pinning, the internal database network, the"
+    echo "  signed manifest — are invisible to it, and some of what it wants"
+    echo "  would be actively wrong on a single-purpose container host."
+    echo ""
+    _w=$(sed -n 's/^warning\[\]=//p' "$_rep" | head -12)
+    if [ -n "$_w" ]; then
+      echo "  Warnings:"
+      printf '%s\n' "$_w" | sed 's/^/    /'
+    else
+      echo "  No warnings recorded."
+    fi
+    echo ""
+    _s=$(sed -n 's/^suggestion\[\]=//p' "$_rep" | grep -c .) || _s=0
+    printf '  %s suggestion(s). Full detail: %s\n' "$_s" "$_rep"
+    echo "  Exclusions and why: /etc/lynis/custom.prf" ;;
+
+  cti-lookup)
+    # Machine-readable single lookup, for other tools. Same cache and same
+    # budget guard as the interactive command -- a second code path with its
+    # own accounting is how a quota gets spent twice over.
+    # Prints: reputation|noise|as_name|country|behaviours|false_positive
+    _ip="${2:-}"
+    CTI_CONF=/etc/wp-install/cti.conf
+    CTI_CACHE=/var/cache/wp-cti
+    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-40}"
+    [ -n "${CTI_API_KEY:-}" ] || exit 2
+    command -v jq >/dev/null 2>&1 || exit 2
+    printf '%s' "$_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || exit 2
+    mkdir -p "$CTI_CACHE" 2>/dev/null; chmod 700 "$CTI_CACHE" 2>/dev/null
+
+    _cf="${CTI_CACHE}/${_ip}.json"
+    _need=1
+    if [ -f "$_cf" ]; then
+      _age=$(( ( $(date +%s) - $(stat -c %Y "$_cf") ) / 86400 ))
+      [ "$_age" -lt 7 ] && _need=0
+    fi
+    if [ "$_need" = 1 ]; then
+      _m=$(date -u +%Y-%m); _uf="${CTI_CACHE}/.used-${_m}"
+      _used=$(cat "$_uf" 2>/dev/null || echo 0)
+      [ "${_used:-0}" -ge "$CTI_MONTHLY_BUDGET" ] && exit 3   # budget spent
+      _t=$(mktemp)
+      _c=$(curl -sS --max-time 15 -w '%{http_code}' -H "x-api-key: ${CTI_API_KEY}" \
+             -o "$_t" "https://cti.api.crowdsec.net/v2/smoke/${_ip}" 2>/dev/null || echo 000)
+      echo $(( _used + 1 )) > "$_uf"
+      case "$_c" in
+        200) mv -f "$_t" "$_cf"; chmod 600 "$_cf" ;;
+        404) rm -f "$_t"; printf 'unknown|-|-|-|not seen in CrowdSec network|no\n'; exit 0 ;;
+        *)   rm -f "$_t"; exit 4 ;;
+      esac
+    fi
+    jq -r '[
+      (.reputation // "unknown"),
+      ((.background_noise_score // "?") | tostring),
+      (.as_name // "?"),
+      (.location.country // "?"),
+      ((.behaviors // []) | map(.label) | join(", ") | if . == "" then "none recorded" else . end),
+      (if ((.false_positives // []) | length) > 0 then "YES" else "no" end)
+    ] | join("|")' "$_cf" 2>/dev/null || exit 4 ;;
+
+  cti-watch)
+    # Cron entry point. Enriches NEW login-guard bans only, and only when the
+    # operator opted in -- because at the free tier's 40/month this would
+    # otherwise consume the entire budget on commodity scanners within a day.
+    #
+    # Login-guard bans specifically, not every CrowdSec decision: an address
+    # that reached the login form and failed repeatedly is targeting THIS
+    # site. An http-probing ban is background noise hitting everyone.
+    CTI_CONF=/etc/wp-install/cti.conf
+    CTI_CACHE=/var/cache/wp-cti
+    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    [ "${CTI_ENRICH_BANS:-0}" = "1" ] || exit 0
+    [ -n "${CTI_API_KEY:-}" ] || exit 0
+    mkdir -p "$CTI_CACHE"; _seen="${CTI_CACHE}/.notified"
+    touch "$_seen"; chmod 600 "$_seen"
+
+    podman exec crowdsec cscli decisions list -o raw 2>/dev/null | tail -n +2 | \
+    while IFS=, read -r _id _src _val _scen _rest; do
+      case "$_val" in Ip:*) _ip="${_val#Ip:}" ;; *) continue ;; esac
+      case "$_scen" in *wpvm-login*) : ;; *) continue ;; esac
+      grep -qxF "$_ip" "$_seen" 2>/dev/null && continue
+      printf '%s\n' "$_ip" >> "$_seen"
+
+      _cti=$("$0" cti-lookup "$_ip" 2>/dev/null) || _cti=""
+      _b=$(mktemp)
+      {
+        printf 'An address was banned for repeated failed logins.\n\n'
+        printf '  IP       : %s\n' "$_ip"
+        printf '  Scenario : %s\n' "$_scen"
+        printf '  Host     : %s\n\n' "$(hostname)"
+        if [ -n "$_cti" ]; then
+          printf 'CrowdSec threat intelligence:\n'
+          printf '%s' "$_cti" | awk -F'|' '{
+            printf "  Reputation : %s\n  Noise      : %s / 10\n  Network    : %s (%s)\n  Behaviours : %s\n  False pos. : %s\n",
+              $1,$2,$3,$4,$5,$6 }'
+          case "$_cti" in
+            *"|YES") printf '\n  ⚠ FLAGGED AS A POSSIBLE FALSE POSITIVE — a crawler, monitor or\n'
+                     printf '    CDN. Confirm before treating this as an attack.\n' ;;
+          esac
+        else
+          printf '(No CTI data — no key, quota spent, or lookup failed.)\n'
+        fi
+        printf '\nWhat it did HERE, which CTI cannot tell you:\n'
+        printf '  wp-forensics.sh timeline --hours 48 | grep %s\n' "$_ip"
+        printf '  wp-hardening.sh crowdsec-whitelist list\n'
+      } > "$_b"
+      [ -x /usr/local/bin/wp-notify.sh ] && \
+        /usr/local/bin/wp-notify.sh wp-cti-ban "Login brute-force ban: ${_ip}" "$_b"
+      rm -f "$_b"
+    done
+    # Keep the seen-list bounded; a ban expiring and recurring is worth
+    # hearing about again eventually.
+    tail -500 "$_seen" > "${_seen}.tmp" 2>/dev/null && mv -f "${_seen}.tmp" "$_seen" ;;
+
+  cti)
+    # CrowdSec CTI lookup — what is this address known for globally?
+    #
+    # QUOTA IS THE DESIGN CONSTRAINT. The free Community key allows
+    # **40 lookups per MONTH**, and unused quota does not roll over. That is
+    # roughly 1.3 per day. Older documentation and blog posts say 50 per day;
+    # that figure is out of date and building against it would exhaust a
+    # month of quota in an afternoon on a site with normal scanner traffic.
+    #
+    # So this is deliberately NOT wired into ban notifications by default. A
+    # busy WordPress site bans dozens of addresses a day and every one of them
+    # is a scanner; spending the entire monthly budget confirming that is a
+    # poor trade. It is an operator command, used when an address actually
+    # matters — the one in a malware timeline, or a repeat offender that
+    # reached the login form.
+    #
+    # Answers are cached for 7 days. CTI describes weeks of observed
+    # behaviour, so a same-week repeat lookup buys nothing and costs quota.
+    _ip="${2:-}"
+    CTI_CONF=/etc/wp-install/cti.conf
+    CTI_CACHE=/var/cache/wp-cti
+    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-40}"
+    mkdir -p "$CTI_CACHE" 2>/dev/null || true
+    chmod 700 "$CTI_CACHE" 2>/dev/null || true
+
+    case "$_ip" in
+      ""|--status)
+        echo ""
+        echo "CrowdSec CTI"
+        echo "━━━━━━━━━━━━"
+        if [ -z "${CTI_API_KEY:-}" ]; then
+          echo "  Not configured."
+          echo ""
+          echo "  A free Community key gives 40 lookups per MONTH (not per day —"
+          echo "  older docs say otherwise). Enough for investigating addresses"
+          echo "  that matter; not enough to enrich routine bans, which is why"
+          echo "  nothing here does that automatically."
+          echo ""
+          echo "  Generate one in the CrowdSec Console under Settings -> CTI API"
+          echo "  Keys, then:  wp-hardening.sh cti-key <key>"
+          exit 0
+        fi
+        _m=$(date -u +%Y-%m)
+        _used=$(cat "${CTI_CACHE}/.used-${_m}" 2>/dev/null || echo 0)
+        printf '  Key        : configured (%s chars)\n' "${#CTI_API_KEY}"
+        printf '  This month : %s of %s lookups used\n' "$_used" "$CTI_MONTHLY_BUDGET"
+          _cached=$(ls -1 "$CTI_CACHE"/*.json 2>/dev/null | grep -c .) || _cached=0
+          printf '  Cached     : %s address(es), 7-day life\n' "$_cached"
+        echo ""
+        echo "  Look one up:  wp-hardening.sh cti <ip>"
+        exit 0 ;;
+    esac
+
+    printf '%s' "$_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+      || { echo "✗ '${_ip}' is not an IPv4 address" >&2; exit 1; }
+    [ -n "${CTI_API_KEY:-}" ] || { echo "✗ No CTI key. wp-hardening.sh cti-key <key>" >&2; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "✗ jq required: apk add jq" >&2; exit 1; }
+
+    _cf="${CTI_CACHE}/${_ip}.json"
+    _fresh=0
+    if [ -f "$_cf" ]; then
+      _age=$(( ( $(date +%s) - $(stat -c %Y "$_cf") ) / 86400 ))
+      [ "$_age" -lt 7 ] && _fresh=1
+    fi
+
+    if [ "$_fresh" = 0 ]; then
+      _m=$(date -u +%Y-%m)
+      _uf="${CTI_CACHE}/.used-${_m}"
+      _used=$(cat "$_uf" 2>/dev/null || echo 0)
+      # Refuse rather than exhaust. Discovering the budget is gone at the
+      # moment an address actually matters is the failure worth avoiding.
+      if [ "${_used:-0}" -ge "$CTI_MONTHLY_BUDGET" ]; then
+        echo "✗ Monthly CTI budget spent (${_used}/${CTI_MONTHLY_BUDGET})." >&2
+        echo "  It resets on the 1st and does not roll over." >&2
+        [ -f "$_cf" ] && echo "  A cached answer from $(date -u -d "@$(stat -c %Y "$_cf")" '+%Y-%m-%d') exists — showing it." >&2
+        [ -f "$_cf" ] || exit 1
+      else
+        _tmp=$(mktemp)
+        _code=$(curl -sS --max-time 20 -w '%{http_code}' \
+                  -H "x-api-key: ${CTI_API_KEY}" \
+                  -o "$_tmp" "https://cti.api.crowdsec.net/v2/smoke/${_ip}" 2>/dev/null || echo 000)
+        case "$_code" in
+          200) mv -f "$_tmp" "$_cf"; chmod 600 "$_cf"
+               echo $(( _used + 1 )) > "$_uf"
+               _used=$(( _used + 1 )) ;;
+          404) rm -f "$_tmp"
+               echo "  ${_ip} is not in CrowdSec's database."
+               echo "  That is meaningful: it has not been seen attacking anyone in"
+               echo "  their network. Not proof of innocence, but it does mean this"
+               echo "  is not a known mass-scanner."
+               echo $(( _used + 1 )) > "$_uf"
+               exit 0 ;;
+          429) rm -f "$_tmp"; echo "✗ CrowdSec rate-limited the request (429). Quota may be exhausted." >&2; exit 1 ;;
+          403|401) rm -f "$_tmp"; echo "✗ Key rejected (HTTP ${_code}). Check it in the Console." >&2; exit 1 ;;
+          *)   rm -f "$_tmp"; echo "✗ Lookup failed (HTTP ${_code})." >&2; exit 1 ;;
+        esac
+      fi
+    fi
+
+    [ -s "$_cf" ] || { echo "✗ No data for ${_ip}" >&2; exit 1; }
+    echo ""
+    echo "CTI — ${_ip}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    [ "$_fresh" = 1 ] && echo "  (cached $(date -u -d "@$(stat -c %Y "$_cf")" '+%Y-%m-%d') — no quota used)"
+    jq -r '
+      "  Reputation   : \(.reputation // "unknown")",
+      "  Confidence   : \(.confidence // "unknown")",
+      "  Network      : \(.as_name // "?") (\(.location.country // "?"))",
+      "  Range        : \(.ip_range // "?")  range score \(.ip_range_score // "?")",
+      "  Noise score  : \(.background_noise_score // "?") / 10   (10 = hits everyone constantly)",
+      "  First seen   : \(.history.first_seen // "?")",
+      "  Last seen    : \(.history.last_seen // "?")",
+      "",
+      "  Behaviours   : \((.behaviors // []) | map(.label) | join(", ") | if . == "" then "none recorded" else . end)",
+      "  Top attacks  : \((.attack_details // []) | map(.name) | .[0:6] | join(", ") | if . == "" then "none recorded" else . end)",
+      "  Targets      : \((.target_countries // {}) | to_entries | sort_by(-.value) | .[0:5] | map("\(.key) \(.value)%") | join(", "))",
+      "  False pos.   : \((.false_positives // []) | join(", ") | if . == "" then "none flagged" else . end)"
+    ' "$_cf" 2>/dev/null || { echo "  Could not parse the response."; exit 1; }
+    echo ""
+    _fp=$(jq -r '(.false_positives // []) | length' "$_cf" 2>/dev/null || echo 0)
+    if [ "${_fp:-0}" -gt 0 ]; then
+      echo "  ⚠ Flagged as a possible FALSE POSITIVE — a search engine crawler,"
+      echo "    monitoring service or CDN. Check before banning it permanently."
+    fi
+    echo "  This describes what the address does GLOBALLY, across CrowdSec's"
+    echo "  network. It does not tell you what it did to this site — for that:"
+    echo "    wp-forensics.sh timeline --hours 48 | grep ${_ip}" ;;
+
+  cti-key)
+    _k="${2:-}"
+    [ -n "$_k" ] || { echo "Usage: wp-hardening.sh cti-key <key>" >&2; exit 1; }
+    mkdir -p /etc/wp-install
+    { printf 'CTI_API_KEY=%s\n' "$_k"
+      printf 'CTI_MONTHLY_BUDGET=%s\n' "${3:-40}"; } > /etc/wp-install/cti.conf
+    chmod 600 /etc/wp-install/cti.conf
+    echo "✔ CTI key stored (0600, root-only)"
+    echo "  Budget set to ${3:-40} lookups/month — the Community free tier."
+    echo "  If you have a paid key, pass the real figure:"
+    echo "    wp-hardening.sh cti-key <key> 5000"
+    echo ""
+    echo "  Test it:  wp-hardening.sh cti 45.148.10.62" ;;
+
+  web-list|web-allow|web-deny)
+    # WEB_CIDR restricts who may open a TCP connection to 80/443 at all.
+    # It is deliberately separate from the wp-admin rule, which decides who
+    # may reach the admin PATHS once connected.
+    #
+    # The useful configuration is both: the proxy, so external visitors are
+    # funnelled through it, PLUS the operator's own addresses, so admin work
+    # can go direct to the VM. Direct access has no proxy in the path, so it
+    # does not depend on mod_remoteip substituting anything — which is the
+    # fragile part, and the one that produces a 403 when it breaks.
+    . /etc/wp-install/vars.sh 2>/dev/null || true
+    _act="${1}"; _ip="${2:-}"
+    _nft=/etc/nftables.nft
+
+    case "$_act" in
+      web-list)
+        echo ""
+        echo "Who may connect to ports 80/443"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ -z "${WEB_CIDR:-}" ]; then
+          echo "  ANY source. External visitors can reach this VM directly,"
+          echo "  bypassing the proxy and whatever it enforces."
+        else
+          printf '%s' "$WEB_CIDR" | tr ',' '\n' | sed 's/^/  • /'
+          echo ""
+          printf '  Proxy configured : %s\n' "${PROXY_IP:-none}"
+          case ",${WEB_CIDR}," in
+            *",${PROXY_IP:-__none__},"*) echo "  ✔ The proxy is allowed — normal visitors can reach the site." ;;
+            *) echo "  ✗ The proxy (${PROXY_IP:-?}) is NOT in this list. Visitors cannot" ;;
+          esac
+          echo ""
+          echo "  wp-admin additionally requires the CLIENT address to match:"
+          printf '    %s %s\n' "${ADMIN_CIDR:-none}" "${ALLOWED_ADMIN_IP:-}"
+          echo "    Reaching the VM directly from one of those is the reliable"
+          echo "    way in: no proxy means no X-Forwarded-For to get wrong."
+        fi
+        echo ""
+        echo "  Live rule:"
+        nft list ruleset 2>/dev/null | grep -E "tcp dport \{ 80, 443 \}" | sed 's/^/    /'
+        echo ""
+        echo "  Add:  wp-hardening.sh web-allow <ip|cidr>"
+        echo "  Drop: wp-hardening.sh web-deny  <ip|cidr>" ;;
+
+      web-allow|web-deny)
+        [ -n "$_ip" ] || { echo "Usage: wp-hardening.sh ${_act} <ip|cidr>" >&2; exit 1; }
+        printf '%s' "$_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' \
+          || { echo "✗ '${_ip}' is not a valid IPv4 address or CIDR." >&2; exit 1; }
+        [ -w "$_nft" ] || { echo "✗ Cannot write ${_nft}" >&2; exit 1; }
+
+        _new="$WEB_CIDR"
+        if [ "$_act" = "web-allow" ]; then
+          case ",${WEB_CIDR}," in
+            *",${_ip},"*) echo "Already allowed: ${_ip}"; exit 0 ;;
+          esac
+          _new="${WEB_CIDR:+${WEB_CIDR},}${_ip}"
+        else
+          # Removing the proxy would take the site offline for every visitor.
+          if [ "$_ip" = "${PROXY_IP:-}" ]; then
+            echo "✗ That is the reverse proxy address. Removing it stops every" >&2
+            echo "  visitor reaching the site, not just you." >&2
+            exit 1
+          fi
+          _new=$(printf '%s' "$WEB_CIDR" | tr ',' '\n' | grep -vxF "$_ip" | paste -sd, -)
+        fi
+
+        cp "$_nft" "${_nft}.bak-$(date -u +%Y%m%d%H%M%S)"
+        # Both places: the input rule and the forward rule. Editing only one
+        # leaves the two disagreeing, and the forward rule is the one that
+        # actually decides for a published container port.
+        sed -i "s|ip saddr { ${WEB_CIDR} } tcp dport { 80, 443 }|ip saddr { ${_new} } tcp dport { 80, 443 }|g" "$_nft"
+        sed -i "s|ip saddr != { ${WEB_CIDR}, 127.0.0.0/8, 10.89.0.0/16 }|ip saddr != { ${_new}, 127.0.0.0/8, 10.89.0.0/16 }|g" "$_nft"
+        sed -i "s|^WEB_CIDR=.*|WEB_CIDR='${_new}'|" /etc/wp-install/vars.sh 2>/dev/null || true
+
+        if nft -c -f "$_nft" 2>/tmp/.nfterr; then
+          nft -f "$_nft" && echo "✔ Web access now: ${_new}"
+          echo "  Rule reloaded. Verify: wp-hardening.sh web-list"
+        else
+          echo "✗ The edited ruleset does NOT parse — nothing was applied." >&2
+          sed 's/^/    /' /tmp/.nfterr >&2
+          cp "$(ls -1t ${_nft}.bak-* | head -1)" "$_nft"
+          echo "  Restored the previous ruleset." >&2
+          exit 1
+        fi
+        rm -f /tmp/.nfterr ;;
+    esac ;;
 
   admin-rule)
     # Switch the wp-admin/wp-login authorization rule between two forms,

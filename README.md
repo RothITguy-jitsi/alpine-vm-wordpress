@@ -53,7 +53,10 @@ It's also honest about where it stops. Every control here states its own limits 
 
 - [Why I built this](#why-i-built-this)
 - [What This Is](#what-this-is)
+- [Knowing it is still there](#knowing-it-is-still-there)
+- [Threat Intelligence](#threat-intelligence-crowdsec-cti)
 - [Incident Playbook](INCIDENT-PLAYBOOK.md)
+- [MSP Runbook](MSP-RUNBOOK.md)
 - [Architecture Diagrams](ARCHITECTURE.md)
 - [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
@@ -106,6 +109,88 @@ Run `install.sh` on a Proxmox VE host as root. It will:
 Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real time via `qm terminal <VMID>`.
 
 ---
+
+## Running this for clients
+
+**[MSP-RUNBOOK.md](MSP-RUNBOOK.md)** — RTO/RPO with the defaults this system actually delivers, severity levels mapped to the alerts that fire, change control, exception review and a decommissioning order that keeps evidence until last.
+
+Templates with defaults, not promises made on your behalf. The compromise RTO is deliberately vague and should stay that way in a contract: restoring takes minutes, but establishing *when* the compromise started — which decides which backup is clean — takes as long as it takes, and a tight RTO is what pressures someone into restoring a backup that still contains the backdoor.
+
+## Threat intelligence (CrowdSec CTI)
+
+Turns *"an IP was banned"* into *"this is a Dutch-hosted HTTP scanner that has been brute-forcing WordPress across five countries since June."*
+
+```sh
+wp-hardening.sh cti-key <key>       # once
+wp-hardening.sh cti 45.148.10.62
+wp-hardening.sh cti --status        # quota used this month
+```
+
+```
+  Reputation   : malicious
+  Network      : Techoff Srv Limited (NL)
+  Noise score  : 8 / 10   (10 = hits everyone constantly)
+  Behaviours   : HTTP Scan, HTTP Bruteforce
+  Top attacks  : crowdsecurity/http-probing, crowdsecurity/http-bf-wordpress_bf
+  Targets      : US 34%, DE 18%, FR 11%, GB 9%, NL 5%
+```
+
+### Three ways to use it
+
+| | Cost | When |
+|---|---|---|
+| **On demand** — `wp-hardening.sh cti <ip>` | 1 lookup | An address you're actually investigating |
+| **Timeline enrichment** — `wp-forensics.sh timeline --around <file> --enrich` | 1 per distinct public IP in the window | After a malware finding, to see what the addresses around it are known for |
+| **Automatic ban enrichment** — opt-in at install | 1 per new login-guard ban | Only sensible with a purchased key |
+
+Timeline enrichment skips private and container addresses — they cost quota and CTI knows nothing about them.
+
+**Automatic enrichment covers login brute-force bans only**, never generic `http-probing` ones. An address that reached your login form and failed repeatedly is targeting *this* site; a probing ban is background noise hitting everyone, and enriching those is how a month's budget disappears in a day.
+
+The installer defaults this to **no** below 100 lookups/month and warns if you enable it anyway.
+
+### The quota is the design constraint
+
+The free Community key allows **40 lookups per month** — not per day. Unused quota doesn't roll over. Older blog posts and documentation say 50/day; that figure is out of date, and building against it would burn a month's budget in an afternoon.
+
+So this is **deliberately not wired into ban notifications.** A WordPress site bans dozens of addresses a day and nearly all are commodity scanners — spending the entire monthly budget confirming that would leave nothing for the address that actually matters. It's an operator command for when one does: the IP in a malware timeline, or a repeat offender that reached the login form.
+
+- Answers cached **7 days** — CTI describes weeks of behaviour, so a same-week repeat buys nothing and costs quota
+- A local counter **refuses** at the budget rather than exhausting it silently; discovering the quota is gone at the moment an address matters is the failure worth avoiding
+- Paid key? `wp-hardening.sh cti-key <key> 5000`
+
+**A 404 is informative, not a failure.** It means the address hasn't been seen attacking anyone in CrowdSec's network — not innocence, but not a known mass-scanner either.
+
+**Check `false_positives` before acting.** CTI flags crawlers, monitoring services and CDNs. Permanently banning Googlebot is a self-inflicted outage.
+
+CTI describes what an address does **globally**. For what it did to *your* site, `wp-forensics.sh timeline` is the tool.
+
+## Knowing it is still there
+
+Every other check in this project runs **on** the VM — so a VM that is powered
+off, unreachable, or on a dead hypervisor reports nothing at all. Silence and
+health look identical.
+
+```sh
+wp-notify.sh --heartbeat-url https://hc-ping.com/<uuid>
+wp-notify.sh --heartbeat        # test it now
+```
+
+Pings an external dead-man's-switch every 10 minutes — [healthchecks.io](https://healthchecks.io) is free, Uptime Kuma works, anything that alerts on **absence** does. The absence of a ping is the signal, which is precisely what an on-box check cannot produce.
+
+It verifies WordPress actually serves and MariaDB answers **before** pinging. A heartbeat that only proved cron was running would report healthy through a completely broken site — worse than none, because it converts a real outage into a false assurance.
+
+Set the check's period to 15 minutes with a 30-minute grace, so two consecutive misses alert rather than one slow run.
+
+### Certificate expiry
+
+```sh
+wp-hardening.sh tls              # uses your configured domain
+```
+
+TLS terminates at the proxy, so the VM cannot see its own certificate — this checks the public endpoint, which also confirms the domain resolves and the proxy answers.
+
+Warns at **14 days**, not 30: Let's Encrypt renews at 30, so warning there fires on every healthy certificate and gets ignored within a week. At 14, automatic renewal has had time to run and hasn't. Daily, silent above the threshold.
 
 ## When something reports a finding
 
@@ -162,6 +247,7 @@ and skips that step. Either way this is what actually gets used:
 │   └── README.md
 ├── ARCHITECTURE.md             # Mermaid diagrams: components, request flow, install, updates
 ├── INCIDENT-PLAYBOOK.md        # what to do when a scan finds something; RACI
+├── MSP-RUNBOOK.md              # SLA, RTO/RPO, change control, decommissioning
 ├── CHANGELOG.md                # what changed and why, including this restructuring
 ├── TODO.md                     # currently open items and why they're deferred
 ├── LICENSE                     # MIT
@@ -620,13 +706,60 @@ location = /xmlrpc.php { deny all; }
 
 # Never serve these, whatever WordPress or a plugin thinks.
 location ~* ^/(wp-config\.php|readme\.html|license\.txt)$ { deny all; }
+# .well-known FIRST — the dotfile rule below would otherwise block
+# security.txt and ACME challenges, since the path begins with a dot.
+# ^~ makes this a prefix match that wins over the regex.
+location ^~ /.well-known/ { proxy_pass http://VM-IP:80; }
 location ~* /\.(git|env|svn|ht) { deny all; }
+
+# Security headers at the edge. The VM sets these in Apache, but an external
+# scan of a live deployment found NONE of them reaching the internet — only
+# HSTS, which the proxy adds itself. Headers that protect the visitor are
+# worth nothing if they die at the proxy.
+#
+# proxy_hide_header first: without it nginx APPENDS rather than replaces and
+# the client gets the header twice.
+proxy_hide_header X-Frame-Options;
+proxy_hide_header X-Content-Type-Options;
+proxy_hide_header Referrer-Policy;
+proxy_hide_header Permissions-Policy;
+add_header X-Frame-Options        "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy        "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy     "camera=(), microphone=(), geolocation=(), payment=()" always;
+
+# includeSubDomains matters: "max-age=...; preload" WITHOUT it is invalid for
+# the HSTS preload list, so the preload directive does nothing. Only enable
+# once every subdomain serves HTTPS.
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
 
 # Uploads should never execute.
 location ~* ^/wp-content/uploads/.*\.(php|phtml|phar|php[0-9])$ { deny all; }
 ```
 
 **On `X-Forwarded-For $remote_addr`** — NPM defaults to `$proxy_add_x_forwarded_for`, which *appends* to whatever the client sent, so a forged header arrives as `<forged>, <real>`. mod_remoteip should still choose correctly, but only while `RemoteIPTrustedProxy` is exactly right. Replacing states the truth and removes the class.
+
+#### Verify the headers actually arrive
+
+Setting a header on the VM is not the same as a visitor receiving it. Check from outside:
+
+```sh
+curl -sI https://your-domain/ | grep -iE 'x-frame|x-content-type|referrer|permissions|strict-transport|content-security'
+```
+
+An external scan of a live WASP deployment found **none** of the Apache-set headers reaching the internet — only HSTS, added by the proxy. The VM was configured correctly the whole time; the headers were lost in between. That is why they are set at the edge above as well.
+
+**CSP is deliberately not set at the edge.** The VM tailors it per path — wp-admin needs `unsafe-eval`, the public site does not — and one blanket policy would either break the admin interface or weaken the public site to match it. Verify it's arriving rather than duplicating it.
+
+#### `security.txt`
+
+```sh
+wp-hardening.sh security-txt security@yourdomain.com
+```
+
+[RFC 9116](https://www.rfc-editor.org/rfc/rfc9116). One small file telling a researcher who finds something where to send it. Without one they give up, post publicly, or email WHOIS — none of which is how you want to learn about a vulnerability in a client's site.
+
+It writes `Expires:`, which the RFC requires and everyone forgets. A stale `security.txt` is worse than none: it tells a researcher the contact is current when it may not be. Re-run it annually.
 
 #### Also worth enabling on the proxy host
 

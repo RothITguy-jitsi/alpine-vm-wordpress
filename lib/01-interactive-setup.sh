@@ -442,8 +442,45 @@ if [[ -n "$PROXY_IP" && -z "$WEB_CIDR" ]]; then
   _sec_note
   read -rp "  Restrict 80/443 to ${PROXY_IP} only? [y/N] : " _WLOCK
   case "${_WLOCK}" in
-    y|Y|yes|YES) WEB_CIDR="${PROXY_IP}"
-      msg_ok "Web ports restricted to ${PROXY_IP} — the VM's IP is no longer directly reachable" ;;
+    y|Y|yes|YES)
+      WEB_CIDR="${PROXY_IP}"
+      # Offer to keep a direct path for admin work. Restricting to the proxy
+      # ALONE means every admin request depends on mod_remoteip substituting
+      # the real client address from X-Forwarded-For — and when that stops
+      # working the result is a 403 with no obvious cause, from a VM that
+      # serves the public site perfectly.
+      #
+      # Allowing the operator's own addresses directly removes that
+      # dependency for admin work entirely: no proxy in the path means
+      # nothing to substitute. External visitors are still funnelled through
+      # the proxy, because their addresses are not in the list.
+      _extra=""
+      [[ -n "$ADMIN_CIDR" && "$ADMIN_CIDR" != "$PROXY_IP" ]] && _extra="$ADMIN_CIDR"
+      [[ -n "$ALLOWED_ADMIN_IP" ]] && _extra="${_extra:+$_extra,}$ALLOWED_ADMIN_IP"
+      if [[ -n "$_extra" ]]; then
+        echo ""
+        echo -e "  ${YW}  Also allow direct access from your admin addresses?${CL}"
+        echo -e "  ${YW}    ${_extra}${CL}"
+        echo -e "  ${YW}  External visitors still have to come through the proxy —${CL}"
+        echo -e "  ${YW}  their addresses are not on this list. What it buys you is a${CL}"
+        echo -e "  ${YW}  path to wp-admin that does NOT depend on the proxy passing${CL}"
+        echo -e "  ${YW}  X-Forwarded-For correctly. If that ever breaks, you get a${CL}"
+        echo -e "  ${YW}  403 on a site that otherwise looks completely healthy, and${CL}"
+        echo -e "  ${YW}  this is the way back in.${CL}"
+        echo -e "  ${YW}  Saying no is defensible if nothing should ever reach the VM${CL}"
+        echo -e "  ${YW}  except the proxy — keep the Proxmox console to hand.${CL}"
+        read -rp "  Allow direct admin access too? [Y/n] : " _WADM
+        case "${_WADM:-y}" in
+          n|N) msg_ok "Web ports restricted to ${PROXY_IP} only" ;;
+          *)   WEB_CIDR="${PROXY_IP},${_extra}"
+               msg_ok "Web ports allow: ${WEB_CIDR}"
+               msg_info "  Visitors funnel through the proxy; you can also reach the VM directly." ;;
+        esac
+        unset _WADM
+      else
+        msg_ok "Web ports restricted to ${PROXY_IP} — the VM's IP is no longer directly reachable"
+      fi
+      unset _extra ;;
     *) msg_ok "Web ports remain open to any source (the proxy is the intended path, not the enforced one)" ;;
   esac
   unset _WLOCK
@@ -1086,6 +1123,65 @@ while :; do
   msg_warn "  '${GOVERNANCE_EMAIL}' doesn't look like an email address."
 done
 unset _gov_default
+
+# ── CrowdSec threat intelligence (CTI) ───────────────────────────────────────
+echo ""
+echo -e "  ${BLD}CrowdSec threat intelligence (optional)${CL}"
+echo -e "  ${YW}Turns \"an address was banned\" into \"this is a Dutch-hosted HTTP${CL}"
+echo -e "  ${YW}scanner that has been brute-forcing WordPress across five${CL}"
+echo -e "  ${YW}countries since June\" — behaviour, not just reputation.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  Useful when deciding whether a ban is a targeted attempt or${CL}"
+echo -e "  ${YW}  background noise, and whether an address is actually a crawler${CL}"
+echo -e "  ${YW}  you have just blocked by mistake.${CL}"
+echo -e "  ${RD}  THE QUOTA IS SMALL. The free Community key allows 40 lookups${CL}"
+echo -e "  ${RD}  per MONTH — not per day. Unused quota does not roll over.${CL}"
+echo -e "  ${YW}  That is enough to investigate addresses that matter, and not${CL}"
+echo -e "  ${YW}  nearly enough to enrich every ban: this VM will ban dozens a${CL}"
+echo -e "  ${YW}  day and almost all of them are commodity scanners.${CL}"
+echo -e "  ${YW}  Lookups are cached for 7 days and a local counter refuses at${CL}"
+echo -e "  ${YW}  the budget rather than letting you discover it is gone during${CL}"
+echo -e "  ${YW}  an incident.${CL}"
+echo -e "  ${YW}  Get a free key in the CrowdSec Console under Settings →${CL}"
+echo -e "  ${YW}  CTI API Keys. Skipping costs nothing else.${CL}"
+_sec_note
+CTI_API_KEY=""; CTI_MONTHLY_BUDGET="40"; CTI_ENRICH_BANS="0"
+read -rsp "  CrowdSec CTI key (blank = skip) : " CTI_API_KEY; echo
+if [[ -n "$CTI_API_KEY" ]]; then
+  msg_ok "CTI key captured (${#CTI_API_KEY} chars)"
+  read -rp "  Monthly lookup budget [40 = free tier] : " _CTB
+  case "${_CTB}" in ''|*[!0-9]*) CTI_MONTHLY_BUDGET=40 ;; *) CTI_MONTHLY_BUDGET="$_CTB" ;; esac
+  echo ""
+  echo -e "  ${BLD}Automatically enrich login brute-force bans?${CL}"
+  echo -e "  ${YW}Only bans from the login-guard scenario — an address that${CL}"
+  echo -e "  ${YW}reached your login form and failed repeatedly is targeting THIS${CL}"
+  echo -e "  ${YW}site. Generic http-probing bans are noise hitting everyone and${CL}"
+  echo -e "  ${YW}are never enriched.${CL}"
+  if [[ "$CTI_MONTHLY_BUDGET" -le 100 ]]; then
+    echo -e "  ${RD}  At ${CTI_MONTHLY_BUDGET}/month this is likely to exhaust the budget.${CL}"
+    echo -e "  ${RD}  Recommended only with a purchased key (5k+/month).${CL}"
+    echo -e "  ${YW}  Say no and look addresses up on demand instead:${CL}"
+    echo -e "  ${YW}    wp-hardening.sh cti <ip>${CL}"
+    echo -e "  ${YW}    wp-forensics.sh timeline --around <file> --enrich${CL}"
+    _CTD="N"
+  else
+    echo -e "  ${YW}  Your budget (${CTI_MONTHLY_BUDGET}/month) can support this.${CL}"
+    _CTD="Y"
+  fi
+  read -rp "  Enrich login brute-force bans automatically? [y/N] : " _CTE
+  case "${_CTE:-$_CTD}" in
+    y|Y|yes|YES) CTI_ENRICH_BANS="1"
+      msg_ok "Login brute-force bans will be enriched and emailed"
+      [[ "$CTI_MONTHLY_BUDGET" -le 100 ]] && \
+        msg_warn "  With a small budget this may stop working mid-month. The counter" && \
+        msg_warn "  refuses rather than failing loudly, so check: wp-hardening.sh cti --status" ;;
+    *) msg_ok "On-demand lookups only — wp-hardening.sh cti <ip>" ;;
+  esac
+  unset _CTB _CTE _CTD
+else
+  msg_ok "CTI skipped — bans are still enforced, just without global context"
+fi
 
 # ── Wordfence Intelligence API key ───────────────────────────────────────────
 echo ""

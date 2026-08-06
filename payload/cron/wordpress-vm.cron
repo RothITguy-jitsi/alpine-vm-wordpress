@@ -52,3 +52,26 @@
 # enough to re-argue it before an update is blocked. Silent unless something
 # is actually approaching, so it stays worth reading.
 0 8 * * 1 /usr/local/bin/wp-hardening.sh exceptions-check >/dev/null 2>&1
+# Enrich NEW login brute-force bans (every 30 min). Exits immediately unless
+# CTI_ENRICH_BANS=1, which the installer only recommends with a purchased key
+# -- at the free tier's 40/month this would consume the budget in a day.
+# Only wpvm-login scenario bans are considered: an address that reached the
+# login form is targeting this site, whereas an http-probing ban is noise.
+*/30 * * * * /usr/local/bin/wp-hardening.sh cti-watch >/dev/null 2>&1
+# Disk check twice daily. Silent below 80%; emails once per 48h above it.
+# 80% rather than 95% deliberately: MariaDB refuses writes before the disk is
+# actually full, the errors do not mention disk, and a backup that runs out of
+# space leaves you with neither the space nor the backup.
+0 */12 * * * /usr/local/bin/wp-hardening.sh disk-check >/dev/null 2>&1
+# External heartbeat every 10 minutes. Exits immediately unless a URL is
+# configured. This is the only check that can detect the VM being GONE:
+# everything else runs on the VM, so silence and health look identical.
+# It verifies WordPress serves and MariaDB answers BEFORE pinging — a
+# heartbeat proving only that cron runs would report healthy through a
+# completely broken site.
+*/10 * * * * /usr/local/bin/wp-notify.sh --heartbeat >/dev/null 2>&1
+# TLS expiry, daily at 09:00. Silent above 14 days. Warns at 14 rather than
+# 30 because Let's Encrypt renews at 30 — warning there would fire on every
+# healthy certificate and be ignored within a week. At 14, automatic renewal
+# has had time to run and has not.
+0 9 * * * /usr/local/bin/wp-hardening.sh tls-check >/dev/null 2>&1

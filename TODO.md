@@ -221,3 +221,176 @@ What is implemented is everything that makes an out-of-band approval
 The remaining gap is inherent: nothing here can verify that the stated
 justification was actually discussed with anyone. That is a property of the
 process around this system, not of this system.
+
+
+---
+
+# Idea list — triage
+
+Positions on the remaining items, so a "no" is a decision with a reason
+rather than something that quietly fell off the list.
+
+## AIDE / Tripwire — NOT PLANNED, largely redundant here
+
+The gap AIDE fills is "has any file on this system changed unexpectedly".
+Most of that is already covered by mechanisms that are stronger *because they
+have an external reference*:
+
+- **WordPress core** is compared against `/usr/src/wordpress` inside the
+  **pinned, digest-verified** image. That is a cryptographically anchored
+  baseline, not a database this host generated about itself.
+- **The tooling** under `/usr/local/bin` is compared against the signed
+  manifest by `wasp-verify-integrity.sh`.
+- **Uploads, plugins and themes** are covered by the structural and YARA
+  layers, and by `wp-forensics.sh since-backup`.
+
+What AIDE would add is `/etc` and `/usr` on the host. Real, but narrower than
+it sounds: those paths change on every `apk upgrade`, which runs nightly, so
+the database needs re-baselining constantly and the signal decays into
+"packages updated again". An AIDE database stored on the host it audits is
+also trivially re-baselined by an attacker with root — the same limitation
+already documented for `wasp-verify-integrity.sh`, but without the signature
+that partially offsets it there.
+
+Reconsider if the VM ever stops auto-upgrading, or if a compliance regime
+requires host-level FIM by name.
+
+## Optional profile flag `lynis_extra=auditd+aide` — NOT PLANNED
+
+The stated motivation was "MSPs who want the score more than simplicity", and
+that is the argument against it. Installing auditd to raise a Lynis number,
+on a VM where nothing reads the audit log, adds a daemon, disk churn and an
+update surface in exchange for a metric. If an MSP needs auditd because a
+client's regime names it, that is a real requirement and belongs in
+`MSP-RUNBOOK.md` as a documented deviation — not a flag that makes a score
+look better.
+
+## LUKS for data volumes — NOT PLANNED as implemented, worth understanding
+
+Encrypting the VM's data volume protects against exactly one thing: someone
+obtaining the disk image without the running system. Against every other
+threat here it does nothing, because the key must be present for the VM to
+boot unattended.
+
+The options and what each actually buys:
+
+| Approach | Protects against | Cost |
+|---|---|---|
+| LUKS + passphrase at boot | Stolen disk image | **No unattended reboot.** Every kernel update needs a console |
+| LUKS + keyfile on the same disk | Nothing | The key sits beside the data |
+| LUKS + key from Proxmox host | Guest-only compromise | Hypervisor still reads both |
+| **Proxmox storage-level encryption** | Stolen physical disk | Transparent; no guest change |
+
+For a VM on a hypervisor you control, storage-level encryption is the honest
+answer — it covers the same threat without breaking unattended boot. If the
+threat is a hostile hypervisor operator, no guest-side measure helps.
+
+**What already covers the realistic case:** off-VM backups are `age`-encrypted
+with a public key, so the copies that leave your control are unreadable
+without a key that never touches the VM. That is where the data is genuinely
+exposed.
+
+## Header comments → docs/ — PARTIALLY, carefully
+
+Raised in an evaluation and in the idea list. The observation is fair: some
+headers are design documents.
+
+But the "why" comments have repeatedly been the thing that made a bug
+findable — the container-variable scope note, the fail-open explanation, the
+heredoc-quoting rationale. Moving them wholesale would optimise for a first
+read at the cost of every subsequent debugging session, and this project's
+history says the debugging sessions are what matter.
+
+Proposed compromise, not yet done:
+
+- Keep **decision rationale** inline. "Why this, not the obvious thing" is
+  worth its lines at the point of the decision.
+- Move **historical narrative** — "this failed in the field on date X, here is
+  the whole story" — to `docs/design-notes.md`, leaving a one-line reference.
+- Only touch files whose header exceeds ~60 lines.
+
+## Safe site import — PLANNED, biggest remaining item
+
+Design notes already recorded above. The primitives exist: `--path` scanning,
+`--json` output, quarantine, core comparison against the pinned image. What is
+missing is the staging area, dump-file scanning before load, and a gate
+policy. This is the highest user-facing win and a session of its own.
+
+
+---
+
+# Gap analysis — what is still missing
+
+From a systematic pass over the project rather than a summary of it.
+
+## Closed in this pass
+
+- **Dead container images were never reclaimed.** Every `update.sh` left the
+  superseded image on disk: roughly 700 MB each, so five updates is 3.5 GB on
+  a 20 GB volume. `update.sh` now prunes dangling images *after* the
+  post-cutover health check passes and `wordpress-old` is removed — the old
+  image IS the rollback path until that moment.
+- **Disk usage was reported, never acted on.** `wp-hardening.sh disk` breaks
+  down what is consuming the volume and what can be reclaimed;
+  `disk-check` runs twice daily and emails once above 80%.
+
+  80% rather than 95% is deliberate: MariaDB refuses writes before the disk
+  is actually full, the resulting errors say nothing about disk, and a backup
+  that runs out of space leaves you with neither the space nor the backup.
+
+## Open — real, not yet addressed
+
+### Boot ordering says "started", not "ready"
+
+`wp-container` declares `need mariadb-container`. OpenRC waits for that
+service to *start*, and `podman start` returns when the container is running —
+not when MariaDB accepts connections, which takes 20–60s. A live VM was
+observed showing `mariadb Up 22 minutes (starting)`.
+
+WordPress reconnects per request so this is usually self-healing, and the
+visible symptom is a brief "Error establishing a database connection" after a
+reboot. Worth fixing with a readiness wait in `wp-container`'s start, using
+the existing `mariadb-health-check.sh`.
+
+### Nothing knows whether the site is reachable
+
+Every check here runs *on* the VM. If it is off, unreachable, or the
+hypervisor is down, nothing reports it — the VM cannot tell you it is gone.
+`MSP-RUNBOOK.md` says to pair this with external monitoring, but the project
+offers no help doing so.
+
+A `wp-notify.sh --heartbeat` writing to an external dead-man's-switch
+(healthchecks.io, Uptime Kuma) would close it cheaply: absence of a heartbeat
+is the signal, and absence is exactly what an on-box check cannot detect.
+
+### No secret rotation
+
+Database, SMTP and MariaDB root passwords are generated at install and never
+rotated. There is no command to rotate them, and the incident playbook says
+"rotate every credential" without providing the means. After a compromise
+this is manual, error-prone, and touches several files that must stay in
+step — precisely the shape of task that gets half-done.
+
+### TLS certificates are entirely the proxy's problem
+
+Nothing here monitors expiry. If the proxy's renewal breaks, the first
+indication is a browser warning seen by a visitor. A check against the public
+endpoint would be cheap; a check from inside the VM cannot see the
+certificate at all, since TLS terminates at the proxy.
+
+### Bus factor
+
+Several things exist only in one place: the minisign secret key, the age
+backup private key, the CTI and Wordfence tokens. Losing the age key makes
+every encrypted backup permanently unreadable. `MSP-RUNBOOK.md` covers
+decommissioning; it does not cover the operator being unavailable.
+
+Worth a documented custody list — what exists, where it is held, and who else
+can reach it — rather than tooling.
+
+### Restore has never been proven end to end
+
+`wasp-selftest.sh restore-test` proves the *local* backup restores into a
+throwaway database. Nobody has yet taken an *encrypted, off-VM* copy,
+decrypted it on a different machine, and restored it. Those are different
+claims, and only the second one is the promise being made to a client.

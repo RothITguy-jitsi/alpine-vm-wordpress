@@ -6,6 +6,392 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Three operational gaps closed
+
+**WordPress now waits for MariaDB to accept connections**, not merely for its
+service to have started. `need mariadb-container` satisfies OpenRC as soon as
+`podman start` returns, which is 20–60s before the database is ready — a live
+VM was observed at `mariadb Up 22 minutes (starting)`.
+
+WordPress reconnects per request so this was self-healing, but the visible
+symptom was "Error establishing a database connection" for the first minute
+after a reboot: a message that sends people hunting a database fault that does
+not exist, appearing at exactly the moment someone is checking whether the
+reboot worked. Capped at 60s, then it starts anyway — a container that is up
+and erroring is more diagnosable than one that never started.
+
+**`wp-notify.sh --heartbeat` closes the only gap nothing else could.** Every
+check in this project runs *on* the VM, so a VM that is off, unreachable, or
+on a dead hypervisor reports nothing, and silence is indistinguishable from
+health. An external dead-man's-switch inverts that: absence of a ping is the
+signal, which is precisely what an on-box check cannot produce.
+
+It verifies WordPress serves and MariaDB answers **before** pinging. A
+heartbeat proving only that cron ran would report healthy through a completely
+broken site — worse than none, because it converts an outage into a false
+assurance.
+
+**`wp-hardening.sh tls` checks certificate expiry from outside.** TLS
+terminates at the proxy, so the VM cannot see its own certificate and an
+`openssl` check against loopback would test nothing. Going to the public
+endpoint also confirms the domain resolves and the proxy answers.
+
+Warns at **14 days rather than 30**, because Let's Encrypt renews at 30 — a
+warning there fires on every healthy certificate and is filtered away within a
+week. At 14, automatic renewal has had its chance and has not taken it. The
+failure message names the most likely cause: an ACME challenge blocked by a
+dotfile deny rule, since `/.well-known/` begins with a dot.
+
+`check-heredoc-backticks.py` caught backticks in the new init-script heredoc —
+the fourth time that check has fired on the same class, and the third time in
+code written minutes after running it.
+
+---
+
+## Unreleased — Gap analysis: disk exhaustion was the sleeper
+
+A systematic pass rather than a summary. The most serious finding is
+unglamorous.
+
+**Nothing ever reclaimed dead container images.** Every `update.sh` left the
+superseded image on disk — roughly 700 MB each, so five updates is 3.5 GB on
+a 20 GB volume. The failure mode is a site that stops working months after an
+update, for reasons that look nothing like an update: MariaDB refuses writes
+before the disk is actually full, and none of the resulting errors mention
+disk.
+
+`update.sh` now prunes dangling images, placed carefully — **after** the
+post-cutover health check passes and `wordpress-old` has been removed,
+because the old image *is* the rollback path until that moment. Filtered to
+`dangling=true` only, so nothing still referenced by a container or pinned in
+`pinned.env` is touched; a blunt `image prune -a` would delete exactly what a
+rollback needs.
+
+**Disk usage was reported and never acted on.** `wp-hardening.sh disk` shows
+what is consuming the volume and what is reclaimable; `disk-check` runs twice
+daily and emails once above **80%** — not 95%, because a backup that runs out
+of space leaves you with neither the space nor the backup.
+
+**Five gaps recorded in `TODO.md` rather than left implicit:**
+
+- **Boot ordering says "started", not "ready".** `need mariadb-container`
+  waits for the service, and `podman start` returns before MariaDB accepts
+  connections. A live VM showed `mariadb Up 22 minutes (starting)`. Usually
+  self-healing, since WordPress reconnects per request, but the first requests
+  after a reboot fail.
+- **Nothing knows whether the site is reachable.** Every check runs *on* the
+  VM; a VM that is off cannot report that it is off. A heartbeat to an
+  external dead-man's-switch would close it — absence is precisely what an
+  on-box check cannot detect.
+- **No secret rotation.** The incident playbook says "rotate every credential"
+  and provides no means to. After a compromise that is manual, touches several
+  files that must stay in step, and is the shape of task that gets half-done.
+- **TLS expiry is unmonitored.** It terminates at the proxy, so the VM cannot
+  see the certificate at all; the first sign of a broken renewal is a visitor's
+  browser warning.
+- **Restore has not been proven end to end.** The self-test proves a *local*
+  backup restores. Nobody has taken an *encrypted, off-VM* copy, decrypted it
+  elsewhere, and restored it — and only that second claim is the one being
+  made to a client.
+
+---
+
+## Unreleased — Lynis profile, quarantine timeline capture, and triage of the rest
+
+**`lynis-custom.prf`** ships with documented exclusions. Lynis audits a
+general-purpose Linux server; this is a single-purpose Alpine VM running three
+containers, and several of its findings are structurally impossible here —
+separate partitions on a single-qcow2 guest, GRUB on a hypervisor-booted
+system, a host web server when Apache runs in a container.
+
+Every skip carries its reason, and the file states the rule for adding to it:
+a skip needs a justification that survives being read back in six months by
+someone who did not write it. "Noisy" is not one. If the honest reason is "we
+have not fixed it yet", it belongs in `TODO.md` as a known gap — a profile
+that hides real findings makes the score say the opposite of the truth.
+
+Time synchronisation is explicitly **not** skipped, with a note saying so,
+because TLS validation and log correlation both depend on the clock and
+somebody will eventually try to suppress it to tidy the report.
+
+`wp-hardening.sh lynis [run]` reads the score and warnings, and says plainly
+that the index compares against a general-purpose profile: a trend to watch,
+not a target to chase, since digest pinning, the internal database network and
+the signed manifest are all invisible to it.
+
+**Quarantine now captures the timeline first.** The file's mtime is the anchor
+for everything around it, and once it moves that anchor becomes the quarantine
+time instead. This is the step people skip under pressure and cannot recover
+afterwards.
+
+**`wp-malware-scan.sh purge [days]`** disposes of old quarantined samples,
+kept separate from quarantine deliberately: containment is a decision made in
+minutes, disposal is one made after the investigation, and merging them is how
+evidence leaves in the same motion as the threat. Timeline captures and the
+manifest are always kept — a few kilobytes, and the only record once the files
+are gone. Requires typing `PURGE`, and records the purge itself.
+
+**Four ideas triaged in `TODO.md` with reasons rather than silence:** AIDE
+(largely redundant against a pinned image and a signed manifest, and its
+database is re-baselined by every nightly `apk upgrade`); `lynis_extra=auditd`
+(installing a daemon nothing reads, to raise a number, is the argument against
+it); LUKS (protects only against a stolen disk image, and every variant either
+breaks unattended boot or keeps the key beside the data — Proxmox
+storage-level encryption is the honest answer, and off-VM backups are already
+age-encrypted where the data is genuinely exposed); and the header-comment
+refactor (accepted in part — move historical narrative out, keep decision
+rationale inline, because those comments are repeatedly what made a bug
+findable).
+
+---
+
+## Unreleased — CTI: timeline enrichment and opt-in ban enrichment
+
+Two additions requested after the base lookup landed, both shaped by the same
+40-per-month constraint.
+
+**`wp-forensics.sh timeline --enrich`** looks up the distinct public addresses
+appearing in a timeline window. Opt-in per run rather than automatic, because
+a window containing a dozen scanner IPs would otherwise spend a quarter of the
+monthly budget answering a question nobody asked. Private, loopback and
+container addresses are filtered out — they cost a lookup and CTI knows
+nothing about them.
+
+**`wp-hardening.sh cti-watch`** enriches new bans and emails them, off unless
+enabled at install. It considers **login brute-force bans only**, never
+generic `http-probing` decisions: an address that reached the login form and
+failed repeatedly is targeting this site, whereas a probing ban is noise
+hitting everyone and enriching those is exactly how a month's budget vanishes
+in a day.
+
+**The installer defaults ban enrichment to NO below 100 lookups/month**, says
+plainly that it is likely to exhaust the budget at the free tier, and points
+at the on-demand commands instead. Above that it defaults to yes. Recommending
+a feature the operator's quota cannot sustain would be worse than not offering
+it.
+
+**`cti-lookup`** added as a machine-readable form sharing the same cache and
+the same budget counter. A second code path with its own accounting is how a
+quota gets spent twice over, so the interactive command, the timeline
+enrichment and the ban watcher all go through one.
+
+The enriched ban notice ends by pointing at
+`wp-forensics.sh timeline | grep <ip>` — CTI says what an address does
+globally and nothing about what it did here, and those are different
+questions.
+
+The CTI key is written to `/etc/wp-install/cti.conf` at 0600 and deliberately
+**not** to `vars.sh`, which several tools source and which gets read during
+troubleshooting.
+
+---
+
+## Unreleased — CrowdSec CTI enrichment, built around a quota that is 37x smaller than assumed
+
+Requested from the task list, which cited the 2024 announcement: *"request
+information up to 50 times a day."* Checking the current documentation first
+found that figure is out of date. It is now:
+
+> **Community Plan Free Key — 40 / month.** Unused quota does not roll over.
+
+Roughly **1.3 lookups per day**, not 50. Building against the old number would
+have exhausted a month's budget in an afternoon on a site with ordinary
+scanner traffic — and the failure would have surfaced as a 429 at the moment
+an address actually mattered.
+
+So the quota is the design constraint rather than a footnote:
+
+- **Not wired into ban notifications**, which was the obvious first use and is
+  wrong at this quota. A WordPress site bans dozens of addresses a day and
+  nearly all are commodity scanners; spending the month confirming that leaves
+  nothing for the one that matters. It is an operator command for the address
+  in a malware timeline or a repeat offender that reached the login form.
+- **Cached 7 days.** CTI describes weeks of observed behaviour, so a
+  same-week repeat lookup buys nothing and costs a lookup.
+- **A local counter refuses at the budget** rather than letting the API
+  refuse. Discovering the quota is gone during an investigation is the failure
+  worth designing against; a cached answer is offered instead where one
+  exists.
+- `cti-key <key> <budget>` for paid tiers, so the guard scales rather than
+  being hardcoded to the free figure.
+
+Two behaviours worth calling out in the output. A **404 is informative**, not
+an error: the address has not been seen attacking anyone in CrowdSec's
+network — not innocence, but not a known mass-scanner either. And
+**`false_positives` is surfaced prominently**, because CTI flags crawlers,
+monitoring services and CDNs, and permanently banning Googlebot is a
+self-inflicted outage.
+
+The output ends by pointing at `wp-forensics.sh timeline`, because CTI
+describes what an address does globally and says nothing about what it did to
+this site — which is the question an operator is usually actually asking.
+
+Parsing verified against a realistic smoke response, including the
+`target_countries` percentage sort and empty-array handling for behaviours and
+attack details.
+
+`check-grep-count.py` caught a third instance of
+`$(grep -c ...) || echo 0` in this new code — the same idiom, written again by
+the person who wrote the check, minutes after running it.
+
+---
+
+## Unreleased — `wp-forensics.sh` and the MSP runbook
+
+Two items from the operator's own task list, and the ones described in most
+detail there.
+
+**`wp-forensics.sh`** assembles a timeline from sources already on the VM:
+malware findings, the quarantine manifest, file mtimes (uploads and mu-plugins
+first, because a change there is almost never legitimate), login-guard events,
+Apache denials, POST requests, CrowdSec decisions, and backup timestamps as
+the "last known clean" anchor.
+
+It answers what the scanner cannot — *when did this appear, and what was
+happening then*. The shape that makes it worth having:
+
+```
+21:54:31  POST           203.0.113.9 /wp-content/plugins/x/upload.php 200
+21:55:31  file-changed   wp-content/uploads/2026/08/shell.php
+21:55:51  scan-CRITICAL  Executable PHP inside uploads
+```
+
+Four subcommands: `timeline` (with `--around <file>` for ±1h about a specific
+finding, and `--json` for the governance mail), `since-backup`, `admins`, and
+`entry-class` — the uploads / plugin / admin / core decision tree written out.
+
+**Three deliberate limits, stated in the tool rather than the docs:**
+
+- **It is not a patient-zero report.** It places events side by side and
+  leaves the inference to the operator. Correlation inside a ten-minute window
+  is suggestive and routinely wrong, and a tool that asserted a conclusion
+  would be confidently wrong on precisely the occasions that matter.
+- **It reports where its evidence runs out.** Logs rotate hourly; an intrusion
+  older than retention leaves file and database timestamps but no HTTP
+  context. Presenting a short window as a complete one is how an investigation
+  reaches the wrong answer.
+- **It only reads.** Nothing modifies, deletes or quarantines. Deciding what
+  happened and acting on it are separate steps, and merging them is how
+  evidence gets destroyed by someone in a hurry.
+
+`wp-malware-scan.sh`'s CRITICAL remediation now opens with
+`wp-forensics.sh timeline --around <file>` — before quarantine, because the
+timeline is the thing quarantining makes harder to reconstruct.
+
+**`MSP-RUNBOOK.md`** covers RTO/RPO with the defaults this system actually
+delivers, severity levels mapped to the alerts that exist, change control,
+exception review and decommissioning.
+
+Two things it says that a template would not. The **compromise RTO is
+deliberately vague**, because restoring takes minutes while establishing when
+the compromise began — which decides which backup is clean — takes as long as
+it takes, and a tight RTO is what pressures someone into restoring a backup
+that still contains the backdoor. And the client-facing summary has a
+**"cannot" column**: no guarantee against compromise, nothing detects a
+backdoor written for this site, ~46% of plugin vulnerabilities have no patch
+at disclosure. A client who believes they bought immunity will be angry about
+the wrong thing.
+
+Decommissioning is ordered so the last step destroys the evidence for the
+earlier ones, and it keeps the stopped VM through a retention period, because
+"one more thing from the old site" arrives after shutdown rather than before.
+
+---
+
+## Unreleased — WEB_CIDR takes a list; admin can reach the VM directly
+
+Reported: restricting 80/443 to the proxy produced a **403 on wp-admin** while
+the public site kept working, from addresses explicitly on the allow list.
+
+The cause is the fail-closed rule added earlier. Through the proxy, Apache
+only knows the client because `X-Forwarded-For` told it. When that
+substitution is not happening, Apache sees the **proxy's** address — and the
+rule now explicitly denies it. Before, that same condition silently allowed
+everyone; now it denies everyone, including the operator. Failing closed is
+right, and this is what failing closed costs when the substitution is broken
+rather than merely absent.
+
+**The operator's proposed fix was the correct one**, and better than repairing
+the substitution: allow their own addresses to reach 80/443 **directly**,
+alongside the proxy. A direct request has no proxy in the path, so there is
+nothing to substitute and nothing to get wrong. Apache reads the real client
+address off the connection.
+
+External visitors are still funnelled through the proxy, because their
+addresses are not on the list — the property that was wanted is kept.
+
+- `WEB_CIDR` now accepts a comma-separated list, which nftables treats as an
+  anonymous set in both the input and forward rules.
+- The installer offers this automatically when the proxy lock is chosen,
+  pre-filled from the admin CIDR and extra admin IP already given, with the
+  reasoning stated: without it, every admin request depends on the proxy
+  passing a header correctly, and the failure mode is a 403 on a site that
+  otherwise looks completely healthy.
+- `wp-hardening.sh web-list | web-allow <ip> | web-deny <ip>` manages it live.
+  It edits **both** the input and forward rules — editing one leaves them
+  disagreeing, and the forward rule is the one that actually decides for a
+  published container port. It refuses to remove the proxy address, since
+  that takes the site offline for every visitor rather than just the
+  operator, and it validates with `nft -c` before applying, restoring the
+  backup if the edited ruleset does not parse.
+
+---
+
+## Unreleased — Security headers were set on the VM and never reached the internet
+
+An external scan of a live deployment, alongside a clean local report
+(12 pass, 0 fail), showed something the VM's own checks cannot see:
+
+```
+contentSecurityPolicy : False        server: openresty
+xFrameOptions         : False        strict-transport-security: max-age=63072000; preload
+xContentTypeOptions   : False
+referrerPolicy        : False
+permissionsPolicy     : False
+```
+
+WASP sets CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy and
+Permissions-Policy in Apache. **None of them reached the client.** The only
+security header present was HSTS, which the proxy adds itself.
+
+The VM was configured correctly throughout, and every local check passed —
+because they all confirm the header is *configured*, and none confirms it is
+*received*. Same shape as the WEB_CIDR and wp-admin failures: correct on the
+box, absent in effect.
+
+**Fixed by setting them at the edge as well**, in the generated nginx snippet
+and the README reference. `proxy_hide_header` before each `add_header`,
+because nginx appends rather than replaces and a duplicated header is
+resolved differently by different browsers. `always`, so they are sent on
+error responses too — a 403 page is still a page a browser renders.
+
+**CSP is deliberately not duplicated at the edge.** The VM tailors it per
+path: wp-admin needs `unsafe-eval` and the public site does not. One blanket
+policy would either break the admin interface or weaken the public site to
+match it. The README gives the command to verify it arrives instead.
+
+**HSTS was invalid.** The scan found `max-age=63072000; preload` **without**
+`includeSubDomains` — which is not merely weaker, it is rejected by the HSTS
+preload list. The `preload` directive was doing nothing at all. Corrected,
+with the warning that it should only be enabled once every subdomain serves
+HTTPS.
+
+**`wp-hardening.sh security-txt <contact>` added** (RFC 9116), flagged missing
+by the same scan. It writes the `Expires:` field the RFC requires and everyone
+forgets — a stale security.txt is worse than none, because it tells a
+researcher the contact is current when it may not be.
+
+And a trap avoided: the dotfile deny rule in the reference config
+(`location ~* /\.(git|env|svn|ht)`) would have blocked `/.well-known/`,
+taking security.txt and ACME challenges with it. A `^~` prefix match is now
+placed above it.
+
+Worth recording: **DNSSEC is enabled on the domain** (DNSKEY, DS and RRSIG all
+present). That materially strengthens the minisign key cross-check, which
+until now had to be described as corroboration because plain DNS is spoofable.
+
+---
+
 ## Unreleased — Branding, VM notes, and a heredoc that would have run 27 commands
 
 Logo added at `docs/wasp-logo.png` and used in the README header.

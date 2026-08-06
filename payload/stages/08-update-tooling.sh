@@ -33,6 +33,7 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/was
 [ -f "${PAYLOAD_DIR}/bin/wasp-testreport.sh" ] && \
   install -m 0755 "${PAYLOAD_DIR}/bin/wasp-testreport.sh" /usr/local/bin/wasp-testreport.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
 # Only install what the chosen method needs. rclone is ~50 MB, so it is not
 # pulled onto a VM that will never use it.
 # age is installed only when encryption was actually configured -- and if it

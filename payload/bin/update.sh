@@ -1129,6 +1129,21 @@ do_wp_update() {
     done
     if [ "$HEALTHY" = "1" ]; then
       podman stop wordpress-old 2>/dev/null; podman rm -f wordpress-old 2>/dev/null
+
+      # Reclaim the superseded image. Nothing did this before, so every update
+      # left ~700 MB behind: five updates is 3.5 GB on a 20 GB disk, and the
+      # symptom is a site that stops working months later for reasons that look
+      # nothing like an update.
+      #
+      # Runs only AFTER the new container has passed its post-cutover health
+      # check and wordpress-old is gone — the old image IS the rollback path
+      # until that point, and pruning earlier would remove the way back.
+      #
+      # --filter dangling=true only: images still referenced by a container, or
+      # pinned in pinned.env, are untouched. A blunt `image prune -a` would
+      # delete the very thing a rollback needs.
+      _freed=$(podman image prune -f --filter dangling=true 2>/dev/null | tail -1)
+      [ -n "$_freed" ] && echo "  Reclaimed: ${_freed}"
       # PRODUCTION SAFETY FIX (v7-6k): a leftover wordpress-old here isn't
       # fatal to THIS update (it already succeeded above), but it now
       # blocks the NEXT one — require_clean_container_state() refuses to

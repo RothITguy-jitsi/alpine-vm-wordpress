@@ -56,6 +56,34 @@ depend() {
 
 start() {
   ebegin "Starting WordPress"
+  # Wait for MariaDB to ACCEPT CONNECTIONS, not merely to have started.
+  #
+  # "need mariadb-container" makes OpenRC wait for that service, and podman
+  # start returns as soon as the container is running -- which is 20-60s
+  # before MariaDB is ready. A live VM was observed at
+  # "mariadb Up 22 minutes (starting)".
+  #
+  # WordPress reconnects per request, so this is usually self-healing and the
+  # visible symptom is "Error establishing a database connection" for the
+  # first minute after a reboot. That is a message which sends people looking
+  # for a database fault that does not exist, and it appears at exactly the
+  # moment someone is checking whether the reboot worked.
+  #
+  # 60s cap, then start anyway: if MariaDB is genuinely broken, a WordPress
+  # container that is up and erroring is more diagnosable than one that never
+  # started, and the health checks will report the real problem.
+  _wait=0
+  while [ \$_wait -lt 60 ]; do
+    if podman exec mariadb sh -c \
+         'mariadb-admin ping --silent -uroot -p"\$MARIADB_ROOT_PASSWORD" 2>/dev/null || \
+          mariadbd-admin ping --silent -uroot -p"\$MARIADB_ROOT_PASSWORD" 2>/dev/null' \
+         >/dev/null 2>&1; then
+      break
+    fi
+    sleep 3
+    _wait=\$(( _wait + 3 ))
+  done
+  [ \$_wait -ge 60 ] && einfo "MariaDB not ready after 60s — starting anyway; check: mariadb-health-check.sh"
   export PODMAN_IGNORE_CGROUPSV1_WARNING=1
   lsmod | grep -q '^overlay' || modprobe overlay 2>/dev/null || true
   lsmod | grep -q '^fuse'    || modprobe fuse    2>/dev/null || true
