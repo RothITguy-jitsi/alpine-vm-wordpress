@@ -438,8 +438,69 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
   echo "  sourced from MITRE remain (c) MITRE Corporation."
 }
 
+# ── Install a plugin from the WordPress.org directory ────────────────────────
+# WASP does not bundle a plugin store, and for good reason: fetching arbitrary
+# code at runtime is the thing this project spends most of its effort avoiding.
+# But a small, named, well-known set of plugins (2FA above all) is worth
+# supporting through one auditable path rather than having operators paste
+# `wp plugin install` by hand with no verification.
+#
+# This installs by slug from WordPress.org over the already-allowlisted
+# .wordpress.org egress path, records what it did, and REFUSES an arbitrary
+# URL or ZIP -- only directory slugs, so the source is always the signed
+# WordPress.org directory and never a random download. Activation is the
+# caller's choice, because a plugin that activates before its settings exist
+# can lock a login.
+do_install() {
+  _slug=""; _activate=0
+  for _a in "$@"; do
+    case "$_a" in
+      --activate) _activate=1 ;;
+      http*://*|*.zip)
+        echo "✗  Refusing a URL or ZIP. Only WordPress.org directory slugs are" >&2
+        echo "   allowed, so the source is always the signed directory:" >&2
+        echo "     wp-plugins.sh install two-factor" >&2
+        exit 1 ;;
+      -*) : ;;
+      *) [ -z "$_slug" ] && _slug="$_a" ;;
+    esac
+  done
+  [ -n "$_slug" ] || { echo "Usage: wp-plugins.sh install <slug> [--activate]" >&2; exit 1; }
+  # Slug hygiene: WordPress.org slugs are lowercase, digits and hyphens only.
+  case "$_slug" in
+    *[!a-z0-9-]*) echo "✗  '${_slug}' is not a valid plugin slug" >&2; exit 1 ;;
+  esac
+
+  echo "── Installing ${_slug} from WordPress.org ──"
+  if _wp plugin is-installed "$_slug" 2>/dev/null; then
+    echo "  ℹ  Already installed."
+  else
+    if _wp plugin install "$_slug" 2>&1 | sed 's/^/  /'; then
+      echo "  ✔  Installed ${_slug}"
+    else
+      echo "✗  Install failed. If egress filtering is on, confirm .wordpress.org" >&2
+      echo "   is reachable: wasp-egress status" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$_activate" = 1 ]; then
+    _wp plugin activate "$_slug" >/dev/null 2>&1 \
+      && echo "  ✔  Activated" \
+      || echo "  ⚠  Could not activate — activate from wp-admin once configured"
+  else
+    echo "  ℹ  Not activated. Activate when ready:  wp-plugins.sh ... (or in wp-admin)"
+  fi
+
+  # Record it so status/reporting can see what was added out of band.
+  mkdir -p /etc/wp-install 2>/dev/null || true
+  printf '%s\t%s\tactivate=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_slug" "$_activate" \
+    >> /etc/wp-install/installed-plugins.log 2>/dev/null || true
+}
+
 case "${1:-status}" in
   status) show_status ;;
+  install|add) shift; do_install "$@" ;;
   vulns|vuln|cve)
     case "${2:-}" in --nvd) vuln_scan 1 ;; *) vuln_scan 0 ;; esac ;;
   vuln-sources)

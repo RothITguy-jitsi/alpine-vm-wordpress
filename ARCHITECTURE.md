@@ -3,7 +3,8 @@
 Diagrams render natively on GitHub. Eight views, because one diagram covering all of this would be unreadable:
 what exists, what a request passes through, where trust comes from, what may
 leave, how it gets built, how it changes safely, how another site's content gets
-in, and what maintains it afterwards.
+in, and what maintains it afterwards. A ninth section walks the login path in
+prose, since that one is a sequence of decisions rather than a shape.
 
 ---
 
@@ -95,7 +96,11 @@ flowchart TD
     L2C --> PHP["PHP + WordPress bootstrap<br/>first real cost"]
     PHP --> L4{"Login Guard<br/>mu-plugin"}
     L4 -->|"address locked out"| D6["rejected<br/>before password check"]
-    L4 --> APP(["WordPress serves the request"])
+    L4 --> L5{"MFA enforcement<br/>mu-plugin (optional)"}
+    L5 -->|"admin, no 2nd factor,<br/>past grace"| D7["redirected to<br/>2FA setup — cannot<br/>use admin"]
+    L5 -->|"2nd factor required"| TF["Two Factor plugin<br/>TOTP / backup codes"]
+    TF --> APP(["WordPress serves the request"])
+    L5 --> APP
 
     L4 -.->|"logs every outcome"| CSX["CrowdSec"]
     CSX -.->|"5 failures in 20s window"| BAN["ban at nftables"]
@@ -106,6 +111,9 @@ flowchart TD
     style BAN fill:#1f2937,stroke:#ef4444,color:#fff
     style PHP fill:#374151,stroke:#f59e0b,color:#fff
     style APP fill:#1f2937,stroke:#22c55e,color:#fff
+    style D7 fill:#1f2937,stroke:#22c55e,color:#fff
+    style TF fill:#374151,stroke:#3b82f6,color:#fff
+    style L5 fill:#374151,stroke:#3b82f6,color:#fff
 ```
 
 ---
@@ -130,7 +138,7 @@ flowchart TD
     DNS -.->|"cross-check<br/>corroboration, not proof"| INST
 
     INST --> V1{"signature valid?"}
-    V1 -->|"no"| STOP1["REFUSE<br/>typing UNVERIFIED required to override;<br/>non-interactive aborts"]
+    V1 -->|"no"| STOP1["REFUSE<br/>production: no override at all;<br/>standard/lab: type UNVERIFIED,<br/>persists a durable marker"]
     V1 -->|"yes"| V2{"every file hash matches?"}
     V2 -->|"no"| STOP2["REFUSE<br/>manifest authentic, so a file was<br/>changed after signing"]
     V2 -->|"yes"| SRC["source lib/ and copy payload/"]
@@ -260,6 +268,7 @@ flowchart LR
 
     style J fill:#374151,stroke:#f59e0b,color:#fff
     style T fill:#1f2937,stroke:#22c55e,color:#fff
+    style MENU fill:#374151,stroke:#3b82f6,color:#fff
 ```
 
 ---
@@ -397,10 +406,13 @@ mounted volume that an image update never touches — which is where roughly
 graph LR
     T(["VM tooling"])
 
+    T --> MENU["wasp-menu.sh<br/>task-grouped front door<br/>to everything below"]
+
     T --> U["update.sh"]
     U --> U1["candidate + cutover + rollback"]
     U --> U2["Trivy CVE scan before applying"]
     U --> U3["digest re-pin + version discovery"]
+    U --> U4["squid — egress proxy on the<br/>same digest-pinned footing"]
 
     T --> V["validate-wordpress.sh"]
     V --> V1["~45 checks, each with a fix command"]
@@ -410,6 +422,7 @@ graph LR
     P --> P1["update visibility"]
     P --> P2["vulnerability scan<br/>Wordfence bulk feed, matched locally"]
     P --> P3["opt-in: Patchstack, WPScan, NVD"]
+    P --> P4["install &lt;slug&gt; — WordPress.org<br/>directory only, no URLs/ZIPs"]
 
     T --> M["wp-malware-scan.sh"]
     M --> M1["PHP in uploads — highest signal"]
@@ -454,6 +467,7 @@ graph LR
     O --> O1["scp / rsync / rclone"]
     O --> O2["age public-key encryption<br/>VM cannot decrypt what it sends"]
     O --> O3["remote size confirmed after upload"]
+    O --> O4["remote-restore-drill — pulls the<br/>real remote object, decrypts,<br/>restores, records RTO"]
 
     T --> S["wasp-selftest.sh"]
     S --> S1["restore proof — throwaway DB, real restore"]
@@ -467,6 +481,15 @@ graph LR
     N --> N2["deduplicated by content, 24h"]
     N --> N3["heartbeat — the only check that detects the VM being GONE"]
 
+    T --> RS["wp-rotate-secrets.sh"]
+    RS --> RS1["salts / db / smtp / all"]
+    RS --> RS2["verifies before commit, rolls back<br/>refuses the backup key"]
+
+    T --> CAP["wasp-capture.sh"]
+    CAP --> CAP1["records a session + diagnostics"]
+    CAP --> CAP2["redacts secrets BY VALUE"]
+    CAP --> CAP3["one local bundle — uploads nowhere"]
+
     style T fill:#1f2937,stroke:#22c55e,color:#fff
     style M1 fill:#1f2937,stroke:#22c55e,color:#fff
     style P2 fill:#1f2937,stroke:#22c55e,color:#fff
@@ -476,6 +499,44 @@ graph LR
     style IM3 fill:#1f2937,stroke:#22c55e,color:#fff
     style N3 fill:#1f2937,stroke:#22c55e,color:#fff
 ```
+
+## 9. The login path, layer by layer
+
+The login-flow diagram in section 2 shows five gates before WordPress serves an
+admin request. They are deliberately ordered cheapest-first, and each rests on a
+different assumption failing, so defeating one does not defeat the next:
+
+1. **nftables** drops a banned or out-of-CIDR source for zero cost — no PHP, no
+   database. Under a distributed attack this is what keeps the box up.
+2. **mod_remoteip** restores the real client IP, but only from the one proxy
+   address declared trusted, so every IP-based decision below it is made on a
+   value an attacker cannot forge per-request.
+3. **The 8G firewall, GeoIP and wp-admin IP restriction** (all in `.htaccess`,
+   still before PHP) reject scanners, disallowed countries, and admin access
+   from unapproved networks.
+4. **The login guard** (`02-wpvm-login-guard.php`) throttles password guessing
+   on the `authenticate` filter and removes WordPress's username-enumeration
+   leak, and feeds every outcome to CrowdSec for banning at layer 1.
+5. **MFA enforcement** (`03-wpvm-mfa-enforce.php`, optional) is the layer that
+   assumes the password itself was phished or reused. It requires administrators
+   to hold a *configured* second factor and gates every wp-admin request — not
+   just the login moment — so a stale session or a survived cookie cannot walk
+   past it. It closes the REST and application-password channels for unenrolled
+   admins too, so the second factor cannot be bypassed by switching protocols.
+
+The critical design property of layer 5 is that **enforcement is built around
+recovery**: a grace window before blocking, backup codes as a valid factor,
+email excluded for admins (it is the reset channel), and a console-only reset
+for total loss. Enforcement without a recovery path is not a security control,
+it is a way to lock yourself out of your own estate. The reset is safe to
+document precisely because it needs hypervisor access, which is strictly more
+than a WordPress login — see SUPPORT-RUNBOOK.md.
+
+The plugin machinery itself is the WordPress core team's Two Factor plugin,
+installed through `wp-plugins.sh` from the WordPress.org directory. The
+enforcement lives in a separate mu-plugin so the plugin can update freely and so
+the enforcement cannot be switched off from the admin panel an intruder would
+reach first.
 
 ---
 

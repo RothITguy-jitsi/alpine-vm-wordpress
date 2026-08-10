@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.05"
-WASP_VERSION_NOTE="login slug is the bare /<slug> (no -login suffix)"
+WASP_VERSION="2026.08.10"
+WASP_VERSION_NOTE="operator menu (wasp-menu) added as the front door to all tooling; admin MFA enforcement; egress proxy in the update path; external-eval MAJOR findings addressed"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

@@ -189,6 +189,34 @@ wp-malware-scan.sh full
 wp-forensics.sh admins                # accounts you did not create
 ```
 
+**Commission the VM before handing it over.** One guided pass runs the whole
+read-only validation suite and tells you everything that is wrong in one go:
+
+```sh
+wasp-menu        # → 7) Testing & validation → 1) Commission check
+```
+
+It does not stop at the first failure, and when everything passes it explicitly
+does *not* call the VM proven — it names the two things still owed: the offsite
+restore drill, and (if MFA is enforced) a deliberate admin lockout to confirm
+console recovery works. Those are the two failures that actually cost a client
+their site.
+
+**Enable admin MFA as part of onboarding.** If the VM was provisioned with MFA
+enforcement, confirm the Two Factor plugin is active and walk the client's
+administrators through enrolling — an authenticator app plus **printed backup
+codes**. If it was not provisioned with enforcement and the client wants it:
+
+```sh
+wp-plugins.sh install two-factor --activate
+# then set MFA_ENFORCE=1 in /etc/wp-install/vars.sh and re-run provisioning,
+# or leave it opt-in and just have admins enrol from their profile.
+```
+
+The backup codes are the difference between a lost phone being a five-minute
+console reset and a support escalation. Make the client save them somewhere
+that is not the site.
+
 ---
 
 ## Decommissioning

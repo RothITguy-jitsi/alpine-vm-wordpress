@@ -401,13 +401,16 @@ A `wp-notify.sh --heartbeat` writing to an external dead-man's-switch
 (healthchecks.io, Uptime Kuma) would close it cheaply: absence of a heartbeat
 is the signal, and absence is exactly what an on-box check cannot detect.
 
-### No secret rotation
+### No secret rotation — ADDRESSED (in software; not yet hardware-proven)
 
-Database, SMTP and MariaDB root passwords are generated at install and never
-rotated. There is no command to rotate them, and the incident playbook says
-"rotate every credential" without providing the means. After a compromise
-this is manual, error-prone, and touches several files that must stay in
-step — precisely the shape of task that gets half-done.
+`wp-rotate-secrets.sh` now rotates salts, the WordPress DB password, the
+MariaDB root password, and the SMTP relay password (individually or `all`),
+in an order that keeps the site up, verifying each change before committing and
+rolling back on failure. It refuses the age backup key, since rotating that
+would orphan every existing encrypted backup. The incident playbook and this
+list previously promised "rotate every credential" with no means; that gap is
+closed. As with everything here, it has run against mocks and the check suite,
+not yet a live VM — the first rotation should be on a throwaway with a snapshot.
 
 ### TLS certificates are entirely the proxy's problem
 
@@ -426,9 +429,42 @@ decommissioning; it does not cover the operator being unavailable.
 Worth a documented custody list — what exists, where it is held, and who else
 can reach it — rather than tooling.
 
-### Restore has never been proven end to end
+### Restore has never been proven end to end — MEANS NOW EXIST, run still owed
 
-`wasp-selftest.sh restore-test` proves the *local* backup restores into a
-throwaway database. Nobody has yet taken an *encrypted, off-VM* copy,
-decrypted it on a different machine, and restored it. Those are different
-claims, and only the second one is the promise being made to a client.
+`wasp-selftest.sh restore-test` proves the *local* backup restores. The gap was
+that nobody had taken an *encrypted, off-VM* copy, decrypted it elsewhere, and
+restored it — the claim actually promised to a client.
+`wasp-offsite-backup.sh remote-restore-drill` now does exactly that round-trip:
+it pulls the real remote object (never a local shortcut), decrypts with the
+recovery key, restores into a throwaway MariaDB, verifies it is non-empty, and
+records the RTO. The tool exists and is tested in software — but the *run* is
+the point, and it still has to happen on real hardware against the real R2
+bucket. Until it does, offsite recovery is proven-by-construction, not
+proven-in-fact. This remains the single highest-value action on the list.
+
+### Admin MFA — shipped, with two optional follow-ups
+
+Admin two-factor enforcement now ships (Two Factor plugin + the
+`03-wpvm-mfa-enforce.php` enforcement mu-plugin, prompted at install, 21-case
+logic test in the suite). Two things are deliberately left as future options
+rather than built now:
+
+- **WebAuthn / passkeys.** The Two Factor plugin supports hardware keys and
+  passkeys through its companion *Two-Factor Provider: WebAuthn* plugin. The
+  enforcement mu-plugin already treats any configured non-email provider as
+  sufficient, so a passkey would satisfy it with no code change — installing the
+  companion is all that is needed. Not installed by default to keep the surface
+  minimal; add it per-site when a client wants hardware keys.
+- **Runtime re-verification that the plugin is still active.** `validate-
+  wordpress.sh` checks at run time that enforcement is not on with the plugin
+  inactive (the lockout state). It does not continuously watch for the plugin
+  being deactivated later. In practice the mu-plugin fails safe (it shows an
+  admin notice and does not enforce if the plugin vanished), and mu-plugins
+  cannot be switched off from the admin UI, so this is low priority — noted for
+  completeness.
+
+As with the rest of the platform, MFA is validated by the check suite and by
+construction, not yet by a real-hardware run. The first live install should
+deliberately lock out a test admin and confirm the console recovery path brings
+them back — that is the test that matters most, because it is the one whose
+failure is a client locked out of their own site.

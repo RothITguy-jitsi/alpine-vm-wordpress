@@ -132,8 +132,14 @@ doas rc-service wp-container stop      # site offline, data intact
    `wasp-offsite-backup.sh restore --list`
 3. Patch the entry point **before** the site returns, or you will repeat this.
 4. Rotate everything: WordPress admins, database, SMTP relay, any API keys in
-   `wp_options`.
-5. `doas wasp-selftest.sh all` before declaring it done.
+   `wp_options`. Use `wp-rotate-secrets.sh all` for the infrastructure
+   credentials; change the admin passwords in WordPress itself.
+5. If MFA is enforced, force every admin to re-enrol a second factor — a
+   compromise may have captured or added one. Clear each admin's Two Factor
+   providers from the console (see SUPPORT-RUNBOOK.md, *An admin has lost their
+   second factor*) so they must set up a fresh factor on next login. If MFA was
+   NOT enforced, this is the moment to turn it on.
+6. `doas wasp-selftest.sh all` before declaring it done.
 
 > A restored site with the original vulnerability is a site that gets
 > compromised again, usually within days. Step 3 is not optional.

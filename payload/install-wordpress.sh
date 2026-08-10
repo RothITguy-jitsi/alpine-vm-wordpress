@@ -201,6 +201,11 @@ GEOIP_ENABLED="${GEOIP_ENABLED:-0}"
 USE_DIGEST_PINNING="${USE_DIGEST_PINNING:-1}"
 ADMIN_USER="${ADMIN_USER:-}"
 ADMIN_USER_CREATED="${ADMIN_USER_CREATED:-0}"
+# MFA keys default OFF when missing (older vars.sh, re-provision). Off is the
+# safe direction: a site that should enforce but doesn't is recoverable; a site
+# that unexpectedly enforces with no plugin installed would lock admins out.
+MFA_ENFORCE="${MFA_ENFORCE:-0}"
+MFA_GRACE_DAYS="${MFA_GRACE_DAYS:-7}"
 
 # ── PRUN: podman dispatch wrapper ─────────────────────────────────────────────
 # BUG FIX (v7-6d): PRUN used to have a rootless branch that rebuilt the whole

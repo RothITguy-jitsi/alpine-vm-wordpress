@@ -1165,6 +1165,49 @@ case "${_EP}" in
 esac
 unset _EP
 
+# ── Multi-factor authentication for admins ───────────────────────────────────
+echo ""
+echo -e "  ${BLD}Require two-factor authentication for administrators?${CL}"
+echo -e "  ${YW}A stolen or phished admin password is the most common way a${CL}"
+echo -e "  ${YW}WordPress site is taken over. A second factor means the password${CL}"
+echo -e "  ${YW}alone is not enough, even if the login page is reached.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  Installs the WordPress core team's Two Factor plugin (TOTP,${CL}"
+echo -e "  ${YW}  backup codes, and passkeys) and REQUIRES administrators to${CL}"
+echo -e "  ${YW}  enrol. Non-admins are unaffected. It composes with the custom${CL}"
+echo -e "  ${YW}  login slug, the brute-force guard and the IP restriction${CL}"
+echo -e "  ${YW}  already in place -- they are sequential stages, not conflicts.${CL}"
+echo -e "  ${YW}  It also closes the REST/app-password side doors so the second${CL}"
+echo -e "  ${YW}  factor cannot be walked around via an API.${CL}"
+echo ""
+echo -e "  ${RD}  LOCKOUT SAFETY. Enforcement is built around recovery: a new or${CL}"
+echo -e "  ${RD}  promoted admin gets a grace window to enrol (not blocked${CL}"
+echo -e "  ${RD}  instantly), backup codes count as a factor so any device works,${CL}"
+echo -e "  ${RD}  and 2FA for one user can be reset from the VM console if every${CL}"
+echo -e "  ${RD}  factor is lost. Tell your admins to PRINT THE BACKUP CODES.${CL}"
+_sec_note
+MFA_ENFORCE=0
+MFA_GRACE_DAYS=7
+read -rp "  Require 2FA for administrators? [Y/n] : " _MFA
+case "${_MFA}" in
+  n|N|no|NO)
+    msg_ok "MFA not enforced — admins may still opt in from their profile if the plugin is added later" ;;
+  *)
+    MFA_ENFORCE=1
+    read -rp "  Grace period for admins to enrol, in days [7] : " _MFG
+    case "${_MFG}" in
+      ''|*[!0-9]*) MFA_GRACE_DAYS=7 ;;
+      *) MFA_GRACE_DAYS="${_MFG}" ;;
+    esac
+    # A grace window measured in months is an open door with a timer; cap it.
+    [ "${MFA_GRACE_DAYS}" -gt 30 ] && { MFA_GRACE_DAYS=30; msg_warn "  Grace capped at 30 days."; }
+    msg_ok "2FA required for administrators (${MFA_GRACE_DAYS}-day grace to enrol)"
+    msg_warn "  After install: log in, go to your profile, enable an authenticator app,"
+    msg_warn "  and PRINT the backup codes. Without them a lost phone needs console recovery." ;;
+esac
+unset _MFA _MFG
+
 # ── CrowdSec threat intelligence (CTI) ───────────────────────────────────────
 echo ""
 echo -e "  ${BLD}CrowdSec threat intelligence (optional)${CL}"

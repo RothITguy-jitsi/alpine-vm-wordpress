@@ -54,6 +54,13 @@ changing. Your job here is to check three things and report clearly.
 - **Do not keep retrying a password.** After several failures the system will
   block your address for a while as a security measure, and you will lock
   yourself out longer. Stop after two or three and ask for a reset.
+- **A page asking you to set up two-factor authentication** is expected for
+  administrator accounts. Follow it: install an authenticator app (Google
+  Authenticator, 1Password, Authy, Microsoft Authenticator all work), scan the
+  code, and — this part matters — **print or save the backup codes it gives
+  you.** Those codes are how you get back in from any device if you lose your
+  phone. If you are blocked because a grace period ended before you set it up,
+  ask an engineer; they can help you enrol.
 
 ### You received an alert email from the system
 
@@ -288,6 +295,65 @@ wasp-verify-integrity.sh                  # scripts vs the signed manifest
 
 If this fails, treat the VM as compromised at the system level, not just the
 application — and rebuild rather than clean.
+
+### An admin has lost their second factor and is locked out
+
+This is the recovery path that makes it safe to *require* 2FA at all. It needs
+the VM console, which is deliberately the one entry point that keeps working
+when the network login does not — so this is a Tier 2 action by design, not
+something reachable from outside.
+
+First, confirm it is genuinely a lost-factor lockout and not an IP or CrowdSec
+block (walk the 403 tree and *Un-banning* first — a 2FA reset will not fix
+those). The symptom for this section is specific: the admin passes the password,
+then cannot complete the second step and has no backup codes.
+
+Reset 2FA for that one user from the console. This does not touch their
+password; it removes their enrolled second factors so they can log in with the
+password alone and immediately re-enrol:
+
+```sh
+# On the VM console (qm terminal <VMID>), as root:
+wp-plugins.sh doctor    # confirm wp-cli can reach the site first
+
+# Remove the user's two-factor providers. Replace <login> with their username.
+podman exec --user 33 wordpress \
+  wp --path=/var/www/html user meta delete <login> _two_factor_enabled_providers
+podman exec --user 33 wordpress \
+  wp --path=/var/www/html user meta delete <login> _two_factor_provider
+
+# Also clear the WASP grace anchor so they get a fresh window to re-enrol,
+# rather than being blocked again on their next login.
+podman exec --user 33 wordpress \
+  wp --path=/var/www/html user meta delete <login> wpvm_mfa_grace_start
+
+# And clear Two Factor's own login rate-limit counters, so the account is not
+# still throttled from the failed 2FA attempts that led to the lockout.
+podman exec --user 33 wordpress \
+  wp --path=/var/www/html user meta delete <login> _two_factor_last_login_failure
+podman exec --user 33 wordpress \
+  wp --path=/var/www/html user meta delete <login> _two_factor_failed_login_attempts
+```
+
+> The two `_two_factor_*` provider keys are the plugin's own storage
+> (`_two_factor_enabled_providers` and `_two_factor_provider`) — verified against
+> the plugin source, because a wrong key here would silently do nothing and
+> leave the admin still locked out. If a future plugin version renames them,
+> `wp user meta list <login>` shows the current keys.
+
+Then tell the admin to log in (password only now works), go straight to their
+profile, re-enable an authenticator, and **print the backup codes this time.**
+Watch them do it if you can — the whole reason they were locked out is that this
+step was skipped once already.
+
+If `wp-cli` itself cannot reach the site, the site has a bigger problem than
+2FA; fix that first (*A container starts then dies*, *`--check` stays CRITICAL*).
+
+> Why this is safe to document openly: it requires the VM console, which is
+> reachable only with hypervisor access. An attacker who already has that has
+> far more than a WordPress login. What this procedure must never become is a
+> network-reachable reset — that would turn the second factor back into a
+> single factor.
 
 ### The things that need you specifically
 

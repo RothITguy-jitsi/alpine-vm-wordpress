@@ -56,6 +56,8 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Egress control (Squid)](#egress-control-squid)
 - [Checking the whole VM](#checking-the-whole-vm-at-once)
 - [Alerts](#alerts)
+- [The operator menu](#the-operator-menu)
+- [Capturing a session for review](#capturing-a-session-for-review)
 - [Testing it from the outside](#testing-it-from-the-outside)
 - [Rotating credentials](#rotating-credentials)
 - [Monitoring from outside](#monitoring-from-outside)
@@ -74,6 +76,7 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Quick Start](#quick-start)
   - [Verifying what you run](#verifying-what-you-run)
 - [Login Protection](#login-protection)
+  - [Two-factor authentication for administrators](#two-factor-authentication-for-administrators)
 - [Plugin Vulnerability Scanning](#plugin-vulnerability-scanning)
 - [Verifying What You Run](#verifying-what-you-run-minisign)
 - [Vulnerability Exceptions](#vulnerability-exceptions)
@@ -82,7 +85,7 @@ It's also honest about where it stops. Every control here states its own limits 
   - [Creating the encryption key](#creating-the-encryption-key)
 - [Self-Test](#self-test-proving-the-guarantees-hold)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
-- [Outbound Firewall (optional)](#outbound-firewall-optional)
+- [Outbound Firewall (optional, host-service layer)](#outbound-firewall-optional-host-service-layer)
 - [Outbound Email](#outbound-email)
 - [WordPress Site Address](#wordpress-site-address)
 - [Interactive Setup Walkthrough](#interactive-setup-walkthrough)
@@ -381,6 +384,68 @@ wp-notify.sh --test
 Identical alerts are deduplicated over 24 hours so a recurring fault doesn't become noise, with two exceptions that always send: backup failure and self-test failure. Both are silent-until-it-matters problems, and suppressing a repeat is how they stay unnoticed for months.
 
 `wp-notify.sh` sends governance notices to a separate address, warned about at install if it matches the admin address — a record only the decision-maker receives is a diary, not oversight.
+
+## The operator menu
+
+Everything below is a command-line tool, and there are around twenty of them. You do not have to remember which flag does what — `wasp-menu.sh` is a task-grouped menu over all of them:
+
+```sh
+wasp-menu.sh          # or just: wasp-menu
+```
+
+It groups the tooling by what you actually came to do — Health, Backup, Security, Updates, Import, Diagnostics, and **Testing & validation** — and every action **shows the exact command before it runs**, so it doubles as a cheat-sheet: a new tech learns the commands by watching, and an engineer can confirm nothing surprising happens and skip the menu next time. Destructive actions (rotate, update, restore, purge) are marked `[!]` and require typing `yes`.
+
+It is deliberately plain: pure POSIX shell, no extra packages, and it works in the `qm terminal` console (where you cannot paste) exactly as it does over SSH. It is not a web interface — that would mean a listening service and a new attack surface, which is the opposite of what this VM is for. It launches the tools; it does not replace them, so anything the menu does you can still do by typing the command yourself.
+
+### Commissioning a VM: one guided pass
+
+The Testing section exists because validating a deployment is its own task that
+otherwise spans six other menus. Its first entry runs the whole read-only suite
+in the order that makes sense — does it work, is it hardened, can it recover:
+
+```
+wasp-menu → 7) Testing & validation → 1) Commission check
+```
+
+It runs health, full validation, the self-tests, egress enforcement, tooling
+integrity, outstanding updates, the mail path and wp-cli reachability, then
+prints a `PASS / FAIL / SKIP` tally. **It does not stop at the first failure** —
+a commissioning pass should tell you everything that is wrong in one go, rather
+than making you fix one thing and re-run to find the next. Nothing in it changes
+the site.
+
+When everything passes it deliberately does *not* declare the VM proven. It
+tells you what is still owed:
+
+- **The offsite restore drill** (option 13) — it needs your recovery key and
+  pulls a real encrypted object, so it stays a separate, deliberate step. Until
+  it has run, offsite recovery is an assumption rather than evidence.
+- **The MFA lockout test**, if enforcement is on — deliberately lock out a test
+  admin and confirm the console recovery brings them back.
+
+Those two are the tests whose failure actually costs a client their site, which
+is why they are called out rather than buried.
+
+## Capturing a session for review
+
+When something needs a second pair of eyes — a failed install, a control misbehaving, "did this do what I think" — the most useful thing to hand over is exactly what you ran and exactly what the machine saw. `wasp-capture.sh` records that and bundles it into one file you can attach in a browser.
+
+```sh
+wasp-capture.sh start debugging-403     # opens a recorded shell; do your work
+exit                                     # leave the recorded shell
+wasp-capture.sh stop                     # gathers diagnostics, bundles, redacts
+
+wasp-capture.sh report                   # no session — just the VM's current state
+wasp-capture.sh oneshot -- wasp-egress test   # record a single command
+```
+
+The bundle contains an environment snapshot, the full `wasp-testreport.sh` diagnostic, your session transcript, and recent firewall/egress/CrowdSec log lines — each **redacted by value** for every secret the installer knows about (passwords, API keys, the age recipient, any private key you pasted), replaced with `«REDACTED:NAME»` markers.
+
+It wraps `script` (already on the VM — no new dependency), not asciinema, and **uploads nowhere**: the bundle is a local file you decide where to send. That matters because a raw transcript on a WASP VM contains client IPs and hostnames, which under GDPR is personal data the moment it leaves the machine — public recording services are the wrong place for it. Redaction is automatic, but skim the bundle before sending: you are the last check.
+
+```sh
+scp admin@your-vm:/var/tmp/wasp-capture-*.tar.gz .
+```
 
 ## Testing it from the outside
 
@@ -751,6 +816,27 @@ doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4
 **`X-Forwarded-For` is deliberately not read in PHP.** `REMOTE_ADDR` is used, because mod_remoteip has already corrected it and only for the one proxy IP you declared trusted. Reading the header directly would accept it from anyone — letting an attacker send a fresh forged address per attempt and never accumulate a count. That's the most common way application-layer login limiters get defeated.
 
 **On XML-RPC:** `xmlrpc.php`'s `system.multicall` allows hundreds of password attempts in a single request, which is how brute-force protection is usually bypassed. This VM blocks it in Apache already — check with `wp-hardening.sh status`.
+
+### Two-factor authentication for administrators
+
+The slug hides the login and the guard slows down guessing, but both still rest on a password. A phished or reused admin password defeats them — which is how most WordPress takeovers actually happen. Optionally (prompted at install), administrator accounts are **required** to have a second factor.
+
+This uses the **Two Factor plugin maintained by the WordPress core contributors** — TOTP, backup codes, and passkeys via its WebAuthn companion — for the actual machinery, and a small WASP mu-plugin (`03-wpvm-mfa-enforce.php`) for the enforcement the plugin deliberately leaves out. Administrators (anyone with `manage_options`) must enrol; everyone else is untouched.
+
+It is built so that **enabling it cannot lock anyone out**, because enforcement without a recovery path is how a lost phone becomes a rebuild:
+
+- **A grace window.** A new or newly-promoted admin is steered to enrol with an admin notice counting down the days, not blocked on their first login. The window is set at install (default 7 days, capped at 30) and held as a constant so a compromised session cannot widen it.
+- **Backup codes count as a factor.** An admin with TOTP plus printed backup codes can get back in from any device — the property that makes requiring 2FA safe. Email-as-second-factor is deliberately *not* sufficient for admins, because the email inbox is usually also the password-reset channel, which would collapse both factors into one.
+- **A console recovery path.** If every factor is lost, 2FA for one user is reset from the VM console with wp-cli (documented in the support runbook's lockout section). It needs hypervisor access — an attacker with that already has more than a login — so it is a safe override, never a network-reachable one.
+
+**It closes the side doors, not just the front one.** A second factor on the browser login is meaningless if an admin can authenticate through an API that skips it. XML-RPC is already blocked; the mu-plugin additionally refuses REST-API and application-password authentication for an unenrolled admin past grace, so the enforcement can't be walked around a different channel.
+
+**How it composes with the rest of this section:** the slug decides *where* the login lives, the guard throttles the *password* attempt on the `authenticate` filter, and 2FA runs *after* a correct password on the login-completion flow. They are sequential stages of one login, not competitors for one hook — verified with a logic-test harness (`test/test-mfa-enforcement.php`, 21 cases) that runs in the check suite, because this exact kind of interaction is where the subtle lockout bugs live.
+
+```sh
+wp-plugins.sh install two-factor --activate   # what the installer runs for you
+# then, as each admin: log in → profile → enable authenticator → PRINT backup codes
+```
 
 ---
 
@@ -1402,9 +1488,9 @@ ClamAV is a general-purpose, signature-driven file scanner built largely for ema
 
 Where it genuinely earns its place: sites that accept **file uploads from visitors**, where someone may post a real malware binary rather than a PHP shell; **non-PHP payloads** such as dropped ELF binaries, which the YARA rules here don't target; and **compliance regimes that simply require an AV product**.
 
-Answer yes and it's installed with signatures fetched and a weekly scan (Sunday 04:15). Answer no and the structural, core-integrity, YARA and database layers still run daily. Add it later with `apk add clamav clamav-libunrar && freshclam`.
+Memory is a secondary consideration rather than the main one, but it is real: the signature database alone is close to a gigabyte resident, which is a poor trade on a 4 GB VM already running WordPress, MariaDB and CrowdSec.
 
-*(Superseded note:)*  Its signature database alone is close to a gigabyte resident, which is a poor trade on a 4 GB VM already running WordPress, MariaDB and CrowdSec — and its PHP-webshell coverage is weaker than the YARA layer. Add it if you want it: `apk add clamav clamav-libunrar && freshclam`.
+Answer yes and it's installed with signatures fetched and a weekly scan (Sunday 04:15). Answer no and the structural, core-integrity, YARA and database layers still run daily. Add it later with `apk add clamav clamav-libunrar && freshclam`.
 
 **On Linux Malware Detect (maldet/LMD):** deliberately not included. It installs by piping an unsigned shell script from a third-party host — the same supply-chain pattern this project refuses for the Trivy installer — and its signatures overlap ClamAV heavily. Real trust cost, marginal added coverage.
 

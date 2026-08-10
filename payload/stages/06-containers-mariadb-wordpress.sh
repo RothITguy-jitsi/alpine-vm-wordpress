@@ -323,6 +323,37 @@ else
   warn "SMTP transport mu-plugin FAILED to install — wp_mail() will fail silently"
 fi
 
+# MFA enforcement. Unconditional install (the mu-plugin is a no-op when
+# WPVM_MFA_ENFORCE is 0), same block as the others for the same reason.
+# Enforcement and grace are substituted from the install-time answers; the
+# mu-plugin holds them as constants so a compromised admin session cannot
+# widen the grace window to defeat the control.
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/03-wpvm-mfa-enforce.php" "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php"
+sed -i \
+  -e "s|WPVM_MFA_ENFORCE_PLACEHOLDER|${MFA_ENFORCE:-0}|g" \
+  -e "s|WPVM_MFA_GRACE_PLACEHOLDER|${MFA_GRACE_DAYS:-7}|g" \
+  "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php"
+chown 33:33 "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php" 2>/dev/null || true
+# A leftover placeholder would be a PHP parse error -> site-wide fatal, and an
+# mu-plugin cannot be disabled from wp-admin, so this is checked now while a
+# console still exists to fix it.
+if grep -q "WPVM_MFA_.*_PLACEHOLDER" "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php" 2>/dev/null; then
+  warn "MFA mu-plugin still has a placeholder — enforcement will fatal. Fix by hand."
+elif PRUN exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php >/dev/null 2>&1; then
+  if [ "${MFA_ENFORCE:-0}" = "1" ]; then
+    ok "MFA enforcement mu-plugin installed (required for admins, ${MFA_GRACE_DAYS:-7}-day grace)"
+  else
+    ok "MFA enforcement mu-plugin installed (present, enforcement OFF)"
+  fi
+else
+  warn "MFA mu-plugin failed php -l — NOT enforcing. Check: podman logs wordpress"
+fi
+
+# NOTE: the Two Factor PLUGIN (the TOTP/backup-code machinery this mu-plugin
+# enforces) is installed in stage 08, after wp-plugins.sh exists to install it.
+# The mu-plugin above is a safe no-op until the plugin is present -- it detects
+# absence and shows an admin notice rather than locking anyone out.
+
 # The mu-plugin needs to know the proxy's address to notice when it has
 # become the apparent client -- the symptom of mod_remoteip not applying.
 # Written next to the SMTP config because that directory is already mounted

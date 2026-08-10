@@ -486,6 +486,40 @@ else
   info "No custom login slug configured (default /wp-login.php in use)"
 fi
 
+# --- MFA enforcement (mu-plugin + Two Factor plugin) ---
+# Three things can be wrong and each matters: the mu-plugin could have a syntax
+# error (site-wide fatal), enforcement could be ON while the Two Factor plugin
+# is absent (every admin blocked with no way to enrol -> lockout), or it could
+# be present and healthy. Distinguish them.
+MU_MFA=/home/wpuser/wp/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php
+if [ -f "$MU_MFA" ]; then
+  if grep -q "WPVM_MFA_.*_PLACEHOLDER" "$MU_MFA" 2>/dev/null; then
+    fail "MFA mu-plugin has an unsubstituted placeholder" \
+         "It will PHP-fatal and take the site down." \
+         "Re-run provisioning or set the constants by hand in ${MU_MFA}"
+  elif ! podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php >/dev/null 2>&1; then
+    fail "MFA mu-plugin has a PHP syntax error" \
+         "An mu-plugin fatal takes the whole site down and cannot be disabled from the admin UI." \
+         "rm -f ${MU_MFA} from the console to restore the site, then re-provision"
+  else
+    # Is enforcement actually turned on in the installed copy?
+    if grep -q "define( 'WPVM_MFA_ENFORCE', 1 )" "$MU_MFA" 2>/dev/null; then
+      # Enforcement ON -> the Two Factor plugin MUST be active or admins lock out.
+      if podman exec --user 33 wordpress wp --path=/var/www/html plugin is-active two-factor >/dev/null 2>&1; then
+        pass "MFA enforced for admins and the Two Factor plugin is active"
+      else
+        fail "MFA is ENFORCED but the Two Factor plugin is not active" \
+             "Admins past their grace window cannot enrol and will be locked out." \
+             "wp-plugins.sh install two-factor --activate"
+      fi
+    else
+      pass "MFA mu-plugin installed and parses (enforcement is off)"
+    fi
+  fi
+else
+  info "MFA enforcement mu-plugin not installed"
+fi
+
 # --- wp-admin IP restriction ---
 # v7-16: check the Apache config as the SOURCE OF TRUTH, not the ADMIN_CIDR
 # variable. The old logic only looked for 'Require ip' when ${ADMIN_CIDR} was

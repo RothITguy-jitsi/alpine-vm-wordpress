@@ -2,6 +2,25 @@
 
 `test-wordpress-vm.sh` runs on the **Proxmox VE host** and asserts, end-to-end, that a provisioned WordPress VM actually works — the runtime-only class of failure that `dash -n` and `bash -n` cannot see. Four of the v7-16 round's seven bugs were exactly that: they passed every syntax check and only surfaced on real hardware. This harness runs the thing and checks the results.
 
+## Two test suites, different jobs
+
+This repository has two independent test entry points, and it is worth knowing
+which does what:
+
+- **`test/run-all-checks.sh`** — static and unit checks that need no VM. It runs
+  `bash -n`/`sh -n` across every script, the auto-discovered `check-*.py` suite
+  (each of which self-tests against its own fixture — including
+  `check-menu-entries.py`, which verifies every `wasp-menu` entry maps to a tool
+  that exists and a subcommand that tool actually accepts), and — when PHP is present
+  — `php -l` on every mu-plugin plus `test/test-mfa-enforcement.php`, the
+  21-case logic harness for the MFA enforcement decision (scope, enrollment,
+  grace maths, the enrollment-path gate). Run this on every change; it is fast
+  and catches the class of bug that has repeatedly bitten this project.
+- **`test/test-wordpress-vm.sh`** (documented below) — the integration harness
+  that runs against a real provisioned VM and checks live behaviour.
+
+The rest of this document describes the integration harness.
+
 ## Requirements
 
 - Runs on the Proxmox VE host (needs `qm`).

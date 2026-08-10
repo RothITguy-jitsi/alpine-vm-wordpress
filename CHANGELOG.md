@@ -6,6 +6,351 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — Proofreading pass: two real errors, and a check so links cannot rot
+
+A spelling and grammar pass across every document, done with tooling rather than
+by eye — codespell for misspellings, aspell against a project dictionary built
+from the codebase, plus scripted checks for doubled words, a/an agreement,
+broken anchors and stale editorial markers.
+
+**Spelling and grammar came back essentially clean.** Codespell's only hits were
+false positives: `FO` (a Mermaid node ID for wp-forensics), `unparseable` (a
+valid alternative spelling), and `pre-empts` (standard hyphenated form). The
+aspell pass surfaced ~160 unknown words in the README, all of which proved to be
+legitimate technical vocabulary — allowlist, cutover, docroot, rootful, skopeo,
+netavark, xmlrpc and the like. `an nftables bouncer` and `apk add clamav
+clamav-libunrar` were both flagged and both correct.
+
+**Two real errors, neither of them spelling:**
+
+- **ARCHITECTURE.md claimed "Eight views" and enumerated eight** — but a ninth
+  section (the login path, added with the MFA work) had since been written. The
+  intro now describes the eight diagrams accurately and notes that the ninth
+  section is prose, because that layer is a sequence of decisions rather than a
+  shape.
+- **A broken table-of-contents link in README.md.** Renaming "Outbound Firewall
+  (optional)" to "...(optional, host-service layer)" while resolving the egress
+  documentation contradiction left the TOC entry pointing at the old anchor. The
+  cross-reference added at the same time was correct; the TOC was not.
+
+**An editorial wart removed.** A paragraph in the README was still labelled
+"*(Superseded note:)*" and duplicated both the surrounding argument and its
+install command. The one genuinely additional point (the signature database is
+close to a gigabyte resident, which matters on a 4 GB VM) is folded into the
+prose; the redundancy is gone.
+
+**New check: `check-doc-links.py`.** A renamed heading silently breaks every
+link to it — the markdown stays valid, the page still renders, and the failure
+is discovered by a reader clicking a table-of-contents entry. Getting the anchor
+rule right was the whole difficulty: a naive implementation false-positives on
+every heading containing `&` or an em-dash, which would make the check noise and
+get it ignored. It implements GitHub's actual rule (strip the character, keep
+its surrounding spaces, spaces become hyphens — so "Malware & Integrity
+Scanning" is `malware--integrity-scanning` with a double hyphen), and its
+self-test asserts both that a real break is caught and that the tricky cases are
+not flagged. Verified retroactively: re-introducing the TOC bug makes the check
+fail, and removing it makes it pass. 77 internal links across 11 files currently
+resolve.
+
+---
+
+## Unreleased — Menu review: a Testing section, and a check so entries cannot rot
+
+A review pass over the menu, plus the improvement that matters most for the
+stage this project is at: making validation easy to run.
+
+**New: Testing & validation section, with a guided commission check.** Testing
+capability was scattered across six menu sections, but validating a deployment
+is its own task. The new section gathers all of it — health, full validation,
+the self-tests, egress enforcement, tooling integrity, CVE scan, mail and wp-cli
+reachability, and the offsite restore drill — and its first entry runs the
+read-only ones as one sequence.
+
+The commission check has three deliberate properties. It **does not stop at the
+first failure**: a commissioning pass should tell you everything that is wrong
+in one go, not make you fix-and-rerun to discover the next problem. It shows the
+failing tool's last output lines inline, so a failure is actionable without
+hunting. And when everything passes it **refuses to declare the VM proven** —
+it names what is still owed: the offsite restore drill (which needs the recovery
+key and so stays deliberate) and, if MFA is enforced, a deliberate admin lockout
+to confirm console recovery. Those two are the failures that actually cost a
+client their site, so they are called out rather than buried.
+
+**New check: `check-menu-entries.py`.** A menu entry is a promise. One pointing
+at a tool that does not exist, or a subcommand a tool does not accept, is
+invisible to `sh -n` (syntax is fine) and to a code read (the string looks
+plausible) — it surfaces when an operator picks it mid-incident. The check parses
+every `run()` call site and verifies the tool exists and its dispatch really
+accepts the subcommand, handling the `a|b|c)` alternation forms real dispatchers
+use. All 55 entries currently verify clean.
+
+**Its own self-test caught a bug in the checker before the checker was trusted.**
+The first matcher only recognised case arms whose line ended in `)`, so a normal
+`status) echo hi ;;` arm was missed and a valid entry was reported broken. The
+fixture caught it immediately. This is the discipline the project keeps
+returning to: a check that cannot fail is not a check, and writing the failing
+fixture first is what makes the passing result mean something.
+
+Verified by driving the menu with scripted keystrokes through a pseudo-TTY:
+the commission check runs all steps, correctly reports a failing tool with its
+exit code and output, continues past it, skips missing tools, and produces an
+accurate PASS/FAIL/SKIP tally in both the has-failures and all-clean cases.
+Version and version-note confirmed current (2026.08.10) with no stale strings
+anywhere in code or docs.
+
+---
+
+## Unreleased — An operator menu: one front door to the tooling
+
+`wasp-menu.sh` — a task-grouped menu over the ~20 operator tools, so no one has
+to remember which flag does what. The design question was what KIND of menu
+fits, and the environment answered it: pure POSIX shell, zero new packages.
+
+Why not the obvious alternatives. A web GUI would mean a listening service, a
+port, auth and TLS — a new attack surface on a VM whose entire purpose is
+minimal surface. A whiptail/dialog TUI would add a package to a hardened box for
+cosmetics. Neither is worth it. A plain sh menu, by contrast, runs in the
+`qm terminal` console where root actually operates and CANNOT paste, works
+identically over SSH, needs nothing installed, and degrades to any terminal.
+
+What it does. Groups the tools by the task an operator has in mind — Health,
+Backup, Security, Updates, Import, Diagnostics — with each entry showing its
+real command. Three deliberate behaviours, chosen for a two-audience tool
+(on-shift techs and engineers) without splitting into two programs:
+
+- **Every action prints the exact command before it runs.** The menu doubles as
+  a cheat-sheet: a tech learns the command by watching it, an engineer confirms
+  nothing surprising happens and can skip the menu next time. Nothing here does
+  anything you could not do by typing the command yourself.
+- **Arguments are prompted inside the menu** (mail test address, import file
+  path, new SMTP password), so the tech does not have to remember argument
+  syntax, and a blank entry cancels cleanly rather than running a tool with a
+  missing operand.
+- **Destructive actions are marked `[!]` and require typing `yes`** — rotate,
+  update, restore, purge. Everything else runs on a keystroke.
+
+It launches the tools, it does not reimplement them; if a tool changes, its menu
+entry keeps working because it just calls the tool. A top-of-menu health pulse
+(`validate-wordpress.sh --check`) shows state before you act, and an `/etc/motd`
+line points new operators at it on login. Installed in stage 08 alongside the
+other tooling.
+
+**Testing found and fixed two real bugs before this shipped.** First, the banner
+read the build version with `tr -d` and nested shell quotes — the exact
+quote-nesting anti-pattern the project's own `check-embedded-quotes.py` exists
+for — which degraded into an invalid `tr` character range (`range-endpoints of
+'p-i' are in reverse collating sequence order`) and blanked the version;
+replaced with sed. Second, `run()` invoked tools by bare name, relying on $BIN
+being in PATH, which it often is not in a bare console; it now resolves each
+tool under $BIN explicitly. Both were caught by actually driving the menu with
+scripted keystrokes through a pseudo-TTY and checking that the confirm-yes path
+runs, confirm-no skips, non-destructive runs directly, prompted arguments pass
+through, and the version displays — not by reading the code and assuming.
+
+---
+
+## Unreleased — Documentation brought current across the whole set
+
+A pass over every document to close the gap between what the code now does and
+what the docs described. Version bumped to 2026.08.10 with a note reflecting the
+real headline (admin MFA), and the recent feature work threaded through the docs
+that should mention it:
+
+- **ARCHITECTURE.md** — MFA added to the login-path diagram as the fifth gate
+  (after the login guard, gating every wp-admin request); the Day-2 tooling
+  diagram updated with the tools that were missing from it (`wp-rotate-secrets`,
+  `wasp-capture`, `remote-restore-drill`, `wp-plugins install`, `update.sh
+  squid`); the release-trust-chain node updated to show production refusing an
+  unverified install outright; and a new section 9 walking the five login layers
+  in prose, with the emphasis that MFA enforcement is built around recovery.
+- **INCIDENT-PLAYBOOK.md** — the post-compromise rotation step now includes
+  forcing 2FA re-enrolment (a compromise may have captured or added a factor)
+  and points at `wp-rotate-secrets.sh` for the infrastructure credentials.
+- **MSP-RUNBOOK.md** — onboarding now includes enabling admin MFA and walking
+  the client through enrolment plus printed backup codes.
+- **SUPPORT-RUNBOOK.md** — already carried the console recovery procedure from
+  the MFA work; unchanged this pass beyond that.
+- **TODO.md** — two long-standing open items marked addressed: "no secret
+  rotation" (now `wp-rotate-secrets.sh`) and "restore never proven end to end"
+  (now `remote-restore-drill` — with the honest note that the tool exists but the
+  real-hardware *run* is still owed and remains the highest-value action). Added
+  an MFA follow-ups subsection (WebAuthn companion, runtime re-verification) as
+  optional future work.
+- **test/README.md** — added a section distinguishing the two test suites, since
+  it previously documented only the integration harness and not
+  `run-all-checks.sh` (which now carries the 21-case MFA logic test).
+
+Verified across the set: doc-coverage clean at 17 tools, all 9 mermaid diagrams
+balanced, all code fences balanced, and a stale-fact sweep confirms no document
+still claims rotation is absent, restore is unproven-by-any-means, or references
+the old version. The standing caveat is unchanged and stated in the docs that
+matter: the platform is validated by the check suite and by construction, not
+yet by a real-hardware run.
+
+---
+
+## Unreleased — MFA review pass: three real bugs found and fixed
+
+A second read of the MFA work with fresh eyes, looking specifically for what a
+mocked logic test cannot see — real WordPress hook timing and plugin internals.
+Three genuine bugs surfaced, each of which would have either let an admin bypass
+enforcement or locked one out, and all three passed the original checks.
+
+**Bug 1 — enforcement only fired at the login moment.** The original design
+gated on `wp_login` only, which has two holes: an admin already logged in when
+enforcement is switched on never fires `wp_login` again until their cookie
+expires (up to 14 days unprotected), and `wp_clear_auth_cookie()` at `wp_login`
+races the auth cookie the login flow already queued in the same response — it
+usually wins on header order, but "usually" is not a control. Fixed by adding an
+`admin_init` gate that runs on EVERY wp-admin request, redirecting an unenrolled
+in-scope admin past grace to the setup page. A stale session is caught on its
+next click; a survived cookie never reaches an admin screen. The `wp_login`
+handler stays as a second layer. Critically, the gate allows the enrollment
+paths (profile, the TOTP setup AJAX/POST, logout) through — gating without that
+allowance would itself be the lockout.
+
+**Bug 2 — the REST filter deferred to a prior ALLOW.** `rest_authentication_
+errors` used `if ( ! empty( $result ) ) return` — but WordPress core's
+convention is that `true` on that filter means "already authenticated, allow
+it". Treating a prior `true` as "someone decided, stop" meant enforcement was
+skipped exactly when another handler had authenticated an unenrolled admin.
+Fixed to defer only to a prior `WP_Error` (never override another control's
+denial) while still applying our own check when the request was merely allowed.
+
+**Bug 3 — "enrolled" counted enabled-but-not-configured providers.** The
+enrollment check called `get_enabled_providers_for_user()` (what the user
+ticked) rather than `get_available_providers_for_user()` (enabled AND
+configured). A user could enable TOTP, never scan the QR, and be counted as
+enrolled — then be blocked at their next fresh login with no factor that
+actually works. Fixed to require a configured provider, with a defensive
+fallback for unexpected plugin versions.
+
+**Also confirmed and improved by the review:**
+
+- The console-recovery meta keys in the runbook (`_two_factor_enabled_providers`,
+  `_two_factor_provider`) were verified against the plugin source — a wrong key
+  would silently no-op and leave the admin locked out. They are correct. Added
+  clearing of the plugin's rate-limit keys (`_two_factor_last_login_failure`,
+  `_two_factor_failed_login_attempts`) too, so a recovered account is not still
+  throttled from the failed attempts that caused the lockout.
+- Added `MFA_ENFORCE`/`MFA_GRACE_DAYS` to the payload's defensive-defaults block,
+  so a re-provision from an older vars.sh defaults enforcement OFF (the safe
+  direction) rather than leaving it undefined.
+
+The logic-test harness grew from 13 to 21 cases, adding the enrollment-path gate
+(the lockout-critical function: profile and TOTP-setup endpoints must stay
+reachable, normal admin pages must not). All pass. The broader lesson is the one
+this project keeps relearning: the check suite proves the code does what the
+code says, and a review against the real system is what catches the code saying
+the wrong thing. Mocks cannot model `wp_login` cookie timing or the difference
+between a ticked and a configured provider; only reading how WordPress and the
+plugin actually behave could.
+
+---
+
+## Unreleased — Two-factor authentication for administrators
+
+Answering "add MFA to the admin login" — but not with any of the four identity
+providers that were suggested (Kanidm, Authentik, Authelia, PocketID). Those are
+SSO servers: they add MFA by making WordPress speak OIDC/forward-auth, which
+means a standalone always-on identity service (Authentik needs PostgreSQL and
+Redis), a second WordPress integration on top, and a new single point of
+compromise — if the IdP is lost, every downstream app loses auth at once. That
+is the opposite of WASP's minimal-surface design, and the wrong amount of
+machinery to protect one login form. An IdP is a fleet-identity decision for
+later, not a wp-admin-MFA decision now.
+
+The right fit is the **Two Factor plugin maintained by the WordPress core
+contributors** (TOTP, backup codes, passkeys via its WebAuthn companion) — the
+smallest code surface, no upsell, no phone-home — plus a WASP mu-plugin for the
+enforcement the plugin deliberately omits.
+
+**What was built:**
+
+- `wp-plugins.sh install <slug> [--activate]` — a slug-only installer from the
+  already-allowlisted WordPress.org directory. Refuses URLs and ZIPs, so the
+  source is always the signed directory and never an arbitrary runtime download,
+  which is the thing this project otherwise avoids. Logs what it installed.
+- `payload/mu-plugins/03-wpvm-mfa-enforce.php` — requires 2FA for administrators
+  (`manage_options`), and is built entirely around not locking anyone out:
+  a grace window (default 7 days, capped 30, held as a constant so a compromised
+  session can't widen it), backup codes counting as a factor, email explicitly
+  NOT sufficient for admins (it's the reset channel), and a console recovery
+  path. It also closes the REST and application-password side doors so the
+  second factor can't be bypassed via an API.
+- Installed at provisioning: the mu-plugin in stage 06 (with placeholder
+  substitution and a `php -l` gate), and the Two Factor plugin itself in stage
+  08 where `wp-plugins.sh` exists to install it — ordered so a failed fetch
+  cannot wall the login (the mu-plugin treats "plugin absent" as "don't enforce
+  yet, show a notice").
+- An install prompt (`MFA_ENFORCE`, `MFA_GRACE_DAYS`) with the lockout-safety
+  explanation, and `validate-wordpress.sh` now fails loudly if enforcement is on
+  while the plugin is inactive — the one state that would lock admins out.
+
+**Composition was tested, not assumed.** The subtle risk was interaction with
+the three things already on the login path: the custom slug, the brute-force
+guard, and the IP restriction. They compose as sequential stages — the slug
+decides where the form lives, the guard throttles the password on the
+`authenticate` filter, 2FA gates the second factor on `wp_login` after a correct
+password. MFA deliberately does not touch the `authenticate` filter the guard
+owns; where both use `wp_login`, ordering (02 before 03) means the guard clears
+failure counters on success before MFA gates, which is correct. A 13-case logic
+harness (`test/test-mfa-enforcement.php`) proves the scope, enrollment (including
+email-insufficient and backup-codes-sufficient), grace maths, and combined
+blocking decision, and now runs in `run-all-checks.sh` alongside `php -l` of
+every mu-plugin — because this session has repeatedly shown that login-path
+interactions are exactly where lockout bugs hide.
+
+The console recovery procedure is documented in SUPPORT-RUNBOOK.md as a Tier 2
+action, with the reasoning that it is safe to document openly precisely because
+it needs hypervisor access — an attacker with that already has more than a
+login, and it must never become a network-reachable reset.
+
+---
+
+## Unreleased — Session capture for review, redacted and self-contained
+
+`wasp-capture.sh` — records what you did on the VM and produces one shareable
+bundle, so handing a problem over means handing over exactly what ran and
+exactly what the machine saw, not a description of it.
+
+The research question was whether an existing tool does this. Two do —
+asciinema and util-linux `script` — but for a WASP VM the important finding was
+a privacy one, surfaced repeatedly in the sources: a terminal transcript here
+contains client IPs and hostnames, which under GDPR is personal data the moment
+it leaves the machine, and public recording services (asciinema.org and the
+like) are explicitly the wrong destination. So the answer is not a third-party
+uploader; it is a thin wrapper around `script` (already on the VM, zero new
+dependency) that redacts and bundles locally.
+
+Most of the work was already done: `wasp-testreport.sh` is the
+diagnostic-gathering half and already redacts secrets to lengths. The wrapper
+adds the session transcript, an environment snapshot, and correlated
+firewall/egress/CrowdSec logs, then applies a SECOND redaction pass that scrubs
+BY VALUE every secret the installer knows about — reading the actual values
+from vars.sh and the secrets files and replacing them with typed
+`«REDACTED:NAME»` markers in both the transcript and the report. Verified
+end to end: a mock report leaking an admin password and an API key came out
+clean.
+
+Modes: `start`/`stop` for an interactive session, `report` for just the VM's
+current state, and `oneshot -- CMD` for a single command. The bundle is a local
+tar.gz the operator attaches in a browser; it uploads nowhere, and the tool
+tells the operator to skim it before sending because they are the last check.
+
+**A quote-nesting bug caught in build, and it was the exact class the project's
+own `check-embedded-quotes.py` exists for.** Two spots used
+`tr -d '\"'"'"'` — a double-quote-and-single-quote strip written with nested
+shell quoting — inside a `$( )` inside an `echo`. It was unparseable by dash
+(the error walked down the file as each surface symptom was patched, the
+signature of an unclosed quote), and unreadable regardless. Replaced with a
+small `_unquote` helper that uses character variables (`_sq`, `_dq` from
+`printf '\047'`/`'\042'`) so there is never a literal quote-inside-quote for a
+POSIX parser to mishandle. The lesson the checker encodes held up: if a quote
+construct is too tangled to read, it is usually also wrong.
+
+---
+
 ## Unreleased — External security evaluation: 6 of 8 MAJOR findings fixed in source
 
 An independent evaluation (2026-08-09, 91 files, 34,587 lines) rated the build

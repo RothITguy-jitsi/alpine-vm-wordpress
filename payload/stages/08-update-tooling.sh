@@ -26,6 +26,20 @@ ok "  pinned.env is now written atomically (temp file + rename) and re-validated
 # for that layer.
 ts "Installing WordPress plugin/theme update visibility"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
+
+# Two Factor plugin: install it here, where wp-plugins.sh now exists, when MFA
+# enforcement was requested at install time. The enforcement mu-plugin (stage
+# 06) is already in place and waiting for it. Activated only after it installs
+# and parses, so a failed fetch cannot wall the admin login -- the mu-plugin
+# treats "plugin absent" as "do not enforce yet, show a notice".
+if [ "${MFA_ENFORCE:-0}" = "1" ]; then
+  if /usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1 | sed 's/^/  /'; then
+    ok "Two Factor plugin installed and activated — admins can now enrol"
+  else
+    warn "Two Factor plugin install failed. Admins cannot enrol until present."
+    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
+  fi
+fi
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
@@ -37,6 +51,21 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-capture.sh" /usr/local/bin/wasp-capture.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-menu.sh" /usr/local/bin/wasp-menu.sh
+
+# A login hint so operators discover the menu. Written to /etc/motd (shown on
+# interactive login over SSH and on the console) rather than a shell rc, so it
+# does not run code on every shell -- it is just a printed line. The menu is
+# the recommended entry point; the individual tools remain available for anyone
+# who prefers them.
+cat > /etc/motd << 'MOTD'
+
+  WASP — WordPress Alpine Security Platform
+  Type  wasp-menu  for a task-grouped menu of all the operator tooling,
+  or run any tool in /usr/local/bin directly (wp-*, wasp-*, update, ...).
+
+MOTD
 # The inbox is group-writable by the admin user so SFTP drops a file in
 # without a permissions fight -- the most common reason a non-technical
 # handover stalls. Not world-readable: a client's backup contains their
