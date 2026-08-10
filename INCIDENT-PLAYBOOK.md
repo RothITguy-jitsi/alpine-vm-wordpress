@@ -1,5 +1,11 @@
 # WASP Incident Playbook
 
+> This playbook is the compromise-response procedure. For the broader
+> "client reports X, do Y" guide across all severities and skill levels, see
+> **[SUPPORT-RUNBOOK.md](SUPPORT-RUNBOOK.md)** — its Tier 2 section links back
+> here for anything that turns out to be a compromise.
+
+
 What to do when something here reports a finding. Written for the person on
 call at the time, not for a reader with the whole system in their head.
 
@@ -71,17 +77,41 @@ not a false positive — nothing legitimate produces either.
 # 1. Full picture — do not act on the first line of it
 doas wp-malware-scan.sh full
 
-# 2. Preserve. quarantine MOVES and records the original path; it is reversible
+# 2. WHEN did it appear, and what else happened then?
+#    Do this BEFORE quarantining. The file's mtime is the anchor for
+#    everything around it; once it moves, that anchor becomes the
+#    quarantine time and the correlation is gone.
+doas wp-forensics.sh timeline --around <file>
+doas wp-forensics.sh entry-class          # the decision tree
+
+# 3. Preserve. quarantine MOVES and records the original path; it is
+#    reversible, and captures the timeline first.
 doas wp-malware-scan.sh quarantine <file>
 
-# 3. How did they get in? An outdated plugin is the usual door
+# 4. How did they get in? An outdated plugin is the usual door
 doas wp-plugins.sh vulns
 doas wp-plugins.sh status
+doas wp-forensics.sh since-backup         # what changed since known-good
 
-# 4. What else did they touch?
+# 5. What else did they touch?
 doas wasp-verify-integrity.sh
 doas grep -E "wpvm-login|POST /wp-login" /home/wpuser/wp/logs/*.log | tail -50
 doas podman exec crowdsec cscli alerts list
+doas wp-forensics.sh admins               # persistence that outlives file cleaning
+
+# 6. Who is the attacker? Only for an address that matters — the CTI
+#    free tier is 40 lookups per MONTH.
+doas wp-hardening.sh cti <ip>
+```
+
+**If egress control is enabled, check what the site tried to reach.** A
+compromised site calling out is often the clearest evidence of what the
+payload was for, and the denial log records attempts that succeeded at
+nothing:
+
+```sh
+doas wasp-egress discovery
+doas grep DENIED /opt/squid/logs/access.log | tail -30
 ```
 
 ### Then decide
@@ -210,9 +240,12 @@ writes, so an update candidate could modify production data. Do not run
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| **403** on admin paths | Your address is not in the allow list, or mod_remoteip is not substituting it | `wp-hardening.sh proxy-check` |
+| **403** on admin paths | Your address is not allowed, or mod_remoteip is not substituting it | `wp-hardening.sh proxy-check`, then `wp-hardening.sh web-allow <your-ip>` for a direct path that does not depend on the proxy |
+| **403** persists, cause unclear | Possibly the fail-closed `Require not ip <proxy>` rule | `wp-hardening.sh admin-rule simple` to isolate it; `admin-rule strict` to restore |
 | **503** on admin paths | nginx `limit_req` — its default status is 503 | Remove `limit_req` from the NPM Advanced tab, or set `limit_req_status 429` |
 | SSH refused | CrowdSec banned you | Console: `podman exec crowdsec cscli decisions delete --ip <ip>` |
+| Plugin or update failing, no error | Egress proxy blocking an unlisted destination | `wasp-egress discovery` — check *before* assuming the plugin is broken |
+| Site unreachable, no alert fired | Nothing on the VM can report the VM being gone | Configure `wp-notify.sh --heartbeat-url` |
 | Locked out of WordPress | Login guard lockout | Wait it out, or clear the transient via wp-cli |
 
 Console access via `qm terminal <VMID>` from the Proxmox host always works —

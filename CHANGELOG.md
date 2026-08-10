@@ -6,6 +6,727 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — External security evaluation: 6 of 8 MAJOR findings fixed in source
+
+An independent evaluation (2026-08-09, 91 files, 34,587 lines) rated the build
+a strong controlled-pilot platform, not yet unconditionally MSP-production
+certified, with 8 distinct MAJOR findings, ~98 MINOR (mostly two repeated
+inherent-design observations), and 3 PASS. Six of the eight MAJORs were real
+and fixable in source; they are fixed. The other two are the unsigned-build
+state (expected for a development tarball) and a subset now partially closed.
+
+**MAJOR — Squid startup/parser failure only warned.** A production site whose
+egress proxy failed to start could complete installation with all WordPress
+web access broken. Now fatal under `DEPLOYMENT_PROFILE=production`, matching the
+existing CrowdSec-bouncer pattern: both a failed `podman run` and a failed
+`squid -k parse` abort the install with the logs, while lab/standard still
+warns. A running proxy with a broken policy is treated as worse than one that
+did not start, because the firewall directs traffic to it and it does not
+filter.
+
+**MAJOR — DNS unrestricted from WordPress.** The egress firewall allowed UDP/TCP
+53 to any destination, leaving a DNS tunnel open: a compromised WordPress could
+exfiltrate by encoding data into lookups to a resolver it controls, bypassing
+Squid entirely. DNS and NTP are now pinned to the wp-front gateway resolver
+(where aardvark-dns listens) rather than any destination. Squid resolves
+external names itself, so WordPress only needs to resolve `mariadb` and its few
+direct-path names — all via the gateway. Off-network resolver attempts now hit
+the logged drop.
+
+**MAJOR — WASP_ACCEPT_UNVERIFIED reachable in production.** A signature-check
+failure could be bypassed noninteractively. Under
+`DEPLOYMENT_PROFILE=production` neither the `WASP_ACCEPT_UNVERIFIED` escape nor
+the interactive UNVERIFIED prompt is now available — the only fix is a correctly
+signed build. Any unverified install (only possible under standard/lab) persists
+a durable `/etc/wp-install/UNVERIFIED` marker that `validate-wordpress.sh
+--check` surfaces as a WARNING and `wasp-testreport.sh` banners at the top, so a
+lab build can never be quietly mistaken for a verified one.
+
+**MAJOR — Candidate read live data and could call out.** The update candidate
+container mounts the docroot read-only and has a SELECT-only DB grant already,
+but the evaluator noted it could still call external APIs, send mail or
+exfiltrate. It now has two-layer egress isolation: at the firewall (on wp-front,
+restricted to Squid + gateway DNS when egress is enabled) and at the
+application (`WP_HTTP_BLOCK_EXTERNAL=true`, plus disabled cron, file-mods and
+auto-updater — candidate-only, not production). A health-check boot needs no
+external HTTP, so blocking all of it costs nothing and removes the whole class.
+
+**MAJOR — Weekly self-test proved local restore, not remote recovery.** Verifying
+the offsite object EXISTS is not proof it RESTORES — it can be truncated,
+encrypted to a recipient whose key is gone, or otherwise unusable exactly when
+needed. New `wasp-offsite-backup.sh remote-restore-drill` forces the full
+round-trip: pull the actual remote object (never a local shortcut), decrypt it
+with the recovery key, restore into a throwaway database, verify it is
+non-empty, and record fetch/decrypt/restore timing as a real RTO. This directly
+converts the project's weakest claim — recovery — from reasoning into evidence.
+
+**MAJOR — README contradicted itself on egress.** Early sections described Squid
+as the destination boundary; a later section still described port-only egress
+as "may connect out to anything." Resolved with an explicit two-layer hierarchy:
+Squid is the destination boundary for WordPress web traffic (the layer that
+matters, since 443 is open at the port level either way), and the outbound
+firewall is the coarser VM-wide port control for the host's own non-HTTP
+services. Both sections now cross-reference and frame each other as complementary
+layers rather than alternatives.
+
+**Partially closed — vulnerability-exception governance.** The exception
+mechanism was already digest-scoped with expiry (the core of the finding). Added
+the missing half: `wasp-testreport.sh` now surfaces every ACTIVE (unexpired)
+exception with its digest and lapse date, so weekly review sees what has been
+accepted — an unreviewed exception is how one quietly becomes permanent policy.
+
+**Expected, not a defect — unsigned build.** The evaluated tarball is an unsigned
+development build (empty `WASP_PUBKEY`, no `MANIFEST.sha256`). That is the
+correct state for a source drop; the signing path exists and is now
+additionally enforced by the production profile above. A real MSP deployment is
+built from a signed release.
+
+The two-repeated MINOR themes — "permanent root tooling is a persistence target"
+and "correct static content still needs runtime validation" — are inherent to a
+root-run provisioner audited from source, not defects, and are answered by the
+existing integrity manifest plus the standing caveat that none of this is proven
+until it runs on hardware. That caveat is unchanged and remains the honest
+headline: these fixes are validated by the check suite and by construction, not
+yet by a disposable-VM drill.
+
+---
+
+## Unreleased — Squid folded into the update path (it was the one component left out)
+
+The question was whether every component, Squid included, was in `update.sh`.
+It was not — and the gap was worse than a missing dispatch line.
+
+**Squid was not a pinnable image at all.** It ran `alpine:3.21` and did
+`apk add squid` at container start, so its version was whatever Alpine's repo
+served the moment the container booted. That cannot be digest-pinned (the
+binary is not in the image), cannot be CVE-scanned before deployment, and
+cannot be updated through the same mechanism as everything else — it was the
+one container outside the entire digest-pinning security model, and it was the
+container most defined by CVE exposure, having just had four mitigations added.
+
+**Fixed by making Squid a real pinned image and wiring it in fully.** Now uses
+Canonical's `ubuntu/squid`, whose digest represents a known Squid version, on
+identical footing to WordPress, MariaDB and CrowdSec:
+
+- Registry constant, pinned-version fallback, and `pinned.env` tag+digest.
+- Digest-pinned at install (stage 02) alongside the others, guarded so it only
+  pins when egress filtering is enabled.
+- `do_squid_update()` following the CrowdSec pattern — candidate scan, clean
+  stop, rename-to-rollback, run, policy-parse verification, and rollback on any
+  failure. Simpler than CrowdSec in fact: Squid is on an isolated network with
+  no persistent state, so there is no two-engines-on-one-port hazard.
+- Present in `update.sh squid`, `update.sh all`, `update.sh digest-check`,
+  `update.sh trivy`, `update.sh status`, `update.sh versions`, and the usage
+  string. Verified every path the other three appear in.
+
+**Research corrected a wrong assumption in the process.** The version guard and
+a config comment claimed CVE-2025-62168 (the CVSS 10.0) requires Squid 7.2.
+Canonical BACKPORTS that fix into the 6.x line — it is fixed in the
+6.13-1ubuntu1.2 package — so a "must be >= 7.2" check would have wrongly warned
+on a fully patched image. The guard now reports the version and points at
+`update.sh squid` for currency rather than asserting a version floor the
+Canonical image deliberately does not follow. The `email_err_data off` policy
+workaround stays as defence in depth regardless.
+
+The result: there is no longer any component that cannot be checked, scanned
+and updated through one tool. That was the actual question, and the honest
+answer required fixing the image model, not just adding a case to a switch.
+
+---
+
+## Unreleased — Version audit against upstream: WordPress and PHP floors bumped
+
+A pass with a research lens rather than a re-read: every pinned version,
+base image and external command checked against its current upstream state as
+of August 2026, because that is the kind of staleness a self-review cannot see.
+
+**Two real findings, both in the default version floors:**
+
+- **WordPress default was 6.9.4; 6.9.6 shipped 2026-08-06.** The 6.9 branch has
+  had active security releases (6.9.2/6.9.3 addressed security issues, and
+  6.9.4 itself was reissued because not all fixes had applied). A fresh install
+  on 6.9.4 was therefore born two maintenance releases behind on a branch that
+  was actively patching. Floor moved to 6.9.6. Note this only affected first
+  boot: `update.sh` already moves off the floor by digest after a CVE scan, so
+  an operator who had run an update was current regardless.
+- **PHP was pinned to 8.3, which entered SECURITY-ONLY support on 2025-11-23**
+  (full EOL 2027-12-31). 8.4 is the recommended production line, with bug fixes
+  through 2028-12-31. New installs should not start on the security-only line;
+  floor moved to php8.4.
+
+Both defaults are documented in the code as *starting floors, not the version
+you end up on*, with the verification date and the upstream reasoning inline,
+so the next person can see why the number is what it is rather than guessing
+whether it is arbitrary.
+
+**Four things checked and confirmed already correct — the more useful half of
+an audit:**
+
+- **MariaDB 11.4** is right and current. It is LTS with support to May 2029 —
+  the longest runway of any release — and the bare `11.4` branch tag tracks
+  patch releases (11.4.12 latest). The existing code comment that `11.4-lts` is
+  not a real tag is accurate and was kept.
+- **The June 2026 MariaDB Galera CVEs do not apply.** They affect Galera
+  clustering; WASP is single-node and enables no clustering (the only `cluster`
+  reference is a Proxmox VMID lookup). Verified rather than assumed.
+- **CrowdSec v1.7.8** is the current latest (2026-05-11) and is already the
+  correct security release — the code comment correctly identifies it as the
+  CVE-2026-44982 WAF-bypass fix. No change needed.
+- **`cscli dashboard`**, removed in CrowdSec 1.7, appears nowhere. No removed
+  MariaDB config directives, no `docker-compose`, no deprecated container
+  syntax. The `--allow-root` and `allow_url_fopen` uses are deliberate and
+  documented, not leftovers.
+
+All illustrative version strings in comments, examples and the Proxmox notes
+were aligned too, so no reader is misled by a stale example even where it was
+never functional. The point of that is not cosmetic: a comment showing
+`6.9.4-php8.3` next to code that installs `6.9.6-php8.4` is a small lie that
+costs the next reader time.
+
+---
+
+## Unreleased — Support runbook that supports everyone, tiered by reader
+
+`SUPPORT-RUNBOOK.md` — the gap the project's own assessment kept naming: a
+troubleshooting guide for the person who is *not* the author, so an incident
+does not route to whoever wrote the system.
+
+Structured by who is reading it, not by subsystem, because that is what decides
+what a reader can safely do:
+
+- **Tier 0 — Anyone.** A client or account manager, no command line. Deliberately
+  cannot break anything: it is all looking and reporting. Covers the three real
+  Tier-0 events — site looks down, cannot log in, got an alert email — with an
+  emphasis on reporting the exact error rather than "it's broken", because a 502
+  and a 403 send a technician to entirely different places. Includes what never
+  to do: stop retrying a password before CrowdSec bans you, do not install a
+  plugin to fix an outage.
+- **Tier 1 — On-shift tech.** A symptom-to-action table keyed on what the client
+  actually says, each row naming the first check and the likely fix. The 403
+  tree gets its own walkthrough because it is the most common WASP-specific call
+  and has three distinct causes. Un-banning, the console escape hatch, and an
+  explicit "stop before changing something you don't understand" with what to
+  hand up.
+- **Tier 2 — Engineer.** The failures Tier 1 correctly does not attempt:
+  container-dies-on-start, CRITICAL-after-obvious-fixes, the ordered compromise
+  response (with the reminder that quarantining first destroys the timeline),
+  restore, rollback, integrity verification. Ends with a "needs you
+  specifically" list — the judgement calls that have no runbook entry on
+  purpose, because some decisions should not be made by someone following a
+  script.
+
+Writing it did what a runbook should: it forced verification that every command
+it names is real. That surfaced a genuine regression — `validate-wordpress.sh
+--check`, the single most-referenced command in the runbook and the health
+signal the whole fleet-monitoring story depends on, had been lost from the file
+when an earlier edit aborted mid-write. Restored, with the Prometheus mode, and
+re-verified. A runbook that points at a command which no longer exists is worse
+than none, and the doc-vs-code check plus this pass is what caught it.
+
+Cross-linked from the MSP runbook (the business layer), the incident playbook
+(compromise response), and the README, so each points to the right companion
+rather than duplicating it.
+
+---
+
+## Unreleased — Fleet management: a researched decision, not a build
+
+Whether WASP needs to build a central aggregator, or use Pulse for per-VM pod
+status. Researched rather than assumed, and the answer is: build almost nothing.
+
+`docs/FLEET.md` lays it out as three separate problems, because conflating them
+is how you build a monitoring product instead of running a hosting business:
+
+- **Is the VM alive?** Pulse — one LXC on the Proxmox host, auto-discovers
+  guests via the API, shows every VM's CPU/RAM/disk/up-down with console links
+  and downtime alerts. The visual pod-status dashboard, free, self-hosted,
+  nothing installed on the VMs. Blind to everything inside the guest, which is
+  exactly the set of failures WASP catches and which never show as a red VM.
+- **Is WASP healthy inside?** The seam nothing off-the-shelf covers, tiny
+  because `validate-wordpress.sh --check` already emits the signal. Recommended
+  start builds nothing: the existing heartbeat and `--check` fed to a hosted
+  checker is complete fleet monitoring today. A read-only aggregator is a later
+  option if that gets noisy — status only, never fleet credentials.
+- **Is WordPress maintained?** MainWP if you want central updates and reports,
+  self-hosted, carrying an explicit warning: every tool in this category holds
+  a key that controls every connected site, a single point of compromise for
+  the whole portfolio, in tension with WASP's no-single-owner design.
+
+The recommendation, stated as a principle: monitor with tools that observe, not
+tools that control. WASP's value is that no component owns the fleet; fleet
+management should preserve that, not undo it with one dashboard holding every
+key.
+
+**`validate-wordpress.sh --check --prom`** added so the scale path is real:
+the same health signal as Prometheus text with stable metric names
+(`wasp_health`, `wasp_disk_percent`, `wasp_backup_age_hours`,
+`wasp_container_up`), for a textfile collector or scrape endpoint.
+
+No aggregator VM was built, deliberately — the trigger is real pain with the
+zero-infrastructure option, not anticipation of it.
+
+---
+
+## Unreleased — Credential rotation, and a health code for monitoring
+
+Two gaps that separate "works" from "an MSP can run a fleet of these".
+
+**`wp-rotate-secrets.sh`** closes the sharpest one. The incident playbook said
+"rotate every credential" and gave no way to do it — so the moment rotation
+matters most, just after a compromise, was the moment an operator was
+hand-editing several config files under pressure, hoping they caught every
+copy. A missed copy is either a broken site or a credential the attacker still
+holds.
+
+The database password is the hard case because it lives in more than one
+place: the container environment and the MariaDB grant. The tool changes
+MariaDB first, then the environment, then restarts WordPress — an order that
+keeps the site serving throughout, because MySQL does not drop the live
+connection when the password changes. It verifies the new password
+authenticates before committing and rolls both back if it does not. Generated
+passwords are drawn from a shell- and SQL-safe alphabet, so no value can break
+an env file or a SQL statement.
+
+It refuses to rotate the age backup key, loudly. Every existing backup was
+encrypted to the current key; a new key cannot read them, so rotating it
+discards the backup history. That is a re-encryption workflow, not a rotation,
+and pretending otherwise would lose someone their backups.
+
+**`validate-wordpress.sh --check`** gives monitoring a number instead of a
+report. One line, standard exit codes — 0 healthy, 1 degraded, 2 critical — so
+Nagios, Zabbix, Checkmk or a cron poller can watch the VM without parsing
+anything. It checks the four page-worthy conditions: containers up, database
+answering, disk under 90%, newest backup under 26 hours. The rest of the
+validator is diagnosis for humans; this is alerting for machines, and mixing
+the two is why so many health checks are too chatty to alert on.
+
+It complements the heartbeat rather than duplicating it: `--check` reports the
+VM is *unhealthy*, the heartbeat's absence reports the VM is *gone*. An on-box
+check cannot detect its own host being down, and an off-box heartbeat cannot
+see disk usage. Both, or a blind spot.
+
+`MSP-RUNBOOK.md` now maps both `--check` exit codes to severities, and the
+decommissioning section documents rotation as tooled rather than manual.
+
+The doc-coverage check earned its place again — it failed the build twice on
+this tool, once for no documentation and once for prose that described the
+behaviour without naming the command. Both are real: a tool documented only
+inside a code fence is undiscoverable by anyone searching for it.
+
+---
+
+## Unreleased — Perimeter test wired into the report, off-box by default
+
+`wasp-testreport.sh --perimeter <url>` runs the external harness as a section
+of the full report, so one command spans interior and perimeter.
+
+The wiring resolves a real tension rather than papering over it. The harness
+lives in `tools/`, deliberately outside the deployable payload, so a
+compromised VM does not contain a ready-made scanner — which means it is not on
+the VM for `--perimeter` to call. Rather than auto-installing it and undoing
+that, the report treats its absence as **correct**, and prints the two commands
+to run it from a Kali box, including the `--ip` form that tests WEB_CIDR.
+
+It is also honest about vantage. Even when the harness is present on the VM
+(because the operator copied it there), the report states plainly that this
+host is on the LAN and probably allow-listed, so admin endpoints may answer
+here that an outside attacker cannot reach — and that the real access-control
+test is still from off-LAN. A green perimeter section from the VM is not
+allowed to imply more than it shows.
+
+This is deliberately not folded into `test/run-all-checks.sh`, which runs at
+build time in the sandbox and lints shell against no live target. A perimeter
+test needs a reachable VM and makes real HTTP requests; it belongs in the
+on-VM report, not the build-time linter. The two harnesses answer different
+questions and are kept separate on purpose.
+
+---
+
+## Unreleased — External validation harness for Kali
+
+`tools/wasp-pentest.sh` — run from a Kali box against a WASP VM you own, to
+confirm the controls WASP claims actually fire from an attacker's position.
+Every defensive claim becomes a probe with an expected result: admin surface
+refused, XML-RPC disabled, no username enumeration, headers present at the
+edge, no exposed files, rate limiting returning 429 rather than the field
+bug's 503, TLS floor, and — with `--ip` — whether WEB_CIDR really restricts
+direct access to the proxy.
+
+**Deliberately a validation tool, not an attack tool**, and the line is
+explicit in the code and the doc. It makes ordinary HTTP requests and checks
+responses. No exploit payloads, no credential wordlists, no injection strings,
+no traffic flood. The one rate-limit probe is eight spaced requests — enough to
+see the limiter engage without flooding anything or risking a real lockout.
+Every request identifies itself as `wasp-pentest/1.0` in the target's logs.
+
+Confirming a control fires needs one well-formed request with a known expected
+answer. The moment such a tool needs a wordlist or a CVE payload it has stopped
+validating the owner's system and started being useful against systems that are
+not theirs — a different tool with a different purpose, and not this one.
+
+**Authorisation is enforced, not assumed.** The script requires the operator to
+type `I OWN THIS` before sending anything, with the CFAA named. That prompt is
+the boundary between security testing and an offence.
+
+**It is honest about its vantage.** Egress filtering, CrowdSec's ban list,
+backup encryption and malware scanning live inside the VM and cannot be seen
+from outside; the harness says so and points at the VM's own commands rather
+than pretending to cover them. And it treats *where you test from* as the
+substance of the access-control test: an allow-listed address is expected to
+reach wp-admin, an unauthorised one is not, and the difference between the two
+runs is the control working.
+
+Placed in `tools/`, outside the deployable payload, so it is never installed on
+the VM it tests. Verified against a mock hardened endpoint: the hardened
+responses pass and unhandled paths correctly fail.
+
+---
+
+## Unreleased — Forensic audit: CWE-377, and four Squid CVEs the config ignored
+
+An audit against known issue classes rather than a re-read of my own comments.
+
+**Predictable temporary files (CWE-377), eight instances.** Root-run scripts
+wrote error output to fixed paths — `/tmp/.age.err`, `/tmp/.offsite.err`,
+`/tmp/.nfterr`, `/tmp/.offsite.log`. Any local user can pre-create one of
+those as a symlink and have root truncate whatever it points at. The
+dot-prefix hid them from `ls` and from nothing else. All now `mktemp` with a
+trap; the pre-existing function-local trap in `wasp-offsite-backup.sh` was
+checked rather than assumed and survived.
+
+**Four published Squid CVEs, none mitigated by the config I wrote:**
+
+- **CVE-2025-62168, CVSS 10.0** — HTTP credentials were not redacted from
+  error pages, letting a remote client harvest tokens used by backend
+  applications. Fixed in Squid 7.2; `email_err_data off` is the vendor's
+  workaround and is now set, with an install-time version check that says
+  plainly when the running version predates the actual fix.
+- **CVE-2025-54574** — heap overflow in URN handling, remote code execution,
+  everything before 6.4. `http_access deny URN`.
+- **CVE-2026-47729** — out-of-bounds read in the FTP gateway leaking data
+  between sessions. `http_access deny FTP`.
+- **CVE-2026-50012** — heap overflow via crafted cache_digest replies.
+  `digest_generation off`.
+
+Disabling unused protocol handlers is worth doing beyond these specific
+issues: the next flaw in a parser this deployment never invokes is one the
+configuration is already immune to.
+
+**And the fix reproduced the exact bug its own comment warns about.** The URN
+and FTP denies were first placed with the other CVE mitigations near the end
+of the file — *after* `http_access allow`, where they would never be
+evaluated. An allowed source requesting a `urn:` URI would have matched the
+allow first and the deny would have been decorative. Caught by re-reading the
+rendered order, and now enforced by a check that no specific deny follows any
+allow.
+
+**Dead code:** one orphaned function removed. Four more flagged were
+cross-file false positives — `msg_ok` alone is used 67 times — verified before
+deleting anything, since a per-file sweep cannot see cross-file use. No
+dangling `${PAYLOAD_DIR}` references. The two remaining TODO markers are prose
+inside explanatory comments, not unfinished work.
+
+**Clean:** no secrets in host-visible argv (database passwords expand inside
+the container), no `eval` on non-constant input, no TLS verification bypass,
+no world-writable permissions.
+
+---
+
+## Unreleased — Import pipeline diagram, and a coverage check that is not fooled by a mention
+
+Asked where the import section was in `ARCHITECTURE.md`. It was not there —
+`wp-import.sh` existed only as four leaf nodes in the day-2 tooling map.
+
+**The coverage sweep from the previous entry reported it as present**, because
+grep found the string. That is the same failure as the checks which confirmed
+a firewall rule was *present* rather than *effective*: presence is the easy
+question and rarely the useful one, and here it produced a confident "✔" for a
+multi-stage pipeline with no representation at all.
+
+**Section 7 added: the import pipeline**, because the ordering *is* the
+security property and a list of tool names cannot show ordering. The diagram
+follows the archive from inbox through index-only inspection, bounded
+extraction outside the docroot, file and dump scanning, the graded gate,
+normalisation and re-hardening — with the refusal paths drawn rather than
+described.
+
+Sections renumbered 1–8; `3b` was a leftover from inserting the egress
+boundary.
+
+**`test/check-doc-coverage.py` added**, and written to distinguish *mentioned*
+from *documented*: a tool counts only if it appears in prose outside code
+fences and diagrams, not merely once as a node label. It immediately found two
+more that the grep-based sweep had passed — `wasp-testreport.sh` and
+`wp-notify.sh`, both operator-facing and both only ever named.
+
+Then it caught a third case on the fix itself: the new alerts section
+described what `wp-notify.sh` does without naming it outside a code fence.
+Technically documented behaviour, undiscoverable by anyone searching for the
+command. Fixed by naming it in the prose.
+
+Internal helpers invoked only by cron are listed as exempt rather than
+silently ignored, so the exemption is a decision someone can disagree with.
+
+---
+
+## Unreleased — Documentation brought level with the code
+
+A coverage sweep rather than a tidy-up. Four things were missing entirely and
+two of them mattered.
+
+**`ARCHITECTURE.md` gains a seventh diagram: the egress boundary.** It shows
+the eight-stage policy chain in evaluation order, the three paths that are
+blocked (direct :80/:443, raw sockets, the database container), and states in
+prose why the order is not cosmetic — a hard deny placed after the allowlist
+can be overridden by a wildcard, which is how a metadata endpoint becomes
+reachable.
+
+The component diagram gains Squid; the tooling map gains `wasp-egress.sh`,
+`wp-import.sh`, `wp-forensics.sh`, `wasp-testreport.sh` and the heartbeat.
+Six shipped tools had no representation at all — the same drift that was
+fixed once already, which suggests the check should be automated rather than
+repeated by hand.
+
+**`INCIDENT-PLAYBOOK.md` did not mention `wp-forensics.sh`** — the tool most
+likely to be reached for during an actual incident. Worse, the CRITICAL
+malware sequence had quarantine at step 2, before any timeline capture. That
+ordering destroys the correlation: the file's mtime is the anchor for
+everything around it, and once it moves the anchor becomes the quarantine
+time. Timeline capture is now step 2 and quarantine step 3, with the reason
+stated inline so nobody reorders it.
+
+It also gains an egress step — a compromised site calling out is often the
+clearest evidence of what the payload was *for*, and the denial log records
+attempts that succeeded at nothing.
+
+**`MSP-RUNBOOK.md` gains a client-onboarding section.** Inspect and scan
+before quoting the work: a backup with a webshell in uploads and code in
+autoloaded options is a cleanup engagement, not a migration, and discovering
+that afterwards is how a fixed-price migration becomes unpaid incident
+response.
+
+**Two commands were documented nowhere at all: `web-allow` and `admin-rule`.**
+Both are lockout recovery, which is the worst possible place for an
+undocumented command — they are needed precisely when the operator cannot
+reach the system to go looking. Now in the README with the reasoning, and in
+the playbook's lockout table.
+
+The sweep itself is worth keeping as a habit: a matrix of every feature
+against every document, so "documented nowhere" is a result rather than
+something noticed by accident.
+
+---
+
+## Unreleased — Egress control: Squid + firewall enforcement
+
+Implements the WASP Egress Control Plan. The outbound firewall added earlier
+restricts which **ports** WordPress may use; this restricts which
+**destinations**, which matters because 443 is open either way and 443 is
+where exfiltration goes.
+
+**HTTPS is filtered without decrypting anything.** A client opening an HTTPS
+connection through a proxy sends `CONNECT host:443` in plaintext before the
+TLS handshake, so `dstdomain` allowlisting works with no SSL Bump, no
+certificate authority on the VM, and no ability to read the traffic. TLS
+interception was a stated non-goal and is not needed to get the property.
+
+**The firewall half is the one that matters.** `WP_PROXY_HOST` is honoured
+only by code that chooses to honour it — a plugin calling `fsockopen()`, or
+`curl` without `CURLOPT_PROXY`, ignores it completely. Without an nftables
+rule the proxy filters only well-behaved traffic, which is not the traffic
+anyone is worried about. wp-front may reach `10.89.10.2:3128` and DNS/NTP;
+everything else outbound is logged and dropped, and Squid alone may reach the
+web.
+
+**ACL order is the security property, not presentation.** Source, then
+method/port, then hard deny, then IP literals, then threat list, then
+allowlist, then maintenance, then deny all. Every deny precedes every allow —
+a hard deny placed after the allowlist can be overridden by a wildcard entry,
+which is how a metadata endpoint becomes reachable because somebody
+allowlisted too broadly.
+
+Cloud metadata is denied **by address**, not only by name, because the
+property has to survive a request straight to `169.254.169.254` — which is
+exactly what an SSRF payload does. Bare IP literals are refused outright:
+there is no legitimate WordPress update that needs one, and an IP request
+bypasses every name-based rule below it.
+
+**`wasp-egress test` proves enforcement rather than reviewing configuration.**
+Ten checks, and the important ones remove WordPress's proxy settings and
+confirm egress *still* fails. That is what distinguishes a firewall enforcing
+a boundary from an application politely observing one. It also covers a raw
+`fsockopen()`, a CONNECT to port 22 on an allowlisted host, and the database
+container reaching anything at all.
+
+**Maintenance windows, no open mode.** A window needs a reason of at least ten
+characters, is capped at 120 minutes, records who opened it, emails the fact,
+and closes itself. Expiry is evaluated on every command rather than by a
+timer, so a window cannot outlive its duration because a cron job did not run.
+
+**Discovery never auto-promotes.** Denied destinations are reported and
+classified by hand — REQUIRED, MAINTENANCE, UNNECESSARY, SUSPICIOUS. An
+allowlist grown by accepting whatever asked for access is not an allowlist,
+and a destination the operator cannot account for is a finding.
+
+**A test-harness bug caught by the embedded-quote check**, and fixed as a
+class rather than an instance: `_t` took its command as a string and `eval`'d
+it, so every nested quote had to be escaped correctly twice — and one was not.
+Rewritten to take arguments. A test harness whose own quoting can silently
+change what it runs is not a test harness.
+
+The starting allowlist is deliberately short and says what it excludes and
+why: Gravatar, font CDNs and the rest of the CDN estate are common
+exfiltration paths, and a site that visibly breaks without one has just told
+you about a dependency you did not know it had.
+
+---
+
+## Unreleased — Import: the gate, normalisation and re-hardening
+
+The destructive stages, and the ones where the safety rails matter more than
+the feature.
+
+**The gate is graded, not binary.** Refusing outright would be wrong — people
+import compromised sites deliberately, in order to clean them — and
+proceeding silently defeats the tool's only purpose. Unscanned refuses;
+CRITICAL refuses without `--force`; HIGH refuses without `--accept-findings`;
+every override is recorded with who made it.
+
+**A backup of the current database is mandatory**, taken before anything is
+replaced, and the import refuses if it fails. An import without a way back is
+a replacement.
+
+**Normalisation is where most of the safety comes from**, and it works by
+discarding rather than inspecting wherever a good replacement exists. Core
+comes from the pinned image; `wp-config.php`, `.htaccess` and mu-plugins are
+withheld — mu-plugins especially, because they are active on arrival with no
+activation step to withhold. Executable files in uploads are quarantined as
+evidence rather than deleted.
+
+**Re-hardening runs because an import undoes hardening.** `home` and `siteurl`
+are rewritten for this deployment, salts regenerated — invalidating every
+session the source site had, which is the point — scheduled tasks cleared, and
+administrators listed with the observation that any unrecognised account is
+persistence that outlives deleting the file which created it.
+
+**A real bug found while testing, in code written minutes earlier.** The table
+prefix rewrite matched single-quoted meta keys only. `wp_capabilities`,
+`wp_user_level` and `wp_user_roles` are stored as meta **values** and carry the
+prefix, so rewriting table names alone imports every user with no capabilities
+— the classic "changed the prefix and lost admin access", presenting as a
+completely successful import.
+
+Worse, the first fix only handled single quotes: `mysqldump` emits those, but
+phpMyAdmin, Adminer and several backup plugins emit double, so dumps from the
+most likely sources would still have locked the operator out. Now
+quote-agnostic, verified against both styles.
+
+That is the second time in this feature that a quote-style assumption would
+have produced a silent failure in exactly the case that matters. Worth
+recording as a pattern rather than two coincidences: **SQL dumps are not one
+format**, and any check or rewrite against them needs testing against more
+than the exporter that happened to be to hand.
+
+---
+
+## Unreleased — Import: bounded extraction and dump scanning
+
+Steps 2 and 3 of the import design. Together with `inspect` this answers
+"what is in this backup, and is it safe" without writing anything to the live
+site.
+
+**Extraction treats the archive as hostile.** Hostile-member checks are
+re-run rather than assumed — a check that only fires when the operator
+remembers to run `inspect` first is not a control. Ownership and permission
+bits from the archive are never honoured (`--no-same-owner`,
+`--no-same-permissions`): a setuid binary or root-owned file inside a client's
+backup is not something to reproduce faithfully. Disk headroom is verified
+before writing, because running out mid-extract leaves a half-populated
+staging directory *and* a disk too full for the live site to write its own
+logs.
+
+**Everything extracted has its execute bit removed.** The staging tree is
+never served and nothing in it should run, so removing the bit costs nothing
+and eliminates a class of accident — including a script or an operator
+invoking something from the archive without meaning to.
+
+Duplicator's installer is deleted at extraction rather than at import. There
+is no stage at which keeping it is useful.
+
+**The dump is scanned as a file, before it is loaded.** Loading it and then
+querying it is the same error as extracting into the docroot: by the time you
+look, the thing being checked for has already happened. Three checks, each
+for something most import tooling ignores entirely:
+
+- **Code in autoloaded options** — runs on every page load, invisible in the
+  filesystem, survives any file-level clean.
+- **Suspicious scheduled tasks** — the `cron` option re-creates files after a
+  clean, which is why malware appears to "come back" and why the operator
+  concludes the clean failed.
+- **Administrator rows** — persistence that outlives deleting the file that
+  created the account.
+
+**A real fragility fixed during testing.** The cron pattern matched
+single-quoted option names only. `mysqldump` emits single quotes, but
+phpMyAdmin, Adminer and several backup plugins emit double — so the check
+would have passed silently on those dumps, for the persistence mechanism most
+likely to be missed. Now quote-agnostic, verified against both styles and
+against a legitimate `wp_version_check` entry, which correctly does not match.
+
+Tested end to end against a constructed infected backup: webshell in uploads,
+Duplicator installer, mu-plugins, core files, a poisoned autoloaded option, a
+malicious cron entry and a rogue administrator row. Every one was reported at
+the right severity.
+
+`check-grep-count.py` fired a fifth time on the same idiom, again minutes
+after the check had passed.
+
+---
+
+## Unreleased — `wp-import.sh`: ingest and inspection
+
+Steps 1 and 2 of `docs/IMPORT-DESIGN.md`, chosen first because they are the
+only part of the import pipeline with **no destructive failure mode**.
+Everything after them writes to disk; this only reads.
+
+**Ingest reuses what is already configured.** `fetch s3` uses the same rclone
+remote set up for off-VM backups — a second set of credentials for the same
+bucket is a second thing to rotate and forget. Also `fetch url` with an
+optional checksum, and an SFTP inbox at
+`/var/lib/wasp-import/incoming`, group-writable by the admin user so a
+drag-and-drop transfer does not stall on permissions. That is the most common
+reason a non-technical handover gets stuck.
+
+`fetch url` detects an HTML share page masquerading as an archive and says so.
+Without that the failure surfaces three steps later as an unreadable archive,
+and nobody connects it to having copied the wrong link.
+
+**`inspect` never extracts.** Reading an index is safe; extraction is where
+path traversal, symlink escapes and decompression bombs happen. Checking
+against the listing means a hostile archive is refused while its contents are
+still only names.
+
+Refused outright, no override: `../` members, absolute paths, symlinks. A
+backup does not need any of them, so there is no legitimate case to
+accommodate.
+
+Flagged: executable PHP in uploads (the strongest single indicator the source
+was compromised), Duplicator's `installer.php`, mu-plugins (active on arrival,
+no activation step to withhold), `wp-config.php` and core (both discarded at
+import in favour of this VM's own), and the expansion ratio against free disk
+— because running out mid-import leaves a broken site *and* no import.
+
+Verified against real archives: a clean one passes, one with a webshell in
+uploads warns, and the traversal/symlink checks fire on the listing rather
+than on extracted files.
+
+`.wpress` is detected and declined with instructions, rather than half-handled.
+It is a custom binary format and a shell reader for fixed-width headers is
+unpleasant enough to be worth deferring — saying so is better than a partial
+implementation that fails obscurely.
+
+---
+
 ## Unreleased — Three operational gaps closed
 
 **WordPress now waits for MariaDB to accept connections**, not merely for its

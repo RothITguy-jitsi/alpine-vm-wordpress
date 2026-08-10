@@ -32,9 +32,24 @@ err()  { echo "  ✗  $*" >&2; exit 1; }
 
 # ── Pinned image versions ─────────────────────────────────────────────────────
 # BUG FIX: mariadb:11.4-lts does NOT exist on Docker Hub.
-# Correct tags: mariadb:11.4 (branch), mariadb:lts (always current LTS).
-# wordpress:6.7.2-php8.3-apache (full semver) is more stable than 6.7.
-WP_IMAGE="docker.io/wordpress:6.9.4-php8.3-apache"
+# These are STARTING FLOORS, not the version you end up on. `update.sh check`
+# compares each against the registry by digest and `update.sh wp|db` moves to
+# the newest tag after a CVE scan and health check -- so the job of these
+# values is only to be a safe, current-enough baseline at first boot.
+#
+# Verified against upstream (Aug 2026):
+#   - WordPress 6.9 branch is current (7.0 shipped May 2026 but 6.9 is still
+#     security-supported; 6.9.6 is the latest patch as of 2026-08-06). Pinning
+#     the branch's newest patch, not an older one, so a fresh install is not
+#     born behind on a branch that has had active security releases.
+#   - php8.4: 8.3 entered SECURITY-ONLY support on 2025-11-23 (full EOL
+#     2027-12-31); 8.4 is the recommended production line, supported through
+#     2028-12-31. New installs should start on the supported-with-bugfixes
+#     line, not the security-only one.
+#   - mariadb:11.4 is LTS, supported to May 2029 -- the longest runway of any
+#     current release. The bare "11.4" branch tag tracks patch releases
+#     (11.4.12 latest); "11.4-lts" is NOT a real tag and must not be used.
+WP_IMAGE="docker.io/wordpress:6.9.6-php8.4-apache"
 DB_IMAGE="docker.io/mariadb:11.4"
 # BUG FIX (v7-5): v1.7.6 → v1.7.8. v1.7.8 (2026-05-11) is a security release
 # patching CVE-2026-44982 (a HIGH-impact partial WAF bypass in the AppSec

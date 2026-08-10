@@ -972,6 +972,9 @@ SNIPPET2
           _new=$(printf '%s' "$WEB_CIDR" | tr ',' '\n' | grep -vxF "$_ip" | paste -sd, -)
         fi
 
+        # mktemp, not a fixed /tmp name: this runs as root and a predictable
+        # path is one a local user can pre-create as a symlink.
+        _NFTERR=$(mktemp) || exit 1
         cp "$_nft" "${_nft}.bak-$(date -u +%Y%m%d%H%M%S)"
         # Both places: the input rule and the forward rule. Editing only one
         # leaves the two disagreeing, and the forward rule is the one that
@@ -980,17 +983,17 @@ SNIPPET2
         sed -i "s|ip saddr != { ${WEB_CIDR}, 127.0.0.0/8, 10.89.0.0/16 }|ip saddr != { ${_new}, 127.0.0.0/8, 10.89.0.0/16 }|g" "$_nft"
         sed -i "s|^WEB_CIDR=.*|WEB_CIDR='${_new}'|" /etc/wp-install/vars.sh 2>/dev/null || true
 
-        if nft -c -f "$_nft" 2>/tmp/.nfterr; then
+        if nft -c -f "$_nft" 2>"$_NFTERR"; then
           nft -f "$_nft" && echo "✔ Web access now: ${_new}"
           echo "  Rule reloaded. Verify: wp-hardening.sh web-list"
         else
           echo "✗ The edited ruleset does NOT parse — nothing was applied." >&2
-          sed 's/^/    /' /tmp/.nfterr >&2
+          sed 's/^/    /' "$_NFTERR" >&2
           cp "$(ls -1t ${_nft}.bak-* | head -1)" "$_nft"
           echo "  Restored the previous ruleset." >&2
           exit 1
         fi
-        rm -f /tmp/.nfterr ;;
+        rm -f "$_NFTERR" ;;
     esac ;;
 
   admin-rule)

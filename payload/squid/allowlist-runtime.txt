@@ -1,0 +1,44 @@
+# Runtime allowlist — destinations WordPress and WASP genuinely need.
+#
+# A leading dot matches subdomains: .wordpress.org covers api.wordpress.org
+# and downloads.wordpress.org. Without the dot the match is exact.
+#
+# ADD NOTHING HERE WITHOUT KNOWING WHY. Every entry is a route out for a
+# compromised site, and the reason this control is worth having is that the
+# list is short. "A plugin seemed to want it" is how an allowlist becomes a
+# formality.
+#
+# Use discovery to find what a specific site actually needs:
+#   wasp-egress discovery report
+
+# ── WordPress core, plugin and theme updates ─────────────────────────────────
+.wordpress.org
+.w.org
+
+# ── WASP's own operations ────────────────────────────────────────────────────
+# Vulnerability feed
+www.wordfence.com
+# CrowdSec central API and threat intelligence
+.crowdsec.net
+# GeoIP database refresh
+.maxmind.com
+# Alpine package updates
+.alpinelinux.org
+
+# ── Container registries, for image updates ──────────────────────────────────
+# Needed by update.sh; not by WordPress itself. Removing these means image
+# updates must be done from the Proxmox host instead, which is a defensible
+# choice for a locked-down deployment.
+registry-1.docker.io
+auth.docker.io
+production.cloudflare.docker.com
+.docker.io
+ghcr.io
+.githubusercontent.com
+
+# ── NOT included, deliberately ───────────────────────────────────────────────
+# Gravatar, Google Fonts, jsdelivr, unpkg, and the rest of the CDN estate that
+# WordPress themes reach for. They are usually optional, they are a common
+# exfiltration path, and a site that visibly breaks without one is a site
+# whose dependency you have just discovered. Add them if a client's site
+# genuinely needs them, after discovery has shown it does.

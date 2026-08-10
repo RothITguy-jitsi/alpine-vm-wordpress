@@ -129,6 +129,19 @@ ts "Starting WordPress (pulling ~180 MB)"
 # hardcoded string, because the site-address handling below is conditional.
 WP_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);'
 
+# ── Proxy configuration for WordPress ────────────────────────────────────────
+# The FIREWALL enforces the egress boundary; this is what makes well-behaved
+# code take the sanctioned path rather than being dropped at it. Without
+# these defines, core updates and the plugin API fail at the firewall instead
+# of being proxied, and the site looks broken rather than restricted.
+#
+# WP_PROXY_BYPASS_HOSTS keeps loopback and the container networks direct:
+# mariadb, the health checks and wp-cli must not try to reach each other
+# through a web proxy.
+if [ "${EGRESS_PROXY:-0}" = "1" ]; then
+  WP_CONFIG_EXTRA="${WP_CONFIG_EXTRA}"'define("WP_PROXY_HOST","10.89.10.2");define("WP_PROXY_PORT","3128");define("WP_PROXY_BYPASS_HOSTS","localhost,127.0.0.1,10.89.10.0/24,10.89.20.0/24,mariadb");'
+fi
+
 if [ -n "${WP_DOMAIN:-}" ]; then
   _WP_URL="${WP_SCHEME:-http}://${WP_DOMAIN}"
 

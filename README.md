@@ -53,10 +53,19 @@ It's also honest about where it stops. Every control here states its own limits 
 
 - [Why I built this](#why-i-built-this)
 - [What This Is](#what-this-is)
+- [Egress control (Squid)](#egress-control-squid)
+- [Checking the whole VM](#checking-the-whole-vm-at-once)
+- [Alerts](#alerts)
+- [Testing it from the outside](#testing-it-from-the-outside)
+- [Rotating credentials](#rotating-credentials)
+- [Monitoring from outside](#monitoring-from-outside)
+- [If you are locked out](#if-you-are-locked-out)
 - [Knowing it is still there](#knowing-it-is-still-there)
 - [Threat Intelligence](#threat-intelligence-crowdsec-cti)
-- [Incident Playbook](INCIDENT-PLAYBOOK.md)
+- [Incident Playbook](INCIDENT-PLAYBOOK.md), the [support runbook](SUPPORT-RUNBOOK.md)
 - [MSP Runbook](MSP-RUNBOOK.md)
+- [Import design](docs/IMPORT-DESIGN.md)
+- [Fleet management](docs/FLEET.md)
 - [Architecture Diagrams](ARCHITECTURE.md)
 - [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
@@ -109,6 +118,128 @@ Run `install.sh` on a Proxmox VE host as root. It will:
 Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real time via `qm terminal <VMID>`.
 
 ---
+
+## Importing an existing site
+
+### Getting the backup onto the VM
+
+```sh
+wp-import.sh where          # prints these instructions, filled in for your VM
+```
+
+Everything lands in `/var/lib/wasp-import/incoming`, which is group-writable by your admin user so SFTP works without a permissions fight.
+
+**Object storage — easiest if you already set up off-VM backups.** The same credentials work; nothing new to configure:
+
+```sh
+wp-import.sh fetch s3 my-bucket/handover/backup.zip
+```
+
+**SFTP — drag and drop, no command line.** Point FileZilla, WinSCP or Cyberduck at the VM:
+
+| | |
+|---|---|
+| Host | your VM's address |
+| Port | 22 |
+| User | your admin user |
+| Directory | `/var/lib/wasp-import/incoming` |
+
+Same SSH key you use for the terminal — password auth is disabled.
+
+**Direct link** — Dropbox, Drive, WeTransfer:
+
+```sh
+wp-import.sh fetch url 'https://.../backup.zip' [sha256]
+```
+
+Use the *download* link, not the share page. A share page downloads an HTML file that looks like a backup and isn't one — `fetch` detects that and tells you, rather than letting it fail confusingly three steps later.
+
+### Seeing what's in it
+
+```sh
+wp-import.sh list
+wp-import.sh inspect backup.zip
+```
+
+**`inspect` extracts nothing.** It reads the archive index, which is safe; extraction is where path traversal, symlink escapes and decompression bombs happen. Those are checked against the listing, so a hostile archive is refused before any of its contents exist on disk.
+
+It reports:
+
+- **Path traversal, absolute paths, symlinks** → refused outright, no override. Nothing legitimate needs them.
+- **Executable PHP in uploads** → the strongest single indicator the source site was compromised
+- **Duplicator's `installer.php`** → flagged; it's a documented takeover vector and is never executed
+- **mu-plugins** → active on arrival, with no activation step to withhold
+- **Expansion ratio and disk headroom** → checked before anything writes, because running out mid-import leaves a broken site *and* no import
+
+Safe to run on a backup you don't trust — which is rather the point.
+
+### Staging and scanning
+
+```sh
+wp-import.sh extract backup.tar.gz    # to staging, outside the docroot
+wp-import.sh scan                      # files AND the dump
+wp-import.sh staged                    # what's currently staged
+```
+
+Extraction is bounded rather than trusting: hostile members are re-checked (a check that only runs when someone remembers `inspect` isn't a control), ownership and permission bits from the archive are never honoured, disk headroom is verified *before* writing, and **everything extracted has its execute bit removed**. Duplicator's installer is deleted at extraction, not at import — there's no stage where keeping it is useful.
+
+**The dump is scanned as a file, before it is ever loaded.** That's the point of the exercise: loading it and then querying is the same mistake as extracting into the docroot — by the time you look, the thing you were checking for has already happened.
+
+It looks for three things most import tooling ignores:
+
+| Finding | Why it matters |
+|---|---|
+| **Code in autoloaded options** | Runs on every page load, invisible in the filesystem, survives any file-level clean |
+| **Suspicious scheduled tasks** | Re-creates files after you clean them — this is why malware appears to "come back" |
+| **Administrator rows** | Persistence that outlives deleting the file that created the account |
+
+Patterns are quote-agnostic: `mysqldump` emits single quotes, phpMyAdmin and several backup plugins emit double. A pattern matching one style silently passes dumps produced by the other.
+
+### Importing
+
+```sh
+wp-import.sh apply [id] [--accept-findings] [--force]
+```
+
+Gated on the scan. Never scanned → refuses. CRITICAL → refuses without `--force`. HIGH → refuses without `--accept-findings`. Every override is recorded with who made it.
+
+Refusing outright would be wrong — people import compromised sites *deliberately*, to clean them. Proceeding silently would defeat the tool. So the gate is graded and the decision is written down.
+
+**A backup of the current database is taken first, mandatorily**, and the import refuses if that fails. An import without a way back is a replacement.
+
+**What is deliberately not imported:**
+
+| | Why |
+|---|---|
+| WordPress core | Comes from the pinned image — a digest-verified copy already exists |
+| `wp-config.php` | Old credentials, old salts, often security-weakening defines |
+| `.htaccess` | Handler injection lives here |
+| mu-plugins | **Active on arrival** — no activation step to withhold |
+| Executable files in uploads | Quarantined as evidence, not deleted |
+
+**Then it re-hardens**, because an import undoes hardening: `home`/`siteurl` rewritten for this deployment, salts regenerated (invalidating every session the source site had), scheduled tasks cleared, and administrators listed for review — any you don't recognise is a backdoor that survives deleting the file that created it.
+
+**One trap handled explicitly.** This VM uses a randomised table prefix, so an imported dump needs rewriting. Rewriting *table names alone* is the classic "changed the prefix and lost admin access" — `wp_capabilities`, `wp_user_level` and `wp_user_roles` are stored as meta **values** and carry the prefix too. Miss them and every user imports with no capabilities, presented as a successful import. The rewrite is also quote-agnostic, because `mysqldump` emits single quotes and phpMyAdmin emits double.
+
+**Design and remaining stages: [docs/IMPORT-DESIGN.md](docs/IMPORT-DESIGN.md).** The central rule, and why the design came before the code: nothing from the archive is reachable by the web server, or executed by anything, until it has been scanned. The obvious implementation — extract into the document root, then scan — leaves a webshell live and serving for as long as the scan takes, on a site you're importing *because* you suspect it's compromised.
+
+## Managing a fleet
+
+You do not need to build a fleet manager, and **[docs/FLEET.md](docs/FLEET.md)** explains why — it is three separate problems solved by three existing tools, not one thing to build.
+
+The short version: **[Pulse](https://github.com/rcourtman/Pulse)** on the Proxmox host gives you a single visual dashboard of every WASP VM — CPU, RAM, disk, up/down, links to each console — deployed as one LXC that auto-discovers guests via the Proxmox API. That answers "is the VM alive" for the whole fleet, free, with nothing installed on the VMs themselves.
+
+What Pulse cannot see is what WASP guarantees *inside* the VM — backups encrypting, CrowdSec banning, egress holding. That signal already exists per VM:
+
+```sh
+validate-wordpress.sh --check          # exit 0/1/2, one line — for any monitor
+validate-wordpress.sh --check --prom   # Prometheus text, for Grafana at scale
+wp-notify.sh --heartbeat               # absence = the VM is gone
+```
+
+Feed those to a hosted checker (healthchecks.io, Uptime Kuma) with one check per VM and you have complete fleet monitoring today, with no central server to run or secure. A small read-only aggregator VM makes sense later *if* that gets noisy — but only then, and it should hold status, never the fleet's credentials.
+
+**The one caution:** WordPress-agency tools like MainWP centralise plugin updates and client reports, but they work by holding a key that controls every connected site — a single point of compromise for the whole portfolio, in direct tension with WASP's design. If you adopt one, protect its dashboard harder than any single client site. The monitoring layers above avoid this entirely because they observe rather than control, and that is the principle to keep: **monitor with tools that watch, not tools that hold the keys.**
 
 ## Running this for clients
 
@@ -164,6 +295,162 @@ So this is **deliberately not wired into ban notifications.** A WordPress site b
 **Check `false_positives` before acting.** CTI flags crawlers, monitoring services and CDNs. Permanently banning Googlebot is a self-inflicted outage.
 
 CTI describes what an address does **globally**. For what it did to *your* site, `wp-forensics.sh timeline` is the tool.
+
+## Egress control (Squid)
+
+This is the **destination** boundary for WordPress's web traffic — the fine-grained layer. There is also a coarser VM-wide [outbound firewall](#outbound-firewall-optional-host-service-layer) that restricts *ports* for the host's own services; the two are complementary layers, not alternatives. This section is the one that matters most, because 443 is open at the port level either way, and 443 is where exfiltration goes — so filtering by destination is what actually contains a compromised WordPress.
+
+```sh
+wasp-egress status        # mode, allowlist, recent denials
+wasp-egress test          # PROVE the boundary holds
+wasp-egress discovery     # what got blocked, for classification
+wasp-egress allow <domain>
+wasp-egress maintenance enable --duration 90 --reason "..." --host api.example.com
+```
+
+### Two controls, and both are load-bearing
+
+**Squid decides where traffic may go** — by destination name, read from the plaintext `CONNECT host:443` line. No TLS interception, no certificate authority on the VM, nothing decrypted.
+
+**nftables decides WordPress cannot go round it.** This is the half that matters. WordPress's `WP_PROXY_HOST` is honoured only by code that chooses to honour it — a plugin calling `fsockopen()`, or `curl` without `CURLOPT_PROXY`, ignores it entirely. Without the firewall rule, the proxy filters only well-behaved traffic, which is not the traffic anyone is worried about.
+
+| Scenario | Outcome |
+|---|---|
+| Core update to an allowlisted host | allowed |
+| Plugin calls an unlisted API | denied by Squid, logged |
+| Plugin uses `fsockopen()` direct | **denied by nftables** |
+| SSRF to `169.254.169.254` | denied — hard deny, matched by IP |
+| SSRF to a bare IP address | denied — IP literals are refused |
+| `CONNECT` to an allowlisted host on port 22 | denied — tunnels aren't HTTPS |
+| Squid stopped | **all web egress denied** — fails closed |
+| WordPress proxy config removed | **still denied** — the firewall enforces it |
+
+That last row is the test that distinguishes a boundary from a convention, which is why `wasp-egress test` checks it explicitly.
+
+### The cost is real
+
+Plugins calling unlisted services **will break** — payment gateways, mapping, fonts, licence checks. They break visibly and the log names what was blocked, but they break.
+
+```sh
+wasp-egress discovery     # what this site actually tried to reach
+```
+
+Denied destinations are **never promoted automatically**. Classify each as REQUIRED, MAINTENANCE, UNNECESSARY or SUSPICIOUS — a destination you cannot account for is a finding, not an allowlist entry. An allowlist grown by accepting whatever asked is not an allowlist.
+
+### Maintenance windows, not an open mode
+
+There is no permanent "allow everything". A window takes a reason of at least ten characters, is capped at 120 minutes, records who opened it, emails the fact, and **closes itself**. Expiry is checked on every command, so it can't outlive its duration because nobody ran a timer.
+
+### Keeping it current
+
+Squid is a pinned, digest-verified image on the same footing as WordPress, MariaDB and CrowdSec — not an `apk add` at container start, which could not be version-checked. It updates through the same path:
+
+```sh
+update.sh squid           # digest check, CVE scan, guided update, rollback on failure
+update.sh all             # includes Squid when egress is enabled
+```
+
+Canonical maintains the image and backports Squid CVE fixes into it, so a filtering proxy does not silently age on the one axis — vulnerabilities — that its whole purpose depends on.
+
+### What it does not do
+
+Filters **where** traffic goes, not what it carries. An approved destination that is itself compromised remains reachable, and data can still leave through an allowed host. That's the boundary of this control, and TLS interception — which would change it — is deliberately not implemented.
+
+## Checking the whole VM at once
+
+```sh
+wasp-testreport.sh                    # ~14 sections, one pass
+wasp-testreport.sh --all you@example.com
+```
+
+`validate-wordpress.sh` answers "is anything broken" in about fifty checks, each with the command to fix it. `wasp-testreport.sh` is the wider pass: baseline, configuration as installed, firewall counters, client-IP handling, GeoIP, CrowdSec, login guard, mail, vulnerability scanning, malware scanning, integrity, backups, self-test and scheduling — captured to one file you can read or send on.
+
+Secrets are reduced to lengths rather than values. Skim it before sending anyway; if something slipped through a redaction, that's a bug worth reporting.
+
+Add `--with-mail` to actually deliver a test message and `--with-restore` to run the full restore proof, which starts a throwaway database and takes a few minutes.
+
+## Alerts
+
+```sh
+wp-notify.sh --status
+wp-notify.sh --test
+```
+
+`wp-notify.sh` sends alerts **host-side via msmtp**, deliberately not through WordPress. The alerts that matter most — the site is down, the database will not start, a backup failed — are exactly the situations where WordPress cannot send anything. A notification system that depends on the thing it reports on is not one.
+
+Identical alerts are deduplicated over 24 hours so a recurring fault doesn't become noise, with two exceptions that always send: backup failure and self-test failure. Both are silent-until-it-matters problems, and suppressing a repeat is how they stay unnoticed for months.
+
+`wp-notify.sh` sends governance notices to a separate address, warned about at install if it matches the admin address — a record only the decision-maker receives is a diary, not oversight.
+
+## Testing it from the outside
+
+`tools/wasp-pentest.sh` validates the perimeter from a Kali box — or any Linux machine — by confirming WASP's controls actually respond as claimed from where an attacker would stand. The VM's own tooling checks that a control is *configured*; this checks that it has an *effect*.
+
+```sh
+./wasp-pentest.sh https://your-site.example
+./wasp-pentest.sh --ip 192.168.1.100 https://your-site.example   # also tests WEB_CIDR
+```
+
+**Where you run it from is the point.** WASP restricts the admin surface by source address, so from an allow-listed address wp-admin will answer (correct → WARN), and from anywhere else it should be refused (the test that matters → PASS). Run it from both; the difference between the two runs is the access control working.
+
+You can also trigger it from the VM's own report, though the report points you off-box by default:
+
+```sh
+wasp-testreport.sh --perimeter https://your-site.example
+```
+
+That adds a perimeter section to the full report. Because the VM is on the LAN and likely allow-listed, it explains that the meaningful run is still from a machine that is *not* — and gives you the two commands to do it — rather than pretending an on-box run tests the access control. The harness is deliberately not installed on the VM, so a compromised box doesn't hand an attacker a ready-made scanner.
+
+It is a **validation** tool, not an attack tool — ordinary HTTP requests, no exploit code, no wordlists, no flood, every request tagged in the target's logs. It asks you to type `I OWN THIS` first, because testing a system you don't own is a criminal offence in most jurisdictions. A clean run means the perimeter controls are visible and working; it does not mean the site is invulnerable, which no external test can establish. Full detail in [tools/PENTEST.md](tools/PENTEST.md).
+
+## Rotating credentials
+
+The incident playbook says to rotate everything after a compromise. This does it, across every place each secret is stored — a database password lives in the container environment *and* the MariaDB grant, and missing one copy means either a broken site or a credential the attacker still holds.
+
+```sh
+wp-rotate-secrets.sh status           # what can be rotated, and the right order
+wp-rotate-secrets.sh salts            # instant, logs everyone out (stolen cookies die)
+wp-rotate-secrets.sh db               # kept in sync across env + MariaDB, verified, rolls back on failure
+wp-rotate-secrets.sh smtp '<new>'     # after you change it at the relay
+wp-rotate-secrets.sh all              # salts + db
+```
+
+`wp-rotate-secrets.sh` changes MariaDB first, then the environment, then restarts WordPress — an order that keeps the site serving throughout, because MySQL doesn't drop the live connection when the password changes. It verifies the new password authenticates *before* committing and restores the old one if it doesn't.
+
+**It will not rotate the age backup key**, and says so loudly: every existing backup was encrypted to the current key, so a new one makes your whole history unreadable. That needs a re-encryption workflow, not a rotation.
+
+## Monitoring from outside
+
+```sh
+validate-wordpress.sh --check
+# OK - containers up, db answering, disk 27%, backup fresh   (exit 0)
+```
+
+One line, standard exit codes — 0 healthy, 1 degraded, 2 critical — so Nagios, Zabbix, Checkmk or a plain cron poller can watch the VM without parsing anything. It checks the four things worth paging on: containers up, database answering, disk under 90%, newest backup under 26 hours. The full report is for humans; this is for a machine that only needs a number.
+
+Pair it with the [heartbeat](#knowing-it-is-still-there) — this tells an external monitor the VM is *unhealthy*; the heartbeat's absence tells it the VM is *gone*. Different failures, both worth catching.
+
+## If you are locked out
+
+The two commands most worth knowing before you need them. Both keep a
+timestamped backup and validate before applying.
+
+```sh
+wp-hardening.sh web-list                    # who may reach ports 80/443
+wp-hardening.sh web-allow 192.168.1.50      # add a direct path for yourself
+wp-hardening.sh admin-rule show             # the wp-admin authorization rule
+wp-hardening.sh admin-rule simple           # temporarily relax it to isolate a fault
+```
+
+**`web-allow` is the one that solves the common case.** Restricting 80/443 to the reverse proxy alone means every admin request depends on the proxy passing `X-Forwarded-For` correctly. When that breaks you get a **403 on a site that otherwise looks completely healthy** — and no obvious cause, because nothing is wrong with WordPress.
+
+Allowing your own address to reach the VM **directly** removes that dependency entirely: a direct request has no proxy in the path, so there is nothing to substitute and nothing to get wrong. External visitors still have to come through the proxy, because their addresses are not on the list.
+
+It edits both the input and forward rules — editing one leaves them disagreeing, and the forward rule is the one that actually decides for a published container port. It refuses to remove the proxy's own address, since that takes the site offline for everyone rather than just you.
+
+**`admin-rule simple`** temporarily drops the fail-closed `Require not ip <proxy>` clause, to establish whether that rule is the cause of a 403. It says plainly that it restores fail-**open** behaviour and is for isolating a fault, not for living in. `admin-rule strict` puts it back.
+
+Console access via `qm terminal <VMID>` on the Proxmox host always works — root SSH is disabled, the console is not, and that is deliberate.
 
 ## Knowing it is still there
 
@@ -1127,9 +1414,19 @@ Nothing here detects a backdoor written specifically for your site. Clean output
 
 ---
 
-## Outbound Firewall (optional)
+## Outbound Firewall (optional, host-service layer)
 
-By default this VM may connect **out** to anything — only the Proxmox management ports are blocked. At install you can opt into restricting egress to the ports the system actually needs:
+WASP has **two independent egress layers**, and it's worth being clear about which does what, because they operate at different levels:
+
+| Layer | Scope | Controls | Covered in |
+|---|---|---|---|
+| **Squid egress proxy** | WordPress container's web traffic | *Destinations* — which hosts WordPress may reach, by name | [Egress control (Squid)](#egress-control-squid) |
+| **Outbound firewall** (this section) | The whole VM's non-HTTP services | *Ports* — which ports any VM service may use | here |
+| Management-plane block | Proxmox admin ports | Always blocked, separately | always on |
+
+When the Squid proxy is enabled (`EGRESS_PROXY=1`), **it** is the authoritative boundary for WordPress web egress — by destination, not just port — and the firewall rules restrict WordPress to reaching Squid and the internal resolver only. This section's port-level control is the coarser, VM-wide layer for everything that *isn't* WordPress web traffic: the host's own `apk` updates, NTP, DHCP, outbound mail. The two are complementary, not alternatives — think of Squid as the fine-grained control for the container that matters most, and this as the blunt backstop for the rest of the VM.
+
+By default the VM may connect **out** to anything on non-management ports. At install you can opt into restricting that host-service egress to the ports the system actually needs:
 
 | Port | Why it must stay open |
 |---|---|

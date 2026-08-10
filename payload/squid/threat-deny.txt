@@ -1,0 +1,6 @@
+# Threat blocklist. Evaluated BEFORE the allowlist, so a collision resolves as
+# deny — an allowlist entry cannot re-enable something flagged here.
+#
+# Empty by default. Populate from a feed you trust and can explain the
+# provenance of; an unattributed blocklist is a list of domains someone else
+# decided you should not reach.

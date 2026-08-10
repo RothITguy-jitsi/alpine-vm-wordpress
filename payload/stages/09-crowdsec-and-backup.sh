@@ -11,6 +11,82 @@ mkdir -p /home/wpuser/wp/logs; chown 33:33 /home/wpuser/wp/logs 2>/dev/null || t
 # Ensure /var/log/messages exists before CrowdSec bind-mounts it.
 touch /var/log/messages 2>/dev/null || true
 
+# ── Egress proxy ─────────────────────────────────────────────────────────────
+if [ "${EGRESS_PROXY:-0}" = "1" ]; then
+  ts "Starting the egress proxy"
+  mkdir -p /opt/squid/config /opt/squid/logs
+  for _f in squid.conf hard-deny.txt allowlist-runtime.txt threat-deny.txt allowlist-maintenance.txt; do
+    [ -f "${PAYLOAD_DIR}/squid/${_f}" ] && install -m 0644 "${PAYLOAD_DIR}/squid/${_f}" "/opt/squid/config/${_f}"
+  done
+  touch /opt/squid/config/allowlist-maintenance.txt
+  chmod 0644 /opt/squid/config/*.txt
+  chown -R 100:101 /opt/squid/logs 2>/dev/null || true
+
+  # A fixed address, because the firewall rule names it. A proxy whose address
+  # moves is a firewall rule that stops matching, and the failure is silent:
+  # egress simply starts being denied for the wrong reason.
+  # ── Squid image: a real, pinnable image, not `apk add` at container start ──
+  # Canonical's ubuntu/squid is the maintained option and, crucially, its
+  # DIGEST represents a known Squid version -- which the previous
+  # "alpine + apk add squid" approach could not, because the binary was
+  # fetched at container start and was therefore whatever the repo served that
+  # minute. That made Squid the one container update.sh could not check, scan
+  # or pin. It now follows the same digest model as WordPress, MariaDB and
+  # CrowdSec, and pinned.env carries SQUID_DIGEST the same way.
+  SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:6.13-24.04_stable}"
+  SQUID_RUN_IMAGE="$SQUID_IMAGE"
+  if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
+    [ -n "${SQUID_DIGEST:-}" ] && SQUID_RUN_IMAGE="docker.io/ubuntu/squid@${SQUID_DIGEST}"
+  fi
+
+  PRUN run -d --name squid --restart=always \
+    --network wp-front --ip 10.89.10.2 \
+    --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges \
+    --memory 256m --pids-limit 100 \
+    -v /opt/squid/config/squid.conf:/etc/squid/squid.conf:ro \
+    -v /opt/squid/config/hard-deny.txt:/etc/squid/hard-deny.txt:ro \
+    -v /opt/squid/config/allowlist-runtime.txt:/etc/squid/allowlist-runtime.txt:ro \
+    -v /opt/squid/config/allowlist-maintenance.txt:/etc/squid/allowlist-maintenance.txt:ro \
+    -v /opt/squid/config/threat-deny.txt:/etc/squid/threat-deny.txt:ro \
+    -v /opt/squid/logs:/var/log/squid:rw \
+    "${SQUID_RUN_IMAGE}" \
+    >/dev/null 2>&1 && ok "Squid running on 10.89.10.2:3128" \
+    || _squid_start_failed=1
+  if [ "${_squid_start_failed:-0}" = "1" ]; then
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      err "Squid did not start and EGRESS_PROXY=1 under DEPLOYMENT_PROFILE=production. Egress fails closed, so ALL WordPress web access (updates, plugin/theme APIs, licence checks) is broken -- completing the install would ship a site that cannot reach the internet at all. Refusing. Check: podman logs squid. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where a dead proxy is acceptable."
+    fi
+    warn "Squid failed to start — WordPress web egress will be denied (fails closed)"
+  fi
+
+  # Verify it parses before declaring success. A proxy that started but whose
+  # policy was rejected is worse than one that did not start: the firewall
+  # sends traffic to it and it does not filter.
+  sleep 3
+  # Report the Squid version for the record. CVE-2025-62168 (CVSS 10.0,
+  # credential disclosure via error pages) is the one that needed a code fix,
+  # not just the `email_err_data off` policy workaround. Canonical BACKPORTS
+  # that fix into the 6.x line (fixed in the 6.13-1ubuntu1.2 package), so the
+  # right check here is not "is this >= 7.2" -- it is "is the image current",
+  # which the digest pin plus `update.sh squid` keeps true. The policy
+  # workaround remains as defence in depth regardless of package version.
+  _sqv=$(PRUN exec squid squid -v 2>/dev/null | sed -n 's/.*Version \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$_sqv" ] && ok "  Squid ${_sqv} (Canonical image; keep current via: update.sh squid)"
+  if PRUN exec squid squid -k parse >/dev/null 2>&1; then
+    ok "  Egress policy parsed and loaded"
+  else
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      err "Squid started but rejected its own policy (squid -k parse failed) under DEPLOYMENT_PROFILE=production. A running proxy with a broken policy is worse than one that did not start: the firewall directs traffic to it and it does not filter. Refusing to complete the install. Check: podman logs squid. Retry once the policy parses, or re-run under DEPLOYMENT_PROFILE=standard for a lab install."
+    fi
+    warn "  Squid rejected the policy. Egress is denied until this is fixed:"
+    warn "    podman logs squid"
+  fi
+  ok "  Prove the boundary holds:  wasp-egress test"
+else
+  ok "Egress proxy not enabled (WordPress may reach any host on permitted ports)"
+fi
+
 install -m 0644 "${PAYLOAD_DIR}/crowdsec/acquis.yaml" /opt/crowdsec/acquis.yaml
 # Custom parser + scenario for WordPress login failures. CrowdSec sees Apache
 # access logs already, but a failed and a successful login are both a POST to

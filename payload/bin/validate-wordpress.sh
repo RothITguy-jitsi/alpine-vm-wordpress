@@ -84,6 +84,54 @@ done
 # are 0600 root-only, so this depends on the auto-doas elevation at the top.
 [ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
+# --- Machine-readable health for external monitoring (Nagios/Zabbix/cron) ---
+# --check exits 0 (healthy), 1 (degraded), or 2 (critical) after one line, so a
+# poller that only needs a number never parses the human report below. Kept
+# deliberately cheap -- containers up, database answering, disk < 90%, newest
+# backup < 26h -- because those are the conditions worth paging on; the rest of
+# this script is diagnosis, not alerting, and mixing the two makes a check too
+# chatty to alert on. See docs/FLEET.md (Layer 2) and SUPPORT-RUNBOOK.md.
+if [ "${1:-}" = "--check" ]; then
+  _p=0; _msg=""; _age=9999
+  for c in wordpress mariadb; do
+    podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c" || { _p=2; _msg="${_msg}${c}-down "; }
+  done
+  podman exec mariadb sh -c 'mariadb-admin ping --silent -uroot -p"$MARIADB_ROOT_PASSWORD"' >/dev/null 2>&1 \
+    || { _p=2; _msg="${_msg}db-unreachable "; }
+  _disk=$(df -P / | awk 'NR==2{gsub("%","",$5);print $5}')
+  [ "${_disk:-0}" -ge 90 ] && { [ "$_p" -lt 2 ] && _p=2; _msg="${_msg}disk-${_disk}% "; }
+  _newest=$(ls -t /root/wp-db-backups/*.sql.gz 2>/dev/null | head -1)
+  if [ -n "$_newest" ]; then
+    _age=$(( ( $(date +%s) - $(stat -c %Y "$_newest") ) / 3600 ))
+    [ "$_age" -ge 26 ] && { [ "$_p" -lt 1 ] && _p=1; _msg="${_msg}backup-${_age}h-old "; }
+  else
+    [ "$_p" -lt 1 ] && _p=1; _msg="${_msg}no-backup "
+  fi
+  # An unverified install is a governance finding that should never be silent:
+  # surface it in the machine-readable health so a fleet monitor flags it.
+  [ -f /etc/wp-install/UNVERIFIED ] && { [ "$_p" -lt 1 ] && _p=1; _msg="${_msg}UNVERIFIED-build "; }
+
+  # --check --prom : same signal as Prometheus text for a textfile collector or
+  # scrape endpoint (docs/FLEET.md Layer C). Stable metric names so a Grafana
+  # panel built against them keeps working.
+  if [ "${2:-}" = "--prom" ]; then
+    printf '# HELP wasp_health Overall WASP health (0 ok 1 warn 2 critical)\n# TYPE wasp_health gauge\nwasp_health %s\n' "$_p"
+    printf '# HELP wasp_disk_percent Root filesystem usage percent\n# TYPE wasp_disk_percent gauge\nwasp_disk_percent %s\n' "${_disk:-0}"
+    printf '# HELP wasp_backup_age_hours Age of the newest local backup\n# TYPE wasp_backup_age_hours gauge\nwasp_backup_age_hours %s\n' "${_age:-9999}"
+    for c in wordpress mariadb crowdsec; do
+      _u=0; podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c" && _u=1
+      printf 'wasp_container_up{name="%s"} %s\n' "$c" "$_u"
+    done
+    exit "$_p"
+  fi
+  case "$_p" in
+    0) echo "OK - containers up, db answering, disk ${_disk}%, backup fresh" ;;
+    1) echo "WARNING - ${_msg}" ;;
+    2) echo "CRITICAL - ${_msg}" ;;
+  esac
+  exit "$_p"
+fi
+
 PASS=0; FAIL=0; WARN=0
 REMEDIES=""
 CUR_SECTION=""

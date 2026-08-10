@@ -1,0 +1,34 @@
+# Destinations that are never permitted, regardless of any allowlist.
+#
+# Maintained as ONE artifact and referenced by Squid, rather than copied into
+# several configurations that then drift. A private range that is denied in
+# the firewall and permitted in the proxy is not denied.
+#
+# Listed as addresses, not names: the property has to survive a request made
+# straight to the IP, which is precisely what an SSRF payload does.
+
+# Cloud metadata — the single highest-value SSRF target
+169.254.169.254/32
+169.254.170.2/32
+
+# RFC 1918 and friends
+0.0.0.0/8
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.0.0.0/24
+192.0.2.0/24
+192.168.0.0/16
+198.18.0.0/15
+198.51.100.0/24
+203.0.113.0/24
+224.0.0.0/4
+240.0.0.0/4
+
+# IPv6
+::1/128
+fc00::/7
+fe80::/10
+ff00::/8

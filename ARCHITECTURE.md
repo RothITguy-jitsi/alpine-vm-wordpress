@@ -1,8 +1,9 @@
 # WASP — Architecture
 
-Diagrams render natively on GitHub. Six views, because one diagram covering all of this would be unreadable:
-what exists, what a request passes through, where trust comes from, how it
-gets built, how it changes safely, and what maintains it afterwards.
+Diagrams render natively on GitHub. Eight views, because one diagram covering all of this would be unreadable:
+what exists, what a request passes through, where trust comes from, what may
+leave, how it gets built, how it changes safely, how another site's content gets
+in, and what maintains it afterwards.
 
 ---
 
@@ -34,6 +35,7 @@ graph TB
             DB["MariaDB 11.4<br/>cap-drop ALL + 5 caps"]
         end
 
+        SQUID["Squid 10.89.10.2<br/>egress proxy, optional<br/>destination allowlist"]
         CS["CrowdSec<br/>--network host, --read-only<br/>detection engine"]
         BOUNCER["cs-firewall-bouncer"]
 
@@ -49,7 +51,9 @@ graph TB
     end
 
     INTERNET(["Internet"]) -->|":80 / :443 via proxy"| NFT
-    WP -->|"updates, plugin API, SMTP"| INTERNET
+    WP -->|":3128 when egress proxy is on"| SQUID
+    SQUID -->|"approved destinations only"| INTERNET
+    WP -->|"SMTP, DNS, NTP — direct"| INTERNET
     OFFSITE -->|"scp / rsync / rclone"| REMOTE[("Off-VM storage<br/>append-only recommended")]
     DB -.->|"no path exists"| INTERNET
 
@@ -60,6 +64,7 @@ graph TB
     style DBNET fill:#111827,stroke:#ef4444,color:#fff
     style NFT fill:#1f2937,stroke:#22c55e,color:#fff
     style CS fill:#1f2937,stroke:#22c55e,color:#fff
+    style SQUID fill:#1f2937,stroke:#22c55e,color:#fff
     style INTERNET fill:#374151,stroke:#9ca3af,color:#fff
 ```
 
@@ -152,7 +157,71 @@ edit it. Neither is a root of trust; both make tampering evident.
 
 ---
 
-## 4. Install flow
+## 4. Egress boundary
+
+The ingress side of this system is deliberately public. The egress side is
+not. Two independent controls, and the second is the one that makes the first
+mean anything.
+
+```mermaid
+flowchart LR
+    subgraph FRONT["wp-front 10.89.10.0/24"]
+        WP["WordPress<br/>WP_PROXY_HOST set"]
+        SQ["Squid 10.89.10.2:3128<br/>no TLS interception"]
+    end
+
+    DB[("MariaDB<br/>wp-db, internal")]
+
+    WP -->|":3128 only"| SQ
+    WP -.->|"blocked by nftables"| X1["direct :80/:443"]
+    WP -.->|"blocked — fsockopen, curl<br/>without CURLOPT_PROXY"| X2["raw socket"]
+    DB -.->|"no route exists"| X3["anything outbound"]
+
+    SQ --> P1{"source = wp-front?"}
+    P1 --> P2{"method + port allowed?"}
+    P2 --> P3{"hard deny?<br/>RFC1918, metadata by IP"}
+    P3 --> P4{"IP literal?"}
+    P4 --> P5{"on the threat list?"}
+    P5 --> P6{"on the runtime allowlist?"}
+    P6 --> P7{"maintenance window open?"}
+    P7 -->|"no"| DENY["deny all<br/>logged for discovery"]
+    P6 -->|"yes"| NET(["approved destination"])
+    P7 -->|"yes"| NET
+
+    style X1 fill:#1f2937,stroke:#ef4444,color:#fff
+    style X2 fill:#1f2937,stroke:#ef4444,color:#fff
+    style X3 fill:#1f2937,stroke:#ef4444,color:#fff
+    style DENY fill:#1f2937,stroke:#f59e0b,color:#fff
+    style NET fill:#1f2937,stroke:#22c55e,color:#fff
+    style SQ fill:#374151,stroke:#22c55e,color:#fff
+```
+
+**Why the order is not cosmetic.** Every deny precedes every allow. A hard
+deny placed after the allowlist could be overridden by a wildcard entry —
+which is how a cloud metadata endpoint becomes reachable because somebody
+allowlisted too broadly. Metadata is denied by **address**, not only by name,
+because the property has to survive a request made straight to
+`169.254.169.254`, which is exactly what an SSRF payload does.
+
+**Why HTTPS can be filtered without decrypting it.** A client opening an
+HTTPS connection through a proxy sends `CONNECT host:443` in plaintext before
+the TLS handshake. `dstdomain` matches on that. No SSL Bump, no certificate
+authority on the VM, and no ability to read the traffic — only to see where it
+is going.
+
+**Why the firewall half is load-bearing.** `WP_PROXY_HOST` is honoured only by
+code that chooses to honour it. A plugin calling `fsockopen()`, or `curl`
+without `CURLOPT_PROXY`, ignores it entirely. Without the nftables rule the
+proxy filters well-behaved traffic only — which is not the traffic anyone is
+worried about. `wasp-egress test` proves this by removing WordPress's proxy
+configuration and confirming egress *still* fails.
+
+**What it does not do.** This limits *where* traffic goes, not what it
+carries. An approved destination that is itself compromised remains reachable.
+
+---
+
+## 5. Install flow
 
 Two phases, split by a reboot: the kernel switch has to happen before
 containers exist.
@@ -195,7 +264,7 @@ flowchart LR
 
 ---
 
-## 5. Update: candidate, cutover, rollback
+## 6. Update: candidate, cutover, rollback
 
 Production keeps serving throughout the risky part. The old container is not
 destroyed until the new one has proven itself — it *is* the rollback artifact.
@@ -235,7 +304,89 @@ flowchart TD
 
 ---
 
-## 6. Day-2 tooling
+## 7. Site import
+
+The ordering *is* the security property. Every stage exists to keep untrusted
+content away from anything that executes it until it has been examined.
+
+```mermaid
+flowchart TD
+    SRC(["client backup<br/>UpdraftPlus · Duplicator · manual"])
+    SRC -->|"rclone / SFTP / URL"| IN["inbox<br/>/var/lib/wasp-import/incoming"]
+
+    IN --> I1{"inspect<br/>reads the INDEX only"}
+    I1 -->|"../ · absolute path · symlink"| R1["REFUSE<br/>no override"]
+    I1 -->|"clean index"| EX["extract to staging<br/>outside the docroot<br/>execute bit removed<br/>Duplicator installer deleted"]
+
+    EX --> SC1["scan files"]
+    EX --> SC2["scan the DUMP<br/>as a file, before loading"]
+    SC2 --> D1["autoloaded options containing code"]
+    SC2 --> D2["scheduled tasks — re-infect after cleaning"]
+    SC2 --> D3["administrator rows"]
+
+    SC1 --> G{"gate"}
+    SC2 --> G
+    G -->|"CRITICAL"| R2["REFUSE<br/>--force, recorded"]
+    G -->|"HIGH"| R3["--accept-findings, recorded"]
+    G -->|"clean"| BK["back up the CURRENT site<br/>mandatory — refuse if it fails"]
+
+    BK --> NM["normalise"]
+    NM --> N1["core → pinned image"]
+    NM --> N2["wp-config · .htaccess → this VM's"]
+    NM --> N3["mu-plugins → quarantined"]
+    NM --> N4["executable uploads → quarantined as evidence"]
+
+    NM --> IMP["import content, then the database<br/>table prefix rewritten, capability keys included"]
+    IMP --> RH["re-harden"]
+    RH --> H1["siteurl · home"]
+    RH --> H2["salts regenerated — all sessions void"]
+    RH --> H3["scheduled tasks cleared"]
+    RH --> H4["administrators listed for review"]
+    RH --> V(["verify: malware scan · vulns · validate"])
+
+    style R1 fill:#1f2937,stroke:#ef4444,color:#fff
+    style R2 fill:#1f2937,stroke:#ef4444,color:#fff
+    style EX fill:#374151,stroke:#f59e0b,color:#fff
+    style SC2 fill:#1f2937,stroke:#22c55e,color:#fff
+    style BK fill:#1f2937,stroke:#22c55e,color:#fff
+    style H2 fill:#1f2937,stroke:#22c55e,color:#fff
+    style V fill:#1f2937,stroke:#22c55e,color:#fff
+```
+
+**Nothing is reachable by the web server, or executed by anything, until it
+has been scanned.** The natural implementation — extract into the document
+root, then scan — leaves a webshell live and serving for as long as the scan
+takes, on a site being imported *because* it is suspected compromised.
+
+**The dump is scanned as a file.** Loading it and then querying it is the same
+mistake in a different place: by the time you look, the thing you were
+checking for has already happened.
+
+**Normalisation discards rather than inspects**, wherever a good replacement
+exists. Core comes from the digest-pinned image, so comparing is strictly
+worse than replacing. `wp-config.php` carries the source site's credentials
+and salts. mu-plugins are active on arrival with no activation step to
+withhold. Each is thrown away rather than examined, which removes the entire
+question.
+
+**The gate is graded, not binary.** Refusing outright would be useless —
+people import compromised sites deliberately, in order to clean them — and
+proceeding silently would defeat the tool. So findings are surfaced, overrides
+are explicit, and every one is recorded with who made it.
+
+**Re-hardening is not optional.** An import carries the source site's URLs,
+users, salts and scheduled tasks. Regenerating salts invalidates every session
+the previous operator had, which is the point.
+
+One trap handled explicitly: this VM uses a randomised table prefix, and
+rewriting *table names alone* is the classic "changed the prefix and lost
+admin access" — `wp_capabilities`, `wp_user_level` and `wp_user_roles` are
+stored as meta **values** and carry the prefix too. Miss them and every user
+imports with no capabilities, presented as a successful import.
+
+---
+
+## 8. Day-2 tooling
 
 Each tool covers a layer the others do not. The split matters: `update.sh`
 and Trivy see the **container image**, while plugins and themes live in a
@@ -275,6 +426,26 @@ graph LR
     T --> E["wp-mail.sh"]
     E --> E1["status, test, setup, doctor, log"]
 
+    T --> EG["wasp-egress.sh"]
+    EG --> EG1["destination allowlist, not just ports"]
+    EG --> EG2["test — proves the firewall enforces it"]
+    EG --> EG3["discovery — what got blocked, classified by hand"]
+    EG --> EG4["maintenance windows that close themselves"]
+
+    T --> IM["wp-import.sh"]
+    IM --> IM1["inspect — reads the index, extracts nothing"]
+    IM --> IM2["extract — bounded, non-executable staging"]
+    IM --> IM3["scan — dump checked BEFORE it is loaded"]
+    IM --> IM4["apply — gated, quarantines rather than installs"]
+
+    T --> FO["wp-forensics.sh"]
+    FO --> FO1["timeline — when did it appear, what else happened"]
+    FO --> FO2["entry-class — uploads / plugin / admin / core"]
+    FO --> FO3["since-backup · admins"]
+
+    T --> TR["wasp-testreport.sh"]
+    TR --> TR1["one report to read or send on"]
+
     T --> B["wp-db-backup.sh"]
     B --> B1["verified dump before rotation"]
     B --> B2["pushes off-VM after each verified backup"]
@@ -294,12 +465,16 @@ graph LR
     T --> N["wp-notify.sh"]
     N --> N1["host-side msmtp — works when WordPress is down"]
     N --> N2["deduplicated by content, 24h"]
+    N --> N3["heartbeat — the only check that detects the VM being GONE"]
 
     style T fill:#1f2937,stroke:#22c55e,color:#fff
     style M1 fill:#1f2937,stroke:#22c55e,color:#fff
     style P2 fill:#1f2937,stroke:#22c55e,color:#fff
     style S1 fill:#1f2937,stroke:#22c55e,color:#fff
     style O2 fill:#1f2937,stroke:#22c55e,color:#fff
+    style EG2 fill:#1f2937,stroke:#22c55e,color:#fff
+    style IM3 fill:#1f2937,stroke:#22c55e,color:#fff
+    style N3 fill:#1f2937,stroke:#22c55e,color:#fff
 ```
 
 ---

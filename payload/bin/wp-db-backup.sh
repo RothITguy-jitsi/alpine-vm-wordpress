@@ -2,6 +2,13 @@
 # wp-db-backup.sh — verified daily MariaDB backup. Called from cron.
 # Design mirrors do_db_update()'s in-flight backup step in update.sh.
 set -eu
+
+# Per-run, not a fixed path. A predictable file under /tmp that a root process
+# writes to is CWE-377: any local user can pre-create it as a symlink and have
+# root truncate whatever it points at. Dot-prefixing hid it from `ls` and from
+# nothing else.
+_OFFLOG=$(mktemp) || exit 1
+trap 'rm -f "$_OFFLOG"' EXIT INT TERM
 # FORENSIC FIX (new-audit Medium finding, confirmed reasonable): no lock
 # existed, so a manual run while the scheduled 2am run was still going (or
 # any other double-invocation) could overlap two mariadb-dump processes
@@ -113,7 +120,7 @@ logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -
 # sending, and a push failure must not prevent a good local backup from being
 # kept. A failure here is reported and does not fail the local backup.
 if [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
-  if /usr/local/bin/wasp-offsite-backup.sh push "${BACKUP_FILE}" >/tmp/.offsite.log 2>&1; then
+  if /usr/local/bin/wasp-offsite-backup.sh push "${BACKUP_FILE}" >"$_OFFLOG" 2>&1; then
     logger -t wp-db-backup "off-VM copy sent and size-verified"
   else
     logger -t wp-db-backup "OFF-VM COPY FAILED — the local backup is fine, the remote copy is not"

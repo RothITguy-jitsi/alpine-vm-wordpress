@@ -1124,6 +1124,47 @@ while :; do
 done
 unset _gov_default
 
+# ── Egress proxy (Squid) ─────────────────────────────────────────────────────
+echo ""
+echo -e "  ${BLD}Force WordPress web traffic through a filtering proxy?${CL}"
+echo -e "  ${YW}The outbound firewall you were offered earlier restricts which${CL}"
+echo -e "  ${YW}PORTS WordPress may use. This restricts which DESTINATIONS —${CL}"
+echo -e "  ${YW}443 is open either way, and 443 is where exfiltration goes.${CL}"
+echo ""
+_sec_head
+echo -e "  ${YW}  A compromised WordPress cannot reach an attacker's server${CL}"
+echo -e "  ${YW}  unless that server is on the allowlist. It cannot reach cloud${CL}"
+echo -e "  ${YW}  metadata, the LAN, or a bare IP address. SSRF in a plugin${CL}"
+echo -e "  ${YW}  stops being a route into your internal network.${CL}"
+echo -e "  ${YW}  The firewall enforces it, not WordPress's own settings — a${CL}"
+echo -e "  ${YW}  plugin calling fsockopen() ignores those completely, which is${CL}"
+echo -e "  ${YW}  precisely the traffic worth stopping.${CL}"
+echo -e "  ${YW}  No TLS interception: filtering is on the destination name in${CL}"
+echo -e "  ${YW}  the CONNECT request, which is plaintext. Nothing is decrypted${CL}"
+echo -e "  ${YW}  and no certificate authority is installed.${CL}"
+echo ""
+echo -e "  ${RD}  THE COST IS REAL. Plugins that call an unlisted service will${CL}"
+echo -e "  ${RD}  break — payment gateways, mapping, fonts, licence checks.${CL}"
+echo -e "  ${RD}  They break visibly and the log names what was blocked, but${CL}"
+echo -e "  ${RD}  they do break. Expect to spend time on the allowlist.${CL}"
+echo -e "  ${YW}  Start allowed: wordpress.org, and what WASP itself needs${CL}"
+echo -e "  ${YW}  (Wordfence, CrowdSec, MaxMind, Alpine, registries).${CL}"
+echo -e "  ${YW}  Find what a site actually needs:  wasp-egress discovery${CL}"
+echo -e "  ${YW}  Add one:                          wasp-egress allow <domain>${CL}"
+echo -e "  ${YW}  Temporary window:                 wasp-egress maintenance enable${CL}"
+_sec_note
+EGRESS_PROXY=0
+read -rp "  Force web egress through the proxy? [y/N] : " _EP
+case "${_EP}" in
+  y|Y|yes|YES) EGRESS_PROXY=1
+    msg_ok "Egress proxy enabled — WordPress reaches approved destinations only"
+    msg_warn "  Verify enforcement after install:  wasp-egress test"
+    msg_warn "  If a plugin misbehaves, check what was blocked before assuming"
+    msg_warn "  the plugin is at fault:            wasp-egress discovery" ;;
+  *) msg_ok "No egress proxy — WordPress may reach any host on permitted ports" ;;
+esac
+unset _EP
+
 # ── CrowdSec threat intelligence (CTI) ───────────────────────────────────────
 echo ""
 echo -e "  ${BLD}CrowdSec threat intelligence (optional)${CL}"

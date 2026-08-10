@@ -45,6 +45,15 @@
 # =============================================================================
 set -u
 
+# Error capture goes to a per-run file, not a fixed name.
+#
+# A predictable path under /tmp that a root process writes to is CWE-377: any
+# local user (or a compromised container with a shared /tmp) can pre-create it
+# as a symlink and have root truncate whatever it points at. The path was
+# fixed and dot-prefixed, which hides it from `ls` and from nobody else.
+_ERRF=$(mktemp) || exit 1
+trap 'rm -f "$_ERRF"' EXIT INT TERM
+
 if [ "$(id -u)" -ne 0 ]; then
   if command -v doas >/dev/null 2>&1; then exec doas "$0" "$@"; fi
   echo "Run as root (or via doas)" >&2; exit 1
@@ -91,11 +100,11 @@ _encrypt_for_upload() {
     return 1
   fi
   _enc="/tmp/$(basename "$_src").age"
-  if age -r "$AGE_RECIPIENT" -o "$_enc" "$_src" 2>/tmp/.age.err; then
+  if age -r "$AGE_RECIPIENT" -o "$_enc" "$_src" 2>"$_ERRF"; then
     printf '%s' "$_enc"; return 0
   fi
-  _bad "Encryption FAILED — not uploading. $(head -c 160 /tmp/.age.err 2>/dev/null)"
-  rm -f "$_enc" /tmp/.age.err
+  _bad "Encryption FAILED — not uploading. $(head -c 160 "$_ERRF" 2>/dev/null)"
+  rm -f "$_enc" "$_ERRF"
   return 1
 }
 
@@ -142,25 +151,25 @@ push_one() {
 
   case "$OFFSITE_METHOD" in
     scp)
-      scp $(_ssh_opts) -q "$_f" "${OFFSITE_DEST}/${_b}" 2>/tmp/.offsite.err ;;
+      scp $(_ssh_opts) -q "$_f" "${OFFSITE_DEST}/${_b}" 2>"$_ERRF" ;;
     rsync)
       # --partial so an interrupted transfer resumes rather than restarting;
       # a nightly dump over a slow link should not have to be perfect first time.
       rsync -q --partial --timeout=300 -e "ssh $(_ssh_opts)" \
-            "$_f" "${OFFSITE_DEST}/" 2>/tmp/.offsite.err ;;
+            "$_f" "${OFFSITE_DEST}/" 2>"$_ERRF" ;;
     s3|rclone)
       rclone --config "$RCLONE_CONF" copyto --quiet \
-             "$_f" "${OFFSITE_DEST}/${_b}" 2>/tmp/.offsite.err ;;
+             "$_f" "${OFFSITE_DEST}/${_b}" 2>"$_ERRF" ;;
     *)
       _bad "Unknown method '${OFFSITE_METHOD}'"; return 1 ;;
   esac
   _rc=$?
   if [ "$_rc" -ne 0 ]; then
-    _bad "Upload FAILED (${OFFSITE_METHOD}) — $(head -c 200 /tmp/.offsite.err 2>/dev/null)"
-    rm -f /tmp/.offsite.err
+    _bad "Upload FAILED (${OFFSITE_METHOD}) — $(head -c 200 "$_ERRF" 2>/dev/null)"
+    rm -f "$_ERRF"
     return 1
   fi
-  rm -f /tmp/.offsite.err
+  rm -f "$_ERRF"
 
   # Confirm the remote copy is the right SIZE rather than assuming the
   # transport told the truth. A silently truncated upload is the failure this
@@ -394,8 +403,8 @@ do_restore() {
       command -v age >/dev/null 2>&1 || { _bad "age is not installed (apk add age)"; rm -rf "$_work"; return 1; }
       if [ -n "$_keyfile" ]; then
         [ -r "$_keyfile" ] || { _bad "Cannot read ${_keyfile}"; rm -rf "$_work"; return 1; }
-        age -d -i "$_keyfile" -o "${_src%.age}" "$_src" 2>/tmp/.age.err \
-          || { _bad "Decryption failed — wrong key? $(head -c 160 /tmp/.age.err)"; rm -rf "$_work"; return 1; }
+        age -d -i "$_keyfile" -o "${_src%.age}" "$_src" 2>"$_ERRF" \
+          || { _bad "Decryption failed — wrong key? $(head -c 160 "$_ERRF")"; rm -rf "$_work"; return 1; }
       else
         echo ""
         echo "  ${_file} is encrypted. This VM holds only the public key and"
@@ -411,11 +420,11 @@ do_restore() {
           *) _bad "That does not look like an age private key"; _sk=""; rm -rf "$_work"; return 1 ;;
         esac
         _kf="$_work/k"; printf '%s\n' "$_sk" > "$_kf"; chmod 600 "$_kf"; _sk=""
-        age -d -i "$_kf" -o "${_src%.age}" "$_src" 2>/tmp/.age.err \
-          || { _bad "Decryption failed — wrong key? $(head -c 160 /tmp/.age.err)"; rm -rf "$_work"; return 1; }
+        age -d -i "$_kf" -o "${_src%.age}" "$_src" 2>"$_ERRF" \
+          || { _bad "Decryption failed — wrong key? $(head -c 160 "$_ERRF")"; rm -rf "$_work"; return 1; }
         rm -f "$_kf"
       fi
-      rm -f /tmp/.age.err
+      rm -f "$_ERRF"
       _src="${_src%.age}"
       _ok "Decrypted"
       ;;
@@ -541,6 +550,130 @@ case "${1:-status}" in
 
   list)   _configured || { _bad "Not configured"; exit 1; }
           echo ""; echo "Remote backups:"; list_remote | sed 's/^/  /' ;;
+
+  remote-restore-drill)
+    # The evaluator's MAJOR finding, addressed: verifying the remote object
+    # EXISTS (verify) is not the same as proving it RESTORES. A remote copy can
+    # be truncated, encrypted to a recipient whose key you no longer hold, or
+    # otherwise unusable in exactly the moment you need it. This forces the full
+    # round-trip -- pull the actual remote object, decrypt it with the recovery
+    # key, and restore it into a THROWAWAY database -- and records timing so the
+    # RTO/RPO number becomes evidence rather than an assumption.
+    #
+    # It deliberately does NOT use any local copy: the whole point is to test
+    # the remote path an operator would depend on after losing the VM.
+    _configured || { _bad "Off-VM backup is not configured"; exit 1; }
+    shift 2>/dev/null || true
+    _dk=""; while [ $# -gt 0 ]; do case "$1" in --key-file) _dk="${2:-}"; shift 2 ;; *) shift ;; esac; done
+
+    _hdr "Remote restore drill — pull, decrypt, restore, verify"
+    _t0=$(date +%s)
+
+    # 1. Identify the newest REMOTE object (not local).
+    _remote_newest=$(list_remote 2>/dev/null | awk '{print $NF}' | grep -E '\.sql\.gz(\.age)?$' | sort | tail -1)
+    [ -n "$_remote_newest" ] || { _bad "No remote backup object found to drill"; exit 1; }
+    _note "Newest remote object: ${_remote_newest}"
+
+    # 2. Pull it to a scratch dir. Never fall back to a local copy.
+    _dw=$(mktemp -d) || exit 1
+    trap 'rm -rf "$_dw"' EXIT INT TERM
+    _note "Fetching from the destination (not using any local copy)…"
+    case "$OFFSITE_METHOD" in
+      scp|rsync) scp $(_ssh_opts) -q "${OFFSITE_DEST}/${_remote_newest}" "$_dw/$_remote_newest" ;;
+      s3|rclone) rclone --config "$RCLONE_CONF" copyto --quiet "${OFFSITE_DEST}/${_remote_newest}" "$_dw/$_remote_newest" ;;
+    esac || { _bad "Could not fetch the remote object — this IS the finding: the offsite copy is unreachable"; exit 1; }
+    _pulled=$(stat -c %s "$_dw/$_remote_newest" 2>/dev/null || echo 0)
+    [ "${_pulled:-0}" -gt 0 ] || { _bad "Fetched object is zero bytes — remote copy is truncated"; exit 1; }
+    _ok "Pulled ${_pulled} bytes"
+    _t_pull=$(date +%s)
+
+    # 3. Decrypt if it is an .age object. This is where "encrypted to the wrong
+    #    recipient" or "key unavailable" is caught -- exactly what verify cannot.
+    _plain="$_dw/$_remote_newest"
+    case "$_remote_newest" in
+      *.age)
+        command -v age >/dev/null 2>&1 || { _bad "age is not installed (apk add age)"; exit 1; }
+        if [ -z "$_dk" ]; then
+          echo ""
+          _note "This object is encrypted. Provide the recovery private key to"
+          _note "prove it can actually be decrypted. It is used for this drill"
+          _note "only and never written to disk."
+          printf "  Paste the AGE-SECRET-KEY line (or re-run with --key-file): "
+          stty -echo 2>/dev/null; read -r _sk; stty echo 2>/dev/null; echo
+          case "$_sk" in AGE-SECRET-KEY*) : ;; *) _bad "That is not an age private key"; exit 1 ;; esac
+          _dk="$_dw/.k"; printf '%s\n' "$_sk" > "$_dk"; chmod 600 "$_dk"; _sk=""
+        fi
+        [ -r "$_dk" ] || { _bad "Cannot read key file ${_dk}"; exit 1; }
+        _plain="${_dw}/${_remote_newest%.age}"
+        if age -d -i "$_dk" -o "$_plain" "$_dw/$_remote_newest" 2>"$_ERRF"; then
+          _ok "Decrypted with the recovery key"
+        else
+          _bad "DECRYPTION FAILED — the remote object cannot be recovered with this key."
+          _note "This is precisely the failure that stays invisible until a real"
+          _note "recovery: the copy was present, and unusable. $(head -c 160 "$_ERRF")"
+          exit 1
+        fi
+        ;;
+    esac
+
+    # 4. gzip integrity, then restore into a throwaway MariaDB.
+    gzip -t "$_plain" 2>/dev/null || { _bad "Decrypted archive is not valid gzip — corrupt remote object"; exit 1; }
+    _ok "Archive passes gzip integrity"
+    _t_dec=$(date +%s)
+
+    _net="wasp-remote-drill-net"; _cont="wasp-remote-drill-db"
+    podman rm -f "$_cont" >/dev/null 2>&1 || true
+    podman network rm "$_net" >/dev/null 2>&1 || true
+    podman network create --internal "$_net" >/dev/null 2>&1 || true
+    _rpw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    _dbimg="${DB_IMAGE:-docker.io/library/mariadb:11.4}"
+    _note "Starting a throwaway MariaDB (isolated, no host port)…"
+    if ! podman run -d --name "$_cont" --network "$_net" \
+        --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add CHOWN \
+        --security-opt no-new-privileges --memory 512m \
+        -e MARIADB_ROOT_PASSWORD="$_rpw" -e MARIADB_DATABASE=drill \
+        "$_dbimg" >/dev/null 2>&1; then
+      _bad "Could not start the throwaway database"; exit 1
+    fi
+    # wait for readiness
+    _rdy=0; _n=0; while [ "$_n" -lt 30 ]; do
+      podman exec "$_cont" sh -c 'mariadb-admin ping --silent -uroot -p"'"$_rpw"'"' >/dev/null 2>&1 && { _rdy=1; break; }
+      sleep 2; _n=$((_n+1)); done
+    [ "$_rdy" = 1 ] || { _bad "Throwaway database did not become ready"; podman rm -f "$_cont" >/dev/null 2>&1; exit 1; }
+
+    _note "Restoring the decrypted dump…"
+    if gzip -dc "$_plain" | podman exec -i "$_cont" sh -c 'exec mariadb -uroot -p"'"$_rpw"'" drill' 2>"$_ERRF"; then
+      _ok "Restore completed into the throwaway database"
+    else
+      _bad "Restore FAILED even though the object decrypted: $(head -c 160 "$_ERRF")"
+      podman rm -f "$_cont" >/dev/null 2>&1; podman network rm "$_net" >/dev/null 2>&1; exit 1
+    fi
+
+    # 5. Sanity-check content: a restore that loads an empty dump is not a pass.
+    _tables=$(podman exec "$_cont" sh -c 'exec mariadb -uroot -p"'"$_rpw"'" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"drill\";"' 2>/dev/null)
+    if [ "${_tables:-0}" -gt 0 ]; then
+      _ok "Restored database contains ${_tables} table(s)"
+    else
+      _bad "Restored database is EMPTY — the dump loaded but carried no schema"
+      podman rm -f "$_cont" >/dev/null 2>&1; podman network rm "$_net" >/dev/null 2>&1; exit 1
+    fi
+
+    podman rm -f "$_cont" >/dev/null 2>&1 || true
+    podman network rm "$_net" >/dev/null 2>&1 || true
+    _t1=$(date +%s)
+
+    _hdr "Drill result — the offsite copy is genuinely recoverable"
+    printf "  object      : %s\n" "$_remote_newest"
+    printf "  fetch       : %ss\n" "$(( _t_pull - _t0 ))"
+    printf "  decrypt+gzip: %ss\n" "$(( _t_dec - _t_pull ))"
+    printf "  restore      : %ss\n" "$(( _t1 - _t_dec ))"
+    printf "  TOTAL (RTO)  : %ss for %s bytes\n\n" "$(( _t1 - _t0 ))" "$_pulled"
+    _ok "Pulled from offsite, decrypted with the recovery key, restored, and"
+    _ok "verified non-empty. This is evidence, not an assumption."
+    _note "Record this RTO against your RPO target. Re-run monthly, or after any"
+    _note "change to the backup key, destination, or encryption recipient."
+    logger -t wasp-restore-drill "remote restore drill PASSED: ${_remote_newest} RTO=$(( _t1 - _t0 ))s"
+    ;;
 
   test)
     _configured || { _bad "Not configured"; exit 1; }

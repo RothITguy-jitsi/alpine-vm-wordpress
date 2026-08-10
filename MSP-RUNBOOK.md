@@ -1,5 +1,26 @@
 # WASP — MSP Operational Runbook
 
+> For day-to-day troubleshooting organised by who is handling the ticket —
+> a non-technical client, an on-shift tech, or an engineer — see
+> **[SUPPORT-RUNBOOK.md](SUPPORT-RUNBOOK.md)**. This document is the business
+> layer (SLAs, 
+**Prove offsite recovery, not just offsite presence.** Verifying the remote
+object exists is not proof it restores — it can be truncated or encrypted to a
+key you no longer hold. Run the full round-trip monthly, and after any change
+to the backup key, destination, or encryption recipient:
+
+```sh
+wasp-offsite-backup.sh remote-restore-drill
+```
+
+It pulls the actual remote object, decrypts it with the recovery key, restores
+it into a throwaway database, verifies it is non-empty, and records the RTO —
+turning the recovery-time number from an assumption into evidence.
+
+RTO/RPO, onboarding, decommissioning); that one is the
+> hands-on-keyboard layer.
+
+
 For running WASP deployments as a service for clients. Companion to
 [INCIDENT-PLAYBOOK.md](INCIDENT-PLAYBOOK.md), which covers what to do when
 something fires; this covers the commitments around it.
@@ -54,19 +75,32 @@ Response time is when a human starts; resolution depends on what it turns out to
 **Backup failure is S2, not S3.** Nothing looks wrong to the client, and each
 day it continues raises the cost of the incident that eventually needs it.
 
+**Fleet monitoring is three layers, covered in `docs/FLEET.md`:** Pulse for VM liveness, `validate-wordpress.sh --check` per VM for WASP health, optionally MainWP for WordPress maintenance (protect its dashboard hardest — it holds keys to every site).
+
 ### What monitoring covers
 
 | Alert | Tag | Severity |
 |---|---|---|
 | Backup failed | `wp-db-backup` | S2 |
+| `validate-wordpress.sh --check` returns 2 | poll from your monitoring | S1 |
+| `validate-wordpress.sh --check` returns 1 | poll from your monitoring | S2 |
 | Off-VM copy failed | `wasp-offsite` | S2 |
 | CRITICAL malware finding | `wp-malware` | S1 |
 | Vulnerability finding | `wp-vulns` | S3 |
 | Self-test failed | `wasp-selftest` | S2 |
 | Exception expiring | `wasp-vuln-exception` | S4 |
 
-Nothing here monitors uptime. Pair it with external checks — this VM cannot
-tell you it is unreachable.
+**Uptime is covered by the heartbeat, and only by that.** Every other check
+runs *on* the VM, so a VM that is off, unreachable, or on a dead hypervisor
+reports nothing — and silence looks identical to health.
+
+```sh
+wp-notify.sh --heartbeat-url https://hc-ping.com/<uuid>
+```
+
+It verifies WordPress serves and MariaDB answers before pinging, so a
+heartbeat cannot report healthy through a broken site. Set the external
+check's period to 15 minutes with a 30-minute grace.
 
 ---
 
@@ -80,6 +114,9 @@ tell you it is unreachable.
 | Firewall or admin CIDR | Operator + a second pair of eyes | **Console access confirmed** | `wp-hardening.sh proxy-check` |
 | Accepting a vulnerability | Operator; governance accountable | Written justification | Emailed automatically |
 | Restoring from backup | Client decides | Backup of current state | `wasp-selftest.sh` |
+| Proving offsite recovery works | Operator, monthly | — | `wasp-offsite-backup.sh remote-restore-drill` |
+| Egress allowlist change | Operator | Note why the destination is required | `wasp-egress test` |
+| Importing a client site | Client confirms the source | `wp-import.sh inspect` and `scan` | `wp-malware-scan.sh full` on the live site |
 
 **Confirm console access before any firewall change.** `qm terminal <VMID>`
 works when SSH and HTTP do not, and the failure mode of an access-control
@@ -125,6 +162,35 @@ become policy.
 
 ---
 
+## Onboarding a client site
+
+```sh
+wp-import.sh where                    # how to get the backup here
+wp-import.sh inspect <file>           # reads the index, extracts nothing
+wp-import.sh extract <file>
+wp-import.sh scan
+wp-import.sh apply
+```
+
+**Inspect and scan before quoting the work.** A backup with a webshell in
+uploads and code in autoloaded options is a cleanup engagement, not a
+migration, and finding that out afterwards is how a fixed-price migration
+becomes an unpaid incident response.
+
+The gate refuses on CRITICAL without `--force`, and every override is
+recorded with who made it — useful when the client later asks what was known
+at the time.
+
+**After any import**, treat the plugin set as unknown: it is someone else's.
+
+```sh
+wp-plugins.sh vulns
+wp-malware-scan.sh full
+wp-forensics.sh admins                # accounts you did not create
+```
+
+---
+
 ## Decommissioning
 
 Order matters — the last step destroys the evidence for the others.
@@ -157,6 +223,20 @@ arrive after shutdown, not before.
 
 Not on the VM, so nothing on it will remind you:
 
+**Rotation is now tooled**, so "rotate every credential" in the incident
+process is a command rather than an afternoon of hand-editing:
+
+```sh
+wp-rotate-secrets.sh all              # database + salts, verified and reversible
+wp-rotate-secrets.sh smtp '<new>'     # after changing it at the relay
+```
+
+The age backup key is deliberately excluded — rotating it makes every existing
+encrypted backup unreadable. Treat that as a re-encryption project, not a
+rotation.
+
+### Credentials to revoke on decommission
+
 - SSH key on the backup host (`authorized_keys`)
 - S3/R2 API token
 - MaxMind licence key
@@ -178,7 +258,8 @@ after the data is gone is a liability with no corresponding benefit.
 
 What you can honestly claim, and what you cannot:
 
-**Can:** nightly backups, verified and copied off the VM, with restores proven
+**Can:** egress restricted to approved destinations, with the firewall — not
+application settings — enforcing it. Nightly backups, verified and copied off the VM, with restores proven
 weekly by an automated test. Daily vulnerability scanning against known-issue
 databases. Daily malware and integrity scanning. Firewall, geographic and
 behavioural blocking. Updates tested on a throwaway container before

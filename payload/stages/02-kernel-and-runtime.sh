@@ -226,7 +226,7 @@ ok "Storage driver: ${DRIVER_CHOSEN}"
 DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 
 _skopeo_digest() {
-  # $1 = full tag reference, e.g. docker.io/wordpress:6.9.4-php8.3-apache
+  # $1 = full tag reference, e.g. docker.io/wordpress:6.9.6-php8.4-apache
   # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
   # missing, network error, unparseable output) — treated as "fall back",
   # never as fatal.
@@ -354,6 +354,16 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   WP_IMAGE=$(_pin_digest "$WP_IMAGE" "WordPress")
   DB_IMAGE=$(_pin_digest "$DB_IMAGE" "MariaDB")
   CROWDSEC_IMAGE=$(_pin_digest "$CROWDSEC_IMAGE" "CrowdSec")
+  # Squid only exists when egress filtering is enabled. Pin it on the same
+  # footing as the rest so update.sh can check/scan/bump it -- a filtering
+  # proxy that cannot be updated is a proxy that silently ages on exactly the
+  # axis (CVEs) that made us add mitigations for it in the first place.
+  if [ "${EGRESS_PROXY:-0}" = "1" ]; then
+    SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:6.13-24.04_stable}"
+    SQUID_IMAGE=$(_pin_digest "$SQUID_IMAGE" "Squid")
+    SQUID_TAG_INIT="${SQUID_IMAGE##*:}"
+    case "$SQUID_IMAGE" in *@sha256:*) SQUID_TAG_INIT="6.13-24.04_stable" ;; esac
+  fi
 
   # ── Visibility: pin-count summary, captured now before GeoIP can later
   # reassign WP_IMAGE to a locally-built (never digest-pinned) image, which
@@ -400,6 +410,7 @@ fi
 WP_PIN_DIGEST=""; case "$WP_IMAGE" in *@sha256:*) WP_PIN_DIGEST="${WP_IMAGE#*@}" ;; esac
 DB_PIN_DIGEST=""; case "$DB_IMAGE" in *@sha256:*) DB_PIN_DIGEST="${DB_IMAGE#*@}" ;; esac
 CS_PIN_DIGEST=""; case "$CROWDSEC_IMAGE" in *@sha256:*) CS_PIN_DIGEST="${CROWDSEC_IMAGE#*@}" ;; esac
+SQUID_PIN_DIGEST=""; case "${SQUID_IMAGE:-}" in *@sha256:*) SQUID_PIN_DIGEST="${SQUID_IMAGE#*@}" ;; esac
 mkdir -p /etc/wp-install
 # BUG FIX (v7-12, #8): write via temp-file + mv instead of a direct `cat >`.
 # A direct `cat > pinned.env << EOF` truncates the target the instant the
@@ -424,6 +435,8 @@ DB_TAG="${DB_TAG_INIT}"
 DB_DIGEST="${DB_PIN_DIGEST}"
 CS_TAG="${CS_TAG_INIT}"
 CS_DIGEST="${CS_PIN_DIGEST}"
+SQUID_TAG="${SQUID_TAG_INIT:-}"
+SQUID_DIGEST="${SQUID_PIN_DIGEST:-}"
 PINNEDENV
 chmod 600 "$_PINNEDENV_TMP"
 mv -f "$_PINNEDENV_TMP" /etc/wp-install/pinned.env

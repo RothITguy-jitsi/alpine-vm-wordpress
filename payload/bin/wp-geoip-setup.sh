@@ -67,7 +67,7 @@ command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 \
   || { echo "FATAL: curl is unavailable and 'apk add curl' failed — cannot fetch GeoLite2-Country"; exit 1; }
 
 CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/null)
-[ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:6.9.4-php8.3-apache"
+[ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:6.9.6-php8.4-apache"
 # Derive a human-friendly tag for naming the local GeoIP image.
 # BUG FIX (v7-6f): the Skopeo rewrite of digest pinning dropped the "does
 # this Podman accept a combined tag+digest reference" test — every pinned
@@ -78,7 +78,7 @@ CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/nu
 # string, only falling back to a short digest fragment when none was
 # present) would now hit that fallback on every single run — every GeoIP
 # rebuild producing a digest-fragment tag (wordpress-geoip:a1b2c3d4e5f6)
-# instead of a readable one (wordpress-geoip:6.9.4-php8.3-apache).
+# instead of a readable one (wordpress-geoip:6.9.6-php8.4-apache).
 # /etc/wp-install/pinned.env carries the tag separately from the image
 # reference for exactly this reason (see the installer's PERSIST comment) —
 # read WP_TAG from there first. Only fall back to parsing CURRENT_WP_IMAGE

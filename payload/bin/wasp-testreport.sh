@@ -9,6 +9,10 @@
 #
 #   --with-mail     sends two real emails
 #   --with-restore  starts a throwaway database (~3 min, ~512 MB)
+#   --perimeter <url>  ALSO run the external validation harness against <url>,
+#                      testing the controls as an outside client sees them.
+#                      Best run from a DIFFERENT machine too (see note in the
+#                      section), since from the VM you are on the LAN.
 #
 # Neither runs unless asked. The default run touches nothing.
 #
@@ -19,14 +23,18 @@
 # =============================================================================
 set -u
 
-WITH_MAIL=0; WITH_RESTORE=0; MAIL_TO=""
+WITH_MAIL=0; WITH_RESTORE=0; MAIL_TO=""; PERIMETER=""
+_prev=""
 for a in "$@"; do
+  case "$_prev" in --perimeter) PERIMETER="$a"; _prev=""; continue ;; esac
   case "$a" in
     --with-mail)    WITH_MAIL=1 ;;
     --with-restore) WITH_RESTORE=1 ;;
     --all)          WITH_MAIL=1; WITH_RESTORE=1 ;;
+    --perimeter)    _prev="--perimeter" ;;
+    http://*|https://*) PERIMETER="$a" ;;
     *@*)            MAIL_TO="$a" ;;
-    -h|--help)      sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,24p' "$0"; exit 0 ;;
   esac
 done
 
@@ -57,7 +65,6 @@ run()  { printf '\n$ %s\n' "$1"; sh -c "$1" 2>&1 | sed 's/^/  /'; }
 
 # Redact anything that looks like a credential. Applied to command output that
 # might carry one; the checks below mostly avoid printing such output at all.
-red()  { sed -E 's/(pass[a-z_]*|secret|token|key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<REDACTED>/Ig'; }
 
 hdr "WASP TEST REPORT — $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
 . /etc/wp-install/vars.sh 2>/dev/null || true
@@ -69,6 +76,15 @@ inf "mail: ${WITH_MAIL}   restore: ${WITH_RESTORE}"
 inf "login URL: $([ -n "${WP_ADMIN_SLUG:-}" ] && printf '/%s' "$WP_ADMIN_SLUG" || printf '/wp-login.php')"
 
 # ── 1. Baseline ──────────────────────────────────────────────────────────────
+# Unverified-install banner: the most important provenance fact, placed right
+# after the report title rather than buried in a section.
+if [ -f /etc/wp-install/UNVERIFIED ]; then
+  . /etc/wp-install/UNVERIFIED 2>/dev/null || true
+  warn "THIS BUILD WAS INSTALLED UNVERIFIED (${UNVERIFIED_REASON:-reason unrecorded})"
+  warn "  at ${UNVERIFIED_AT:-unknown time}. Signature verification did not pass."
+  warn "  A production/MSP deployment must be reinstalled from a signed build."
+fi
+
 hdr "1. BASELINE"
 run "validate-wordpress.sh"
 sub "containers"
@@ -229,6 +245,33 @@ else
 fi
 
 # ── 14. Scheduling ───────────────────────────────────────────────────────────
+hdr "ACTIVE VULNERABILITY EXCEPTIONS"
+# The evaluator's #5: exceptions are already digest-scoped with expiry (see
+# trivy_exception in update.sh). This surfaces every ACTIVE one so weekly
+# review sees what has been accepted, against which digest, and when it lapses
+# -- an accepted CVE that nobody is looking at is how an exception quietly
+# becomes permanent policy.
+_vex=/var/log/wasp-vuln-exceptions.log
+if [ -f "$_vex" ]; then
+  _now=$(date -u +%s); _active=0
+  # Records carry an expiry; show any whose expiry is in the future.
+  while IFS= read -r _line; do
+    case "$_line" in
+      *ACCEPTED*|*expires*|*until*)
+        _exp=$(printf '%s' "$_line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | tail -1)
+        [ -n "$_exp" ] || continue
+        _es=$(date -u -d "$_exp" +%s 2>/dev/null || echo 0)
+        if [ "$_es" -gt "$_now" ]; then
+          _active=$((_active+1)); warn "ACTIVE exception (expires ${_exp}): ${_line}"
+        fi ;;
+    esac
+  done < "$_vex"
+  [ "$_active" = 0 ] && _p "No active vulnerability exceptions"
+  [ "$_active" -gt 0 ] && warn "${_active} active exception(s) — confirm each is still justified"
+else
+  _p "No vulnerability exceptions have ever been recorded"
+fi
+
 hdr "14. SCHEDULED JOBS"
 sub "installed cron entries"
 grep -vE '^#|^$' /etc/crontabs/root 2>/dev/null | sed 's/^/  /'
@@ -247,6 +290,37 @@ printf '  pass %s   fail %s   skip %s\n\n' "$PASS" "$FAIL" "$SKIP"
 [ "$WITH_MAIL"    = "0" ] && printf '  Not tested: live mail      (re-run with --with-mail)\n'
 [ "$WITH_RESTORE" = "0" ] && printf '  Not tested: backup restore (re-run with --with-restore)\n'
 cat <<'EOS'
+
+# ── 15. Perimeter (external validation) ──────────────────────────────────────
+if [ -n "$PERIMETER" ]; then
+  section "15. PERIMETER — controls as an outside client sees them"
+  _ph=$(command -v wasp-pentest.sh 2>/dev/null || echo /usr/local/bin/wasp-pentest.sh)
+  if [ ! -x "$_ph" ]; then
+    ok "The external harness is NOT on this VM — which is correct."
+    inf "It lives in tools/wasp-pentest.sh, deliberately outside the payload, so"
+    inf "a compromised VM does not hand an attacker a ready-made scanner. And"
+    inf "the test that matters is from an address NOT on your admin allow list,"
+    inf "which this VM is not. Run it from your Kali box instead:"
+    inf "  scp tools/wasp-pentest.sh kali:~/ && ssh kali"
+    inf "  ./wasp-pentest.sh ${PERIMETER}"
+    inf "  ./wasp-pentest.sh --ip <this-vm-ip> ${PERIMETER}   # also tests WEB_CIDR"
+  else
+    # Running from the VM answers "are the controls working" but NOT "are they
+    # working against an unauthorised source" -- this host is on the LAN and
+    # very likely allow-listed, so admin endpoints will answer here and be
+    # refused elsewhere. Say so plainly rather than let a green result mislead.
+    inf "Running the external harness from THIS VM against ${PERIMETER}."
+    inf "Caveat: this host is on the LAN and probably allow-listed, so admin"
+    inf "endpoints may answer here that an outside attacker cannot reach. For"
+    inf "the real access-control test, run wasp-pentest.sh from off-LAN too."
+    echo ""
+    # Non-interactive: the harness normally asks for "I OWN THIS"; feed it,
+    # because running your own testreport against your own VM IS the
+    # authorisation, and a report should not block on a prompt.
+    printf 'I OWN THIS\n' | "$_ph" "$PERIMETER" 2>&1 | sed 's/^/  /' || true
+  fi
+  echo ""
+fi
 
   Not covered here, needs doing by hand:
     • Browse https://<your-domain>/ and /<slug> from OUTSIDE the LAN (the slug IS the login URL now)

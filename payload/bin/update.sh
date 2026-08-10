@@ -81,12 +81,17 @@ set -e
 # exist yet, or is missing an entry for a component (fresh VM never
 # updated through this script, or the file was lost). Once pinned.env has
 # a value for a component, THAT value is authoritative, not this constant.
-PINNED_WP_VER="6.9.4-php8.3-apache"
+PINNED_WP_VER="6.9.6-php8.4-apache"
 PINNED_DB_VER="11.4"
 PINNED_CS_VER="v1.7.8"
 WP_REGISTRY="docker.io/wordpress"
 DB_REGISTRY="docker.io/mariadb"
 CS_REGISTRY="docker.io/crowdsecurity/crowdsec"
+# Squid: only present when egress filtering is enabled. Kept on the same
+# digest-pinned footing as the rest so a filtering proxy does not silently
+# age on the one axis -- CVEs -- that its whole reason for existing depends on.
+PINNED_SQUID_VER="6.13-24.04_stable"
+SQUID_REGISTRY="docker.io/ubuntu/squid"
 
 # Loopback-only port do_wp_update() uses to validate a freshly pulled
 # WordPress image BEFORE the production container on host port 80 is ever
@@ -192,7 +197,7 @@ DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 # installer-side Skopeo/digest-pinning snippet at install time, and kept
 # current here after every successful update. Deliberately NOT re-derived
 # from the running container's image string on every run (see header note).
-WP_TAG="" WP_DIGEST="" DB_TAG="" DB_DIGEST="" CS_TAG="" CS_DIGEST=""
+WP_TAG="" WP_DIGEST="" DB_TAG="" DB_DIGEST="" CS_TAG="" CS_DIGEST="" SQUID_TAG="" SQUID_DIGEST=""
 # shellcheck disable=SC1091
 [ -f /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
@@ -265,6 +270,8 @@ DB_TAG="${DB_TAG}"
 DB_DIGEST="${DB_DIGEST}"
 CS_TAG="${CS_TAG}"
 CS_DIGEST="${CS_DIGEST}"
+SQUID_TAG="${SQUID_TAG}"
+SQUID_DIGEST="${SQUID_DIGEST}"
 PINNEDENV
   chmod 600 "$_tmp" 2>/dev/null || true
   mv -f "$_tmp" /etc/wp-install/pinned.env 2>/dev/null || true
@@ -299,6 +306,11 @@ if [ -z "$DB_TAG" ] && [ -z "$DB_DIGEST" ] && [ -n "$RUNNING_DB_RAW" ]; then
 fi
 if [ -z "$CS_TAG" ] && [ -z "$CS_DIGEST" ] && [ -n "$RUNNING_CS_RAW" ]; then
   CS_TAG=$(_bootstrap_one "$RUNNING_CS_RAW" "$CS_REGISTRY")
+  # Squid only if it is actually running; absence is normal (egress off).
+  if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+    RUNNING_SQUID_RAW=$(podman inspect squid --format '{{.Config.Image}}' 2>/dev/null || echo "")
+    SQUID_TAG=$(_bootstrap_one "$RUNNING_SQUID_RAW" "$SQUID_REGISTRY")
+  fi
   CS_DIGEST=$(echo "$RUNNING_CS_RAW" | grep -oE 'sha256:[0-9a-f]{64}' || true)
   [ -n "$CS_TAG" ] && _BOOTSTRAPPED=1
 fi
@@ -355,7 +367,7 @@ require_clean_container_state() {
 }
 
 # ── Skopeo: remote digest lookup, no image pull ────────────────────────────
-# $1 = full tag reference, e.g. docker.io/wordpress:6.9.4-php8.3-apache
+# $1 = full tag reference, e.g. docker.io/wordpress:6.9.6-php8.4-apache
 # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
 # missing, network error, unparseable output) — every caller treats that as
 # "fall back to the old method", never as fatal.
@@ -967,6 +979,9 @@ do_wp_update() {
   # either network — the candidate must not contend for it. netavark
   # assigns the candidate a free address on both instead.
   # shellcheck disable=SC2086
+  # Candidate-only application-layer lockdown (see CAND_HARDENING note below).
+  CAND_HARDENING='define("WP_HTTP_BLOCK_EXTERNAL",true);define("WP_ACCESSIBLE_HOSTS","");define("AUTOMATIC_UPDATER_DISABLED",true);define("DISALLOW_FILE_MODS",true);'
+
   if podman run -d --name "$WP_CANDIDATE" --network wp-front \
     -p "127.0.0.1:${WP_CANDIDATE_PORT}:80" --restart no \
     --cap-drop ALL --cap-add NET_BIND_SERVICE \
@@ -978,7 +993,7 @@ do_wp_update() {
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     -e WP_ENVIRONMENT_TYPE=staging \
-    -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \
+    -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}${CAND_HARDENING}" \
     ${CAND_DB_ARGS} \
     -v /home/wpuser/wp/html:/var/www/html:ro \
     -v /home/wpuser/wp/logs-candidate:/var/log/apache2 \
@@ -1638,6 +1653,90 @@ do_db_update() {
   fi
 }
 
+do_squid_update() {
+  # Squid is simpler to update than CrowdSec despite the same shape: it runs on
+  # an ISOLATED podman network (not --network host), and holds no persistent
+  # state -- its config is bind-mounted read-only and its logs are a separate
+  # volume. So there is no two-engines-on-one-port hazard and no data to
+  # protect across the swap; a clean stop, rename, run is enough, with the old
+  # container kept as the rollback until the new one is confirmed serving.
+  if ! podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+    echo "── Squid ──────────────────────────────────────────────────────"
+    echo "  Not installed (egress filtering is off) — nothing to update."
+    return 0
+  fi
+  local target_ver="${1:-${SQUID_TAG:-$PINNED_SQUID_VER}}"
+  echo "── Squid (egress proxy) ───────────────────────────────────────"
+  [ -n "$1" ] && { validate_image_tag "$1" || return 1; }
+  echo "  Pinned  : tag=${SQUID_TAG:-none}  digest=${SQUID_DIGEST:-none}"
+  echo "  Target  : ${SQUID_REGISTRY}:${target_ver}"
+  echo "  Config  : /opt/squid/config (bind-mount, read-only — never removed)"
+
+  _check_component "$SQUID_REGISTRY" "$SQUID_TAG" "$SQUID_DIGEST" "$target_ver" || return 1
+  case "$_UPD_ACTION" in
+    skip) echo "  ✔  Already on target — tag and digest both unchanged."; return 0 ;;
+    refresh) ask_yn "Same tag (${target_ver}) but the registry has a newer digest — refresh it?" || { echo "   Skipped."; return 0; } ;;
+    bump) ask_yn "Update Squid to ${target_ver}?" || { echo "   Skipped."; return 0; } ;;
+  esac
+
+  setup_trivy
+  scan_image "${_UPD_PULL_REF}" || return 1
+
+  require_clean_container_state squid squid-old || return 1
+
+  echo "  → Pulling ${_UPD_PULL_REF}…"
+  podman pull "${_UPD_PULL_REF}" || { echo "✗  Pull failed."; return 1; }
+  if [ -z "${_UPD_DIGEST}" ] && [ "${USE_DIGEST_PINNING}" = "1" ]; then
+    _UPD_DIGEST=$(podman inspect "${_UPD_PULL_REF}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+      | grep -oE 'sha256:[0-9a-f]{64}' || true)
+    [ -n "${_UPD_DIGEST}" ] && _UPD_PULL_REF="${SQUID_REGISTRY}@${_UPD_DIGEST}"
+  fi
+
+  echo "  → Stopping Squid before replacement…"
+  # Egress fails closed while Squid is down: WordPress cannot reach the web
+  # during the swap, which is a brief, safe outage rather than an open window.
+  podman stop --time 20 squid >/dev/null 2>&1 || true
+  require_clean_container_state squid squid-old || { podman start squid >/dev/null 2>&1 || true; return 1; }
+  if ! podman rename squid squid-old; then
+    echo "✗  Unable to prepare Squid rollback container — aborting."
+    podman start squid >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if podman run -d --name squid --restart=always \
+    --network wp-front --ip 10.89.10.2 \
+    --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges --memory 256m --pids-limit 100 \
+    -v /opt/squid/config/squid.conf:/etc/squid/squid.conf:ro \
+    -v /opt/squid/config/hard-deny.txt:/etc/squid/hard-deny.txt:ro \
+    -v /opt/squid/config/allowlist-runtime.txt:/etc/squid/allowlist-runtime.txt:ro \
+    -v /opt/squid/config/allowlist-maintenance.txt:/etc/squid/allowlist-maintenance.txt:ro \
+    -v /opt/squid/config/threat-deny.txt:/etc/squid/threat-deny.txt:ro \
+    -v /opt/squid/logs:/var/log/squid:rw \
+    "${_UPD_PULL_REF}"; then
+
+    sleep 3
+    if podman exec squid squid -k parse >/dev/null 2>&1; then
+      echo "  ✔  New Squid is up and the egress policy parses."
+      podman rm -f squid-old >/dev/null 2>&1 || true
+      SQUID_TAG="$target_ver"; SQUID_DIGEST="${_UPD_DIGEST}"
+      _save_pinned
+      echo "  ✔  Squid updated to ${target_ver}."
+    else
+      echo "✗  New Squid rejected the policy — rolling back."
+      podman rm -f squid >/dev/null 2>&1 || true
+      podman rename squid-old squid >/dev/null 2>&1 || true
+      podman start squid >/dev/null 2>&1 || true
+      return 1
+    fi
+  else
+    echo "✗  New Squid failed to start — rolling back."
+    podman rename squid-old squid >/dev/null 2>&1 || true
+    podman start squid >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
 do_cs_update() {
   local target_ver="${1:-${CS_TAG:-$PINNED_CS_VER}}"
   echo "── CrowdSec ───────────────────────────────────────────────────"
@@ -1812,13 +1911,16 @@ do_digest_check() {
   do_wp_update "${WP_TAG:-$PINNED_WP_VER}" || wp_rc=$?
   do_db_update "${DB_TAG:-$PINNED_DB_VER}" || db_rc=$?
   do_cs_update "${CS_TAG:-$PINNED_CS_VER}" || cs_rc=$?
+  local sq_rc=0
+  do_squid_update "${SQUID_TAG:-$PINNED_SQUID_VER}" || sq_rc=$?
   echo ""
   echo "── Digest Check Summary ──"
   _fmt_rc() { case "$1" in 0) echo "OK" ;; *) echo "FAILED (rc=$1)" ;; esac; }
   printf "  WordPress: %s\n" "$(_fmt_rc "$wp_rc")"
   printf "  MariaDB:   %s\n" "$(_fmt_rc "$db_rc")"
   printf "  CrowdSec:  %s\n" "$(_fmt_rc "$cs_rc")"
-  [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && return 0
+  printf "  Squid:     %s\n" "$(_fmt_rc "$sq_rc")"
+  [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && [ "$sq_rc" -eq 0 ] && return 0
   return 1
 }
 
@@ -1836,6 +1938,8 @@ do_all_updates() {
   do_wp_update || wp_rc=$?
   do_db_update || db_rc=$?
   do_cs_update || cs_rc=$?
+  local sq_rc=0
+  do_squid_update || sq_rc=$?
   echo ""
   echo "── Update Summary ──"
   _fmt_rc() { case "$1" in 0) echo "OK" ;; *) echo "FAILED (rc=$1)" ;; esac; }
@@ -1843,7 +1947,8 @@ do_all_updates() {
   printf "  WordPress: %s\n" "$(_fmt_rc "$wp_rc")"
   printf "  MariaDB:   %s\n" "$(_fmt_rc "$db_rc")"
   printf "  CrowdSec:  %s\n" "$(_fmt_rc "$cs_rc")"
-  [ "$os_rc" -eq 0 ] && [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && return 0
+  printf "  Squid:     %s\n" "$(_fmt_rc "$sq_rc")"
+  [ "$os_rc" -eq 0 ] && [ "$wp_rc" -eq 0 ] && [ "$db_rc" -eq 0 ] && [ "$cs_rc" -eq 0 ] && [ "$sq_rc" -eq 0 ] && return 0
   return 1
 }
 
@@ -1876,11 +1981,17 @@ show_check_summary() {
   _report_one "WordPress" "$WP_REGISTRY" "${WP_TAG:-$PINNED_WP_VER}" "$WP_DIGEST"
   _report_one "MariaDB"   "$DB_REGISTRY" "${DB_TAG:-$PINNED_DB_VER}" "$DB_DIGEST"
   _report_one "CrowdSec"  "$CS_REGISTRY" "${CS_TAG:-$PINNED_CS_VER}" "$CS_DIGEST"
+  # Squid only when egress filtering put it there; silent otherwise so a
+  # non-egress deployment's status is not cluttered with an absent component.
+  if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+    _report_one "Squid"     "$SQUID_REGISTRY" "${SQUID_TAG:-$PINNED_SQUID_VER}" "$SQUID_DIGEST"
+  fi
   if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
     _PIN_COUNT=0
     [ -n "$WP_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
     [ -n "$DB_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
     [ -n "$CS_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
+    [ -n "$SQUID_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
     echo "║  Digest pinning: enabled — ${_PIN_COUNT}/3 currently pinned"
   else
     echo "║  Digest pinning: disabled"
@@ -1901,7 +2012,7 @@ show_check_summary() {
   echo "     jump to a new version on their own, so an unattended update can't swap in"
   echo "     a new major WordPress or a new MariaDB line."
   echo "   • 'versions' / 'upgrade' find and move to newer RELEASES (e.g. WordPress"
-  echo "     6.9.4 -> 6.9.5 for a CVE fix). Run 'update.sh versions' to see what's out,"
+  echo "     6.9.6 -> 6.9.7 for a CVE fix). Run 'update.sh versions' to see what's out,"
   echo "     then 'update.sh upgrade' (guided, with candidate-test + rollback) or name"
   echo "     one directly: update.sh wp <version>."
   show_status
@@ -1912,7 +2023,7 @@ show_check_summary() {
 # ═══════════════════════════════════════════════════════════════════════════
 # digest-check answers "has the tag I'm on been rebuilt?" (same version, new
 # digest). This answers a different question: "has a newer VERSION been
-# published?" — e.g. you're pinned to WordPress 6.9.4 and 6.9.5 is out with a
+# published?" — e.g. you're pinned to WordPress 6.9.6 and 6.9.7 is out with a
 # security fix. It lists available tags from the registry (Skopeo list-tags),
 # filters to the real release tags for each image, and compares versions so
 # you can SEE a newer release and choose to move the pin to it. `upgrade` then
@@ -1977,7 +2088,7 @@ _registry_tags() {
 }
 
 # _wp_latest_stable VARIANT — newest stable WordPress X.Y.Z for the given
-# variant suffix (e.g. php8.3-apache). Beta/RC/cli tags are excluded by the
+# variant suffix (e.g. php8.4-apache). Beta/RC/cli tags are excluded by the
 # strict ^X.Y.Z-variant$ shape (they don't start with a bare version number).
 _wp_latest_stable() {
   _wls_re=$(printf '%s' "$1" | sed 's/[.]/\\./g')
@@ -2144,6 +2255,20 @@ do_versions() {
     echo "     move  : update.sh crowdsec v${_newest_cs}"
   else
     echo "    latest : v${_newest_cs}   (up to date)"
+  fi
+
+  # Squid, only when egress filtering installed it. Its Canonical image is
+  # tracked by DIGEST rather than a semver tag we parse (the tag is a channel
+  # like 6.13-24.04_stable that Canonical rebuilds in place with CVE fixes),
+  # so freshness for Squid is a digest-check question, not a "newer tag?" one.
+  if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+    echo ""
+    echo "  Squid (egress proxy):"
+    echo "    pinned : ${SQUID_TAG:-$PINNED_SQUID_VER}"
+    echo "    note   : Canonical rebuilds this channel in place with security"
+    echo "             fixes, so newness shows up as a digest change, not a new"
+    echo "             tag. Check and apply with:"
+    echo "               update.sh squid          # digest check + guided update"
   fi
   echo ""
   echo "  This is a VERSION check (is a newer release published?), separate from"
@@ -2343,16 +2468,17 @@ case "${1:-check}" in
   wp)          acquire_lock || exit 1; do_wp_update "${2:-}" ;;
   db)          acquire_lock || exit 1; do_db_update "${2:-}" ;;
   crowdsec|cs) acquire_lock || exit 1; do_cs_update "${2:-}" ;;
+  squid)       acquire_lock || exit 1; do_squid_update "${2:-}" ;;
   all)         acquire_lock || exit 1; do_all_updates ;;
   digest-check|digest|pin) acquire_lock || exit 1; do_digest_check ;;
   versions|check-versions|ver) do_versions ;;
   upgrade|upgrade-all)         acquire_lock || exit 1; do_upgrade ;;
   trivy|scan)
     setup_trivy
-    for img in wordpress mariadb crowdsec; do
+    for img in wordpress mariadb crowdsec squid; do
       running=$(podman inspect "$img" --format "{{.Config.Image}}" 2>/dev/null || echo "")
       [ -n "$running" ] && scan_image "$running"
     done ;;
   check|status|"") show_check_summary ;;
-  *) echo "Usage: update.sh [check|status|versions|upgrade|os|wp [VER]|db [VER]|crowdsec [VER]|digest-check|all|trivy]"; exit 1 ;;
+  *) echo "Usage: update.sh [check|status|versions|upgrade|os|wp [VER]|db [VER]|crowdsec [VER]|squid [VER]|digest-check|all|trivy]"; exit 1 ;;
 esac

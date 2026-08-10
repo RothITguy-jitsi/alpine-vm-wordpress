@@ -35,7 +35,7 @@ That is fixed: every normal assertion now requires the command to succeed before
 | Candidate DB isolation (17) | **DONE (light form)** — candidate runs under a temporary SELECT-only account, dropped on every exit path; `wasp-selftest.sh candidate-isolation` proves the grant refuses writes. Does NOT test migrations — see below | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
 | Production findings approval (14) — CLOSED | **DONE** — the y/N override is now a recorded, digest-scoped, expiring exception with a written justification, emailed to a governance address chosen at install | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
 | Off-VM backup gate (18) | **DONE** — optional at install (scp / rsync / rclone), pushed after each verified backup, size-confirmed remotely, and checked weekly by `wasp-selftest.sh`. Append-only destination is prompted for and reported honestly rather than assumed | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
-| Egress restriction (20) | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
+| Egress restriction (20) — DESTINATION-AWARE, see Squid section | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
 | Trivy installer checksum (15) | **DONE** — pinned to v0.72.0 with the release checksums file anchored by SHA-256, plus a denylist refusing the known-compromised 0.69.4/0.69.5/0.69.6 builds regardless of install path | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
 | CrowdSec key in argv (21) | Deferred | Eliminating the brief argv exposure depends on whether the installed cscli supports a stdin/fd interface |
 | Backup restoration proof | **DONE** — `wasp-selftest.sh restore-test` restores the newest archive into a throwaway isolated MariaDB and verifies schema, siteurl, users and row counts against production. Weekly | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
@@ -309,7 +309,45 @@ Proposed compromise, not yet done:
   the whole story" — to `docs/design-notes.md`, leaving a one-line reference.
 - Only touch files whose header exceeds ~60 lines.
 
-## Safe site import — PLANNED, biggest remaining item
+## Safe site import — IMPLEMENTED (v1), see docs/IMPORT-DESIGN.md
+
+`where`, `fetch`, `list`, `inspect`, `extract`, `scan`, `staged`, `apply`.
+Untested on real hardware. `.wpress` still declines with instructions
+rather than being half-handled.
+
+
+Full design written after researching the actual backup formats. Three things
+the research changed:
+
+- **All-in-One WP Migration's `.wpress` is a custom binary format**, not an
+  archive — fixed-width headers (255-byte name, 14-byte size, 12-byte mtime,
+  4096-byte path). A reader is needed, and writing one in POSIX shell is
+  unpleasant enough that it may be deferred to v2.
+- **UpdraftPlus splits into several archives** that must all be present. A
+  missing `-plugins.zip` produces a site that half-works confusingly, so the
+  set has to be validated before anything is extracted.
+- **Duplicator ships an `installer.php`** which is a documented site-takeover
+  vector. It is deleted on sight and never executed — a tool that runs one as
+  part of "restore" is doing the attacker's work.
+
+The design's central rule: nothing from the archive is reachable by the web
+server, or executed by anything, until it has been scanned. Extract to staging
+outside the docroot, scan there, decide there, move last. The natural
+implementation — extract into the docroot then scan — leaves a webshell live
+and serving for the duration of the scan, on a site being imported *because*
+it is suspected compromised.
+
+Two threats worth naming that most import tooling ignores entirely: the
+serialised `cron` option, where a scheduled task re-infects the filesystem
+after a clean and makes the malware look like it "came back"; and mu-plugins,
+which are active on arrival with no activation step to withhold.
+
+Implementation order is in the document. Steps 1–3 — `inspect`, bounded
+extraction, dump scanning — are worth shipping alone: "tell me what is in this
+backup before I touch it" is a real need, and it is the part with no
+destructive failure mode.
+
+## Original note
 
 Design notes already recorded above. The primitives exist: `--path` scanning,
 `--json` output, quarantine, core comparison against the pinned image. What is

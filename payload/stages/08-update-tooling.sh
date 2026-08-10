@@ -34,6 +34,22 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/was
   install -m 0755 "${PAYLOAD_DIR}/bin/wasp-testreport.sh" /usr/local/bin/wasp-testreport.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
+# The inbox is group-writable by the admin user so SFTP drops a file in
+# without a permissions fight -- the most common reason a non-technical
+# handover stalls. Not world-readable: a client's backup contains their
+# database.
+mkdir -p /var/lib/wasp-import/incoming
+if [ -n "${ADMIN_USER:-}" ]; then
+  chown "root:${ADMIN_USER}" /var/lib/wasp-import/incoming 2>/dev/null || true
+  chmod 2770 /var/lib/wasp-import/incoming
+else
+  chmod 750 /var/lib/wasp-import/incoming
+fi
+ok "Import inbox ready: /var/lib/wasp-import/incoming"
+ok "  How to get a backup there: wp-import.sh where"
 # Only install what the chosen method needs. rclone is ~50 MB, so it is not
 # pulled onto a VM that will never use it.
 # age is installed only when encryption was actually configured -- and if it

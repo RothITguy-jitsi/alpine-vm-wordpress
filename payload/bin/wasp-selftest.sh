@@ -129,6 +129,10 @@ restore_test() {
     return
   fi
   _p "Archive passes gzip integrity"
+  # NOTE: this proves the LOCAL backup restores. It does NOT prove the offsite
+  # copy can be pulled and decrypted -- a remote object can be truncated or
+  # encrypted to a key you no longer hold. Prove that separately, periodically:
+  #   wasp-offsite-backup.sh remote-restore-drill
 
   # Throwaway instance: isolated network, no published port, own data dir.
   cleanup_scratch

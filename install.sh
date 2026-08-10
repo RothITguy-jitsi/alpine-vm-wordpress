@@ -163,6 +163,20 @@ fi
 WASP_VERSION="2026.08.05"
 WASP_VERSION_NOTE="login slug is the bare /<slug> (no -login suffix)"
 
+# Persist a durable record that this install skipped signature verification.
+# validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
+# lab build can never be quietly mistaken for a verified one later -- the
+# state lives on disk, not just in the install log that scrolls away.
+_mark_unverified() {
+  mkdir -p /etc/wp-install 2>/dev/null || true
+  {
+    echo "UNVERIFIED_INSTALL=1"
+    echo "UNVERIFIED_REASON=\"${1:-unspecified}\""
+    echo "UNVERIFIED_AT=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+  } > /etc/wp-install/UNVERIFIED 2>/dev/null || true
+  chmod 644 /etc/wp-install/UNVERIFIED 2>/dev/null || true
+}
+
 WASP_PUBKEY="${WASP_PUBKEY:-RWSi+SUZQWeFKd9yTC3Q7xAEADUph345WdgwOOlxK+dV40GHEqMsFTPc}"    # set to the release key; empty = unsigned build
 
 # Where the key fingerprint is published independently of this repository.
@@ -293,18 +307,34 @@ verify_release() {
       echo "  WASP_REQUIRE_SIGNATURE=1 is set. Refusing." >&2
       exit 1
     fi
+    # A certified production install must not proceed unverified by ANY path.
+    # An MSP that ships client sites cannot have "signature check failed, but
+    # someone set a bypass variable" as a reachable outcome -- the whole point
+    # of signing is defeated if a flag skips it. So under
+    # DEPLOYMENT_PROFILE=production, neither the noninteractive
+    # WASP_ACCEPT_UNVERIFIED escape nor the interactive UNVERIFIED prompt is
+    # available; the only fix is a correctly signed build.
+    if [[ "${DEPLOYMENT_PROFILE:-standard}" == "production" ]]; then
+      echo "  DEPLOYMENT_PROFILE=production: an unverified install is not permitted." >&2
+      echo "  Signature verification must pass. Supply a correctly signed build" >&2
+      echo "  (WASP_PUBKEY set, MANIFEST.sha256[.minisig] present and valid)," >&2
+      echo "  or re-run under DEPLOYMENT_PROFILE=standard for a lab install." >&2
+      exit 1
+    fi
     if [[ ! -t 0 ]]; then
       echo "  Not an interactive session, so this cannot be confirmed. Refusing." >&2
       echo "  To install unverified deliberately, run interactively, or set" >&2
       echo "  WASP_ACCEPT_UNVERIFIED=1 having understood the above." >&2
       [[ "${WASP_ACCEPT_UNVERIFIED:-0}" == "1" ]] || exit 1
       echo "  WASP_ACCEPT_UNVERIFIED=1 — continuing unverified." >&2
+      _mark_unverified "noninteractive WASP_ACCEPT_UNVERIFIED=1"
       return 0
     fi
     printf "  Type UNVERIFIED to proceed anyway, anything else to stop: " >&2
     read -r _uv
     [[ "$_uv" == "UNVERIFIED" ]] || { echo "  Stopped." >&2; exit 1; }
     echo "  Proceeding UNVERIFIED at your explicit request." >&2
+    _mark_unverified "interactive UNVERIFIED confirmation"
     return 0
   }
 

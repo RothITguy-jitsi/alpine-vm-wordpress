@@ -25,6 +25,49 @@ else
   WEB_RULE="tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 fi
 
+# ── Egress proxy enforcement ─────────────────────────────────────────────────
+# The control that turns Squid from a suggestion into a boundary.
+#
+# WordPress's own proxy settings are honoured only by code that chooses to
+# honour them. A plugin calling fsockopen(), or curl without CURLOPT_PROXY,
+# goes straight past WP_PROXY_HOST and reaches the internet directly. Without
+# a firewall rule the proxy filters only well-behaved traffic — which is not
+# the traffic anyone is worried about.
+#
+# So: wp-front may reach the proxy, and nothing else on the WAN. Squid runs on
+# the same bridge and is exempt because it IS the sanctioned path out.
+#
+# Placed BEFORE the general container-egress accept, or it never matches.
+if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
+  EGRESS_PROXY_FORWARD="        # WordPress -> Squid only. Everything else outbound is dropped.
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.2 tcp dport 3128 accept
+        # DNS is pinned to the network's OWN resolver (the wp-front gateway,
+        # where aardvark-dns listens), NOT allowed to any destination. Allowing
+        # 53 to the whole internet leaves a DNS tunnel open: a compromised
+        # WordPress can exfiltrate by encoding data into lookups to a resolver
+        # it controls, entirely bypassing Squid. Squid resolves external names
+        # itself (rule below), so WordPress only needs to resolve 'mariadb' and
+        # the handful of names its own direct paths use -- all via the gateway.
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 53 accept
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 53 accept
+        # NTP to the gateway/host time service only, for the same reason: no
+        # arbitrary-destination UDP 123 from the container subnet.
+        ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 123 accept
+        # Squid reaches the web, and resolves external destinations itself. It
+        # is the only thing that may leave, and its DNS also goes to the
+        # gateway resolver rather than anywhere.
+        ip saddr 10.89.10.2 ip daddr 10.89.10.1 udp dport 53 accept
+        ip saddr 10.89.10.2 ip daddr 10.89.10.1 tcp dport 53 accept
+        ip saddr 10.89.10.2 tcp dport { 80, 443 } accept
+        # Everything else from wp-front, logged then dropped. The log is what
+        # discovery reads to find destinations the allowlist is missing, and
+        # now also catches any attempt to reach an off-network resolver.
+        ip saddr 10.89.10.0/24 limit rate 10/minute log prefix \"nft-egress-bypass \" level warn
+        ip saddr 10.89.10.0/24 counter drop"
+else
+  EGRESS_PROXY_FORWARD="        # Egress proxy not enabled — WordPress reaches the web directly."
+fi
+
 # ── Web restriction, enforced where published ports actually pass ────────────
 # VERIFIED BROKEN ON A LIVE VM: with WEB_CIDR=192.168.100.101, a curl from
 # 192.168.100.148 connected successfully. The input-chain rule below reads
@@ -239,6 +282,7 @@ ${PVE_BLOCK_FORWARD}
         # containers may send" rule placed above these would sever the
         # database connection while looking like a hardening win.
 ${WEB_CIDR_FORWARD}
+${EGRESS_PROXY_FORWARD}
         ip daddr 10.89.10.0/24 accept
         ip daddr 10.89.20.0/24 accept
         # wp-db (10.89.20.0/24) is --internal: netavark never routes it to
