@@ -66,6 +66,26 @@ cat > /etc/motd << 'MOTD'
   or run any tool in /usr/local/bin directly (wp-*, wasp-*, update, ...).
 
 MOTD
+
+# ── Bare-name aliases ────────────────────────────────────────────────────────
+# The tools install with a .sh suffix, but everything an operator reads --
+# these installer prompts, the runbooks, the README, the motd -- refers to them
+# by bare name: `wasp-egress test`, `wasp-menu`, `update.sh check`. On the first
+# real install an operator typed `wasp-egress status` exactly as the installer
+# had told them to, and got "not found".
+#
+# Rather than rewrite every reference to add .sh (and have the mismatch come
+# back the next time someone writes a doc from memory), both spellings now
+# work. Symlinks, so `ls -l` shows plainly what they point at.
+for _t in /usr/local/bin/*.sh; do
+  [ -e "$_t" ] || continue
+  _bare="${_t%.sh}"
+  # Never clobber a real binary that happens to share the name.
+  if [ ! -e "$_bare" ]; then
+    ln -sf "$_t" "$_bare" 2>/dev/null || true
+  fi
+done
+ok "Bare-name aliases created (wasp-egress and wasp-egress.sh both work)"
 # The inbox is group-writable by the admin user so SFTP drops a file in
 # without a permissions fight -- the most common reason a non-technical
 # handover stalls. Not world-readable: a client's backup contains their

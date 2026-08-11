@@ -88,9 +88,19 @@ ts "Waiting for MariaDB to accept connections (up to 3 min)"
 # query + InnoDB validation used at update time, with the old ping-only
 # check kept as a fallback only if that script is somehow missing.
 DB_READY=0
+# Intermediate polls are SILENCED. mariadb-health-check.sh is written to be run
+# against a database that should already be up, so it reports every failed sub-
+# check loudly -- correct there, badly wrong here, where "not ready yet" is the
+# expected state for the first few polls. On the first real hardware install
+# this printed two full blocks of red "✗ MariaDB health: ONE OR MORE CRITICAL
+# CHECKS FAILED" before succeeding on the third poll, which reads like a
+# disaster in the log and sends an operator debugging a database that was
+# simply still starting. Output is captured and only shown if we run out of
+# attempts -- at which point it is genuinely diagnostic.
+_db_last_out=""
 for i in $(seq 1 36); do
   if [ -x /usr/local/bin/mariadb-health-check.sh ]; then
-    if /usr/local/bin/mariadb-health-check.sh mariadb; then
+    if _db_last_out=$(/usr/local/bin/mariadb-health-check.sh mariadb 2>&1); then
       DB_READY=1; break
     fi
   # Run mariadbd ping INSIDE the container where MARIADB_ROOT_PASSWORD is set.
@@ -100,8 +110,15 @@ for i in $(seq 1 36); do
         mariadb-admin  ping --silent -uroot -p"${MARIADB_ROOT_PASSWORD}" 2>/dev/null'; then
     DB_READY=1; break
   fi
+  # A progress note every 30s, so a genuinely stuck database is still visible
+  # without a wall of failed sub-checks.
+  [ $(( i % 6 )) -eq 0 ] && echo "     still waiting for MariaDB ($(( i * 5 ))s)…"
   sleep 5
 done
+if [ "$DB_READY" = "0" ] && [ -n "$_db_last_out" ]; then
+  warn "MariaDB never became healthy — last check output:"
+  printf '%s\n' "$_db_last_out" | sed 's/^/    /'
+fi
 [ "$DB_READY" = "1" ] \
   && ok "MariaDB healthy — ping + real query (root and wpdb) + InnoDB initialized" \
   || warn "MariaDB did not pass full health validation in 3 min — WordPress will retry. Check: PRUN logs mariadb | tail -20"
@@ -337,17 +354,38 @@ chown 33:33 "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php" 2>/dev/null || true
 # A leftover placeholder would be a PHP parse error -> site-wide fatal, and an
 # mu-plugin cannot be disabled from wp-admin, so this is checked now while a
 # console still exists to fix it.
+#
+# BUG FIX (found on the first real hardware install): this used to verify with
+# `PRUN exec wordpress php -l ...`, but at THIS point in the stage the
+# WordPress container has not been created yet -- it is pulled and started
+# below. So the exec always failed, and every install reported
+# "MFA mu-plugin failed php -l — NOT enforcing", regardless of whether the file
+# was fine. A check whose failure mode is "always warn" trains people to ignore
+# it, and here it also silently disabled a security control that was working.
+#
+# The placeholder check below needs no container, so it stays here. The real
+# php -l is deferred to _verify_mfa_mu_plugin, called after WordPress is up.
 if grep -q "WPVM_MFA_.*_PLACEHOLDER" "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php" 2>/dev/null; then
   warn "MFA mu-plugin still has a placeholder — enforcement will fatal. Fix by hand."
-elif PRUN exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php >/dev/null 2>&1; then
-  if [ "${MFA_ENFORCE:-0}" = "1" ]; then
-    ok "MFA enforcement mu-plugin installed (required for admins, ${MFA_GRACE_DAYS:-7}-day grace)"
-  else
-    ok "MFA enforcement mu-plugin installed (present, enforcement OFF)"
-  fi
 else
-  warn "MFA mu-plugin failed php -l — NOT enforcing. Check: podman logs wordpress"
+  ok "MFA enforcement mu-plugin written (php -l verified once WordPress is up)"
 fi
+
+# Verify the mu-plugin parses, once there is a container able to parse it.
+# Called after the WordPress container is confirmed running.
+_verify_mfa_mu_plugin() {
+  [ -f "${SMTP_MU_DIR}/03-wpvm-mfa-enforce.php" ] || return 0
+  if PRUN exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php >/dev/null 2>&1; then
+    if [ "${MFA_ENFORCE:-0}" = "1" ]; then
+      ok "MFA enforcement active (required for admins, ${MFA_GRACE_DAYS:-7}-day grace)"
+    else
+      ok "MFA enforcement mu-plugin verified (present, enforcement OFF)"
+    fi
+  else
+    warn "MFA mu-plugin failed php -l — NOT enforcing. Inspect:"
+    warn "  podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php"
+  fi
+}
 
 # NOTE: the Two Factor PLUGIN (the TOTP/backup-code machinery this mu-plugin
 # enforces) is installed in stage 08, after wp-plugins.sh exists to install it.
@@ -453,6 +491,10 @@ for i in $(seq 1 24); do
 done
 [ "$WP_READY" = "0" ] && warn "WordPress did not pass full health validation after 24 attempts — check: podman logs wordpress"
 ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>/dev/null)"
+
+# Now that a WordPress container exists, it can parse the mu-plugin. This was
+# attempted far too early in an earlier version and always failed.
+_verify_mfa_mu_plugin
 
 # Fix uploads ownership — critical for theme/plugin/media uploads.
 # Root cause: WordPress Docker entrypoint runs as UID 0 and creates

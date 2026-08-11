@@ -226,7 +226,7 @@ ok "Storage driver: ${DRIVER_CHOSEN}"
 DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 
 _skopeo_digest() {
-  # $1 = full tag reference, e.g. docker.io/wordpress:6.9.6-php8.4-apache
+  # $1 = full tag reference, e.g. docker.io/wordpress:7.0.2-php8.4-apache
   # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
   # missing, network error, unparseable output) — treated as "fall back",
   # never as fatal.
@@ -359,10 +359,10 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   # proxy that cannot be updated is a proxy that silently ages on exactly the
   # axis (CVEs) that made us add mitigations for it in the first place.
   if [ "${EGRESS_PROXY:-0}" = "1" ]; then
-    SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:6.13-24.04_stable}"
+    SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:latest}"
     SQUID_IMAGE=$(_pin_digest "$SQUID_IMAGE" "Squid")
     SQUID_TAG_INIT="${SQUID_IMAGE##*:}"
-    case "$SQUID_IMAGE" in *@sha256:*) SQUID_TAG_INIT="6.13-24.04_stable" ;; esac
+    case "$SQUID_IMAGE" in *@sha256:*) SQUID_TAG_INIT="latest" ;; esac
   fi
 
   # ── Visibility: pin-count summary, captured now before GeoIP can later

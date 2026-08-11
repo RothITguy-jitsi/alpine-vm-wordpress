@@ -33,7 +33,13 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   # minute. That made Squid the one container update.sh could not check, scan
   # or pin. It now follows the same digest model as WordPress, MariaDB and
   # CrowdSec, and pinned.env carries SQUID_DIGEST the same way.
-  SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:6.13-24.04_stable}"
+  # `latest` deliberately, not a pinned version tag. Canonical's scheme is
+  # <squid>-<ubuntu>_<channel> (e.g. 6.6-24.04_edge) and the set of published
+  # combinations is not guessable -- an earlier version of this file invented
+  # "6.13-24.04_stable", which does not exist, and Squid silently fell back to
+  # an unpinned tag on a real install. `latest` is guaranteed to exist, and the
+  # DIGEST resolved at install is what actually pins us, so nothing is lost.
+  SQUID_IMAGE="${SQUID_IMAGE:-docker.io/ubuntu/squid:latest}"
   SQUID_RUN_IMAGE="$SQUID_IMAGE"
   if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
     [ -n "${SQUID_DIGEST:-}" ] && SQUID_RUN_IMAGE="docker.io/ubuntu/squid@${SQUID_DIGEST}"

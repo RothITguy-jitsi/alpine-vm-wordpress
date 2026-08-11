@@ -245,7 +245,7 @@ printf "  ║  L2 wp-admin   cidr=%-11s  extra-ip=%-16s║\n" "${ADMIN_CIDR:-ope
 printf "  ║  mod_remoteip  proxy=%-40s║\n"  "${PROXY_IP:-not configured (direct)}"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"
   # Pre-compute summary values (avoids quote-in-subshell issues)
-  _WP_PORT_DESC="6.9.6-php8.4-apache → port 80"
+  _WP_PORT_DESC="7.0.2-php8.4-apache → port 80"
   if [[ -n "${VM_STATIC_IP}" ]]; then
     _NET_DESC="${NET_MODE:-dhcp} → ${VM_STATIC_IP}/${VM_PREFIX} via ${VM_GATEWAY}"
   else

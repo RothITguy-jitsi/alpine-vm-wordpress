@@ -6,6 +6,77 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11 — First hardware run: five real bugs, one of them fatal
+
+The platform ran on real hardware for the first time. It failed. Everything
+below was invisible to a check suite that had been passing for weeks, which is
+the point worth recording: the checks proved the code did what the code said,
+and the code said the wrong thing.
+
+**FATAL — two container tags that do not exist.** The install died fifteen
+minutes in with `manifest unknown` on
+`docker.io/wordpress:6.9.6-php8.4-apache`. That tag was set during an earlier
+"version audit" by reasoning from the WordPress *release* history: 6.9.6 had
+shipped, PHP 8.4 was the supported line, so 6.9.6-php8.4-apache must be the
+tag. It never existed. The Docker library builds a specific set of
+version+variant combinations and a WordPress release number is not
+automatically a Docker tag. Corrected to `7.0.2-php8.4-apache`, verified
+against the official-images manifest rather than inferred.
+
+The same mistake had been made for Squid: `ubuntu/squid:6.13-24.04_stable` was
+invented from a CVE advisory that mentioned package version 6.13-1ubuntu1.2.
+Canonical's actual scheme is `<squid>-<ubuntu>_<channel>` (e.g.
+`6.6-24.04_edge`). Squid degraded quietly to an unpinned tag rather than
+failing, which is arguably worse — the digest-pinning guarantee was silently
+lost. Now `latest`, which is guaranteed to exist; the digest resolved at
+install is what actually pins us, so nothing is given up.
+
+**Preflight tag verification added, so this class fails in seconds.** The host
+now checks each pinned tag against the registry before creating a VM, and
+refuses to continue on a definite 404 with the offending tag named. It only
+warns if the registry is unreachable — an install should not be blocked because
+Docker Hub is having a bad day. Fifteen minutes of waiting for a site that was
+never going to come up is now a two-second error.
+
+**MFA verification ran against a container that did not exist yet.** Stage 06
+wrote the enforcement mu-plugin and then verified it with
+`podman exec wordpress php -l ...` — but WordPress is pulled and started later
+in the same stage. The exec therefore always failed, and every install reported
+"MFA mu-plugin failed php -l — NOT enforcing" no matter what. A check whose
+failure mode is "always warn" trains people to ignore it, and this one also
+silently disabled a working security control. The placeholder check (which
+needs no container) stays where it was; the real `php -l` is deferred to after
+WordPress is confirmed healthy.
+
+**Tools installed as `*.sh` while every document said the bare name.** The
+installer's own prompt says "Verify enforcement after install: wasp-egress
+test". The operator typed exactly that and got `wasp-egress: not found`, because
+the tool is `wasp-egress.sh`. Rather than rewrite every reference and have the
+drift return, stage 08 now creates bare-name symlinks for all fifteen tools, so
+both spellings work.
+
+**MariaDB startup printed a wall of red for a database that was fine.** The
+readiness loop called `mariadb-health-check.sh`, which is written to be run
+against a database that should already be up and so reports every failed
+sub-check loudly. During startup that is exactly wrong: two full blocks of
+"✗ MariaDB health: ONE OR MORE CRITICAL CHECKS FAILED" scrolled past before the
+third poll succeeded. Intermediate polls are now silent, with a progress note
+every thirty seconds, and the captured output is shown only if the loop
+genuinely runs out of attempts.
+
+**A sixth bug was nearly introduced while fixing the fifth**: the new progress
+note called `info`, which is not a defined helper in the payload. Caught by
+checking the available helpers instead of assuming, then audited across every
+stage for the same class. None found.
+
+The honest lesson: the static suite, the mocks and the logic tests were all
+green throughout. They were checking internal consistency, and every one of
+these bugs is a disagreement between the code and the outside world — a
+registry, a container lifecycle, an operator's fingers. Only running it found
+them.
+
+---
+
 ## Unreleased — Proofreading pass: two real errors, and a check so links cannot rot
 
 A spelling and grammar pass across every document, done with tooling rather than

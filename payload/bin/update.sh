@@ -81,7 +81,7 @@ set -e
 # exist yet, or is missing an entry for a component (fresh VM never
 # updated through this script, or the file was lost). Once pinned.env has
 # a value for a component, THAT value is authoritative, not this constant.
-PINNED_WP_VER="6.9.6-php8.4-apache"
+PINNED_WP_VER="7.0.2-php8.4-apache"
 PINNED_DB_VER="11.4"
 PINNED_CS_VER="v1.7.8"
 WP_REGISTRY="docker.io/wordpress"
@@ -90,7 +90,7 @@ CS_REGISTRY="docker.io/crowdsecurity/crowdsec"
 # Squid: only present when egress filtering is enabled. Kept on the same
 # digest-pinned footing as the rest so a filtering proxy does not silently
 # age on the one axis -- CVEs -- that its whole reason for existing depends on.
-PINNED_SQUID_VER="6.13-24.04_stable"
+PINNED_SQUID_VER="latest"
 SQUID_REGISTRY="docker.io/ubuntu/squid"
 
 # Loopback-only port do_wp_update() uses to validate a freshly pulled
@@ -367,7 +367,7 @@ require_clean_container_state() {
 }
 
 # ── Skopeo: remote digest lookup, no image pull ────────────────────────────
-# $1 = full tag reference, e.g. docker.io/wordpress:6.9.6-php8.4-apache
+# $1 = full tag reference, e.g. docker.io/wordpress:7.0.2-php8.4-apache
 # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
 # missing, network error, unparseable output) — every caller treats that as
 # "fall back to the old method", never as fatal.
@@ -2012,7 +2012,7 @@ show_check_summary() {
   echo "     jump to a new version on their own, so an unattended update can't swap in"
   echo "     a new major WordPress or a new MariaDB line."
   echo "   • 'versions' / 'upgrade' find and move to newer RELEASES (e.g. WordPress"
-  echo "     6.9.6 -> 6.9.7 for a CVE fix). Run 'update.sh versions' to see what's out,"
+  echo "     7.0.2 -> 7.0.3 for a CVE fix). Run 'update.sh versions' to see what's out,"
   echo "     then 'update.sh upgrade' (guided, with candidate-test + rollback) or name"
   echo "     one directly: update.sh wp <version>."
   show_status
@@ -2023,7 +2023,7 @@ show_check_summary() {
 # ═══════════════════════════════════════════════════════════════════════════
 # digest-check answers "has the tag I'm on been rebuilt?" (same version, new
 # digest). This answers a different question: "has a newer VERSION been
-# published?" — e.g. you're pinned to WordPress 6.9.6 and 6.9.7 is out with a
+# published?" — e.g. you're pinned to WordPress 7.0.2 and 7.0.3 is out with a
 # security fix. It lists available tags from the registry (Skopeo list-tags),
 # filters to the real release tags for each image, and compares versions so
 # you can SEE a newer release and choose to move the pin to it. `upgrade` then
@@ -2259,7 +2259,7 @@ do_versions() {
 
   # Squid, only when egress filtering installed it. Its Canonical image is
   # tracked by DIGEST rather than a semver tag we parse (the tag is a channel
-  # like 6.13-24.04_stable that Canonical rebuilds in place with CVE fixes),
+  # like `latest` or `6.6-24.04_edge` that Canonical rebuilds in place),
   # so freshness for Squid is a digest-check question, not a "newer tag?" one.
   if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
     echo ""

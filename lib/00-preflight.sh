@@ -108,3 +108,60 @@ command -v qemu-nbd  &>/dev/null || msg_error "'qemu-nbd' not found — apt inst
 command -v qemu-img  &>/dev/null || msg_error "'qemu-img' not found — apt install qemu-utils"
 command -v openssl   &>/dev/null || msg_error "'openssl' not found."
 
+# ── Container tags must actually exist ───────────────────────────────────────
+# LEARNED FROM A REAL FAILED INSTALL. The WordPress tag was set to
+# 6.9.6-php8.4-apache by reasoning from the WordPress *release* history --
+# but the Docker library only builds a specific set of version+variant
+# combinations, so that tag never existed. Nothing noticed until the in-VM
+# stages had been running for fifteen minutes and podman finally said
+# "manifest unknown", by which point a VM had been created, a disk imported,
+# and the operator had been waiting for a site that was never going to come up.
+#
+# Checking the tag resolves is a two-second HTTP request. Doing it here turns
+# that fifteen-minute mystery into an immediate, specific error naming the tag.
+#
+# It fails CLOSED on a definite 404 (the tag really is not there) and only
+# WARNS if the registry is unreachable or rate-limits us -- an install should
+# not be blocked because Docker Hub is having a bad day, or because this host
+# reaches the registry through a proxy this check does not know about.
+_tag_exists() {   # namespace repo tag  ->  0 ok, 1 definitely missing, 2 unknown
+  local ns="$1" repo="$2" tag="$3" code
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 8 \
+    "https://hub.docker.com/v2/repositories/${ns}/${repo}/tags/${tag}/" 2>/dev/null) || code="000"
+  case "$code" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *)   return 2 ;;
+  esac
+}
+
+_check_image_tags() {
+  local payload_wp payload_squid unknown=0
+  payload_wp=$(sed -n 's|^WP_IMAGE="docker.io/wordpress:\(.*\)"|\1|p' \
+    "${SCRIPT_DIR:-.}/payload/install-wordpress.sh" 2>/dev/null | head -1)
+  payload_squid=$(sed -n 's|.*docker.io/ubuntu/squid:\([a-zA-Z0-9._-]*\).*|\1|p' \
+    "${SCRIPT_DIR:-.}/payload/stages/09-crowdsec-and-backup.sh" 2>/dev/null | head -1)
+
+  if [[ -n "$payload_wp" ]]; then
+    _tag_exists library wordpress "$payload_wp"
+    case $? in
+      0) msg_ok "Image tag verified: wordpress:${payload_wp}" ;;
+      1) msg_error "wordpress:${payload_wp} does not exist in the registry. The install would fail ~15 minutes in with 'manifest unknown'. Check https://hub.docker.com/_/wordpress/tags for a real tag and correct WP_IMAGE in payload/install-wordpress.sh." ;;
+      2) unknown=1 ;;
+    esac
+  fi
+
+  if [[ -n "$payload_squid" ]]; then
+    _tag_exists ubuntu squid "$payload_squid"
+    case $? in
+      0) msg_ok "Image tag verified: ubuntu/squid:${payload_squid}" ;;
+      1) msg_error "ubuntu/squid:${payload_squid} does not exist. Canonical's scheme is <squid>-<ubuntu>_<channel> (e.g. 6.6-24.04_edge) or plain 'latest'. Correct SQUID_IMAGE in payload/stages/09-crowdsec-and-backup.sh." ;;
+      2) unknown=1 ;;
+    esac
+  fi
+
+  [[ $unknown -eq 1 ]] && msg_warn "Could not reach the registry to verify image tags — continuing. If the install later dies with 'manifest unknown', a pinned tag is wrong."
+  return 0
+}
+_check_image_tags
+
