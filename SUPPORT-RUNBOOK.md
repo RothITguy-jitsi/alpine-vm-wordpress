@@ -312,27 +312,35 @@ Reset 2FA for that one user from the console. This does not touch their
 password; it removes their enrolled second factors so they can log in with the
 password alone and immediately re-enrol:
 
+**wp-cli runs in its own container.** The WordPress image does not contain a
+`wp` binary — `podman exec wordpress wp ...` fails with "wp: not found". Use the
+wp-cli container, which shares the site's network and environment:
+
 ```sh
 # On the VM console (qm terminal <VMID>), as root:
 wp-plugins.sh doctor    # confirm wp-cli can reach the site first
 
+# A small wrapper, so the rest of this section stays readable:
+wpcli() {
+  podman run --rm --network container:wordpress --user 33:33 \
+    --env-file /etc/wordpress/env -e WORDPRESS_DB_HOST=mariadb:3306 \
+    -v /home/wpuser/wp/html:/var/www/html \
+    "$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env | tr -d '"')" \
+    wp --path=/var/www/html "$@"
+}
+
 # Remove the user's two-factor providers. Replace <login> with their username.
-podman exec --user 33 wordpress \
-  wp --path=/var/www/html user meta delete <login> _two_factor_enabled_providers
-podman exec --user 33 wordpress \
-  wp --path=/var/www/html user meta delete <login> _two_factor_provider
+wpcli user meta delete <login> _two_factor_enabled_providers
+wpcli user meta delete <login> _two_factor_provider
 
 # Also clear the WASP grace anchor so they get a fresh window to re-enrol,
 # rather than being blocked again on their next login.
-podman exec --user 33 wordpress \
-  wp --path=/var/www/html user meta delete <login> wpvm_mfa_grace_start
+wpcli user meta delete <login> wpvm_mfa_grace_start
 
 # And clear Two Factor's own login rate-limit counters, so the account is not
 # still throttled from the failed 2FA attempts that led to the lockout.
-podman exec --user 33 wordpress \
-  wp --path=/var/www/html user meta delete <login> _two_factor_last_login_failure
-podman exec --user 33 wordpress \
-  wp --path=/var/www/html user meta delete <login> _two_factor_failed_login_attempts
+wpcli user meta delete <login> _two_factor_last_login_failure
+wpcli user meta delete <login> _two_factor_failed_login_attempts
 ```
 
 > The two `_two_factor_*` provider keys are the plugin's own storage

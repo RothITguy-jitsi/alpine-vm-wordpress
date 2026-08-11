@@ -670,7 +670,24 @@ apply)
   # salts and scheduled tasks. Skipping this leaves a site configured for
   # somewhere else, with credentials someone else may know.
   _hdr "Re-hardening"
-  _wp() { podman exec --user 33 -i wordpress wp --path=/var/www/html --allow-root "$@" 2>/dev/null; }
+  # wp-cli runs in its OWN container: the official wordpress:*-apache image does
+  # NOT ship wp-cli, so `podman exec wordpress wp ...` fails with "wp: not found".
+  # This shares the running container's network and env-file so wp-config resolves
+  # exactly as it does for the site itself.
+  _wpcli_image() {
+    _wi=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
+    [ -n "$_wi" ] || _wi="docker.io/library/wordpress:cli"
+    printf '%s' "$_wi"
+  }
+  _wp() {
+    podman run --rm \
+      --network "container:wordpress" \
+      --user 33:33 \
+      --env-file /etc/wordpress/env \
+      -e WORDPRESS_DB_HOST=mariadb:3306 \
+      -v /home/wpuser/wp/html:/var/www/html \
+      "$(_wpcli_image)" wp --path=/var/www/html "$@" 2>/dev/null
+  }
 
   _url="${WP_SCHEME:-https}://${WP_DOMAIN:-localhost}"
   _wp option update home "$_url"    >/dev/null && _ok "home    -> ${_url}"
@@ -698,7 +715,7 @@ apply)
   echo ""
   _warn "Every account above can log in. Any you do not recognise is a backdoor."
   _note "  wp-forensics.sh admins"
-  _note "Reset a password:  podman exec --user 33 wordpress wp --path=/var/www/html user update <login> --user_pass='<new>'"
+  _note "Reset a password:  wp-plugins.sh doctor   then use wp-cli via the container (see SUPPORT-RUNBOOK.md)"
 
   # ── Record and verify ────────────────────────────────────────────────────
   {

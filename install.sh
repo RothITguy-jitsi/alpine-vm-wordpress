@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11"
-WASP_VERSION_NOTE="FIRST HARDWARE RUN FIXES: corrected two non-existent image tags that killed the install; MFA php -l no longer runs before the container exists; bare-name tool aliases; quiet MariaDB startup polling; preflight tag verification"
+WASP_VERSION="2026.08.11c"
+WASP_VERSION_NOTE="Squid cache_dir null removed (not built in Ubuntu squid - the parse failure); wp-cli invocations fixed (wp-cli is a separate container, and the wp arg was missing); digest gate now covers Squid; squid parse failures now capture diagnostics"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

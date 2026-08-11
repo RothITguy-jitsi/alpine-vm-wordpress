@@ -30,6 +30,28 @@ warn() { echo "  ⚠  $*"; }
 # the right exit behavior.
 err()  { echo "  ✗  $*" >&2; exit 1; }
 
+# ── Deferred production blockers ─────────────────────────────────────────────
+# LEARNED FROM A REAL INSTALL. A fail-closed control (Squid not starting under
+# DEPLOYMENT_PROFILE=production) called err() in the MIDDLE of stage 09. The
+# install stopped there, so CrowdSec never started, backups were never
+# installed, and stage 10 -- which carries validate-wordpress.sh,
+# wp-hardening.sh and wp-malware-scan.sh -- never ran at all. The operator was
+# left with FEWER tools to diagnose the problem precisely because a problem had
+# occurred, and the box looked half-built for a reason that was not obvious.
+#
+# Refusing to certify a broken production install is right. Aborting mid-build
+# is not. block_production() records the reason and lets the install FINISH, so
+# every diagnostic tool exists; the install then refuses at the end, loudly,
+# and leaves a durable marker that health checks and the report surface.
+PRODUCTION_BLOCKERS=/etc/wp-install/PRODUCTION-BLOCKERS
+block_production() {
+  mkdir -p /etc/wp-install 2>/dev/null || true
+  printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$PRODUCTION_BLOCKERS" 2>/dev/null || true
+  warn "PRODUCTION BLOCKER: $*"
+  warn "  The install will CONTINUE so the diagnostic tooling gets installed,"
+  warn "  then refuse to certify this VM at the end."
+}
+
 # ── Pinned image versions ─────────────────────────────────────────────────────
 # BUG FIX: mariadb:11.4-lts does NOT exist on Docker Hub.
 # These are STARTING FLOORS, not the version you end up on. `update.sh check`
@@ -247,3 +269,28 @@ STAGE_DIR=/etc/wp-install/stages
 . "${STAGE_DIR}/08-update-tooling.sh"
 . "${STAGE_DIR}/09-crowdsec-and-backup.sh"
 . "${STAGE_DIR}/10-security-tooling-and-validation.sh"
+
+# ── Final gate ───────────────────────────────────────────────────────────────
+# Everything is installed by now, which is the point: if a fail-closed control
+# tripped earlier, the operator still has the full toolset to diagnose it with.
+# Now, and only now, refuse to certify the VM.
+if [ -s "${PRODUCTION_BLOCKERS:-/etc/wp-install/PRODUCTION-BLOCKERS}" ]; then
+  echo ""
+  echo "════════════════════════════════════════════════════════════════"
+  echo "  INSTALL COMPLETED, BUT THIS VM IS NOT PRODUCTION-READY"
+  echo "════════════════════════════════════════════════════════════════"
+  echo ""
+  echo "  The following fail-closed controls did not pass:"
+  sed 's/^/    /' "${PRODUCTION_BLOCKERS:-/etc/wp-install/PRODUCTION-BLOCKERS}"
+  echo ""
+  echo "  Every tool is installed, so you can diagnose from here:"
+  echo "    wasp-menu                     # 7) Testing -> 1) Commission check"
+  echo "    podman logs squid             # if the blocker was the egress proxy"
+  echo "    validate-wordpress.sh         # full validation"
+  echo ""
+  echo "  This marker persists at ${PRODUCTION_BLOCKERS:-/etc/wp-install/PRODUCTION-BLOCKERS}"
+  echo "  and is surfaced by --check and the test report until it is resolved"
+  echo "  and removed. Do not hand this VM to a client until it is empty."
+  echo "════════════════════════════════════════════════════════════════"
+  exit 1
+fi

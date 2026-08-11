@@ -78,11 +78,16 @@ inf "login URL: $([ -n "${WP_ADMIN_SLUG:-}" ] && printf '/%s' "$WP_ADMIN_SLUG" |
 # ── 1. Baseline ──────────────────────────────────────────────────────────────
 # Unverified-install banner: the most important provenance fact, placed right
 # after the report title rather than buried in a section.
+if [ -s /etc/wp-install/PRODUCTION-BLOCKERS ]; then
+  no "THIS VM WAS NOT CERTIFIED PRODUCTION-READY AT INSTALL"
+  while IFS= read -r _b; do inf "  ${_b}"; done < /etc/wp-install/PRODUCTION-BLOCKERS
+  inf "  Resolve, then remove /etc/wp-install/PRODUCTION-BLOCKERS."
+fi
 if [ -f /etc/wp-install/UNVERIFIED ]; then
   . /etc/wp-install/UNVERIFIED 2>/dev/null || true
-  warn "THIS BUILD WAS INSTALLED UNVERIFIED (${UNVERIFIED_REASON:-reason unrecorded})"
-  warn "  at ${UNVERIFIED_AT:-unknown time}. Signature verification did not pass."
-  warn "  A production/MSP deployment must be reinstalled from a signed build."
+  no "THIS BUILD WAS INSTALLED UNVERIFIED (${UNVERIFIED_REASON:-reason unrecorded})"
+  inf "  at ${UNVERIFIED_AT:-unknown time}. Signature verification did not pass."
+  inf "  A production/MSP deployment must be reinstalled from a signed build."
 fi
 
 hdr "1. BASELINE"
@@ -262,14 +267,14 @@ if [ -f "$_vex" ]; then
         [ -n "$_exp" ] || continue
         _es=$(date -u -d "$_exp" +%s 2>/dev/null || echo 0)
         if [ "$_es" -gt "$_now" ]; then
-          _active=$((_active+1)); warn "ACTIVE exception (expires ${_exp}): ${_line}"
+          _active=$((_active+1)); no "ACTIVE exception (expires ${_exp}): ${_line}"
         fi ;;
     esac
   done < "$_vex"
-  [ "$_active" = 0 ] && _p "No active vulnerability exceptions"
-  [ "$_active" -gt 0 ] && warn "${_active} active exception(s) — confirm each is still justified"
+  [ "$_active" = 0 ] && inf "No active vulnerability exceptions"
+  [ "$_active" -gt 0 ] && no "${_active} active exception(s) — confirm each is still justified"
 else
-  _p "No vulnerability exceptions have ever been recorded"
+  inf "No vulnerability exceptions have ever been recorded"
 fi
 
 hdr "14. SCHEDULED JOBS"

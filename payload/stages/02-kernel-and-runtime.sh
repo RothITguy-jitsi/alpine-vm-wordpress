@@ -369,12 +369,23 @@ if [ "${USE_DIGEST_PINNING:-1}" = "1" ]; then
   # reassign WP_IMAGE to a locally-built (never digest-pinned) image, which
   # would otherwise make a successfully-pinned upstream pull look like a
   # failure in any summary computed after that point. ──────────────────────
+  # Squid must be counted too when egress filtering installed it. It was not,
+  # so the denominator was hardcoded to 3 and a real install that pinned FOUR
+  # images reported "3/3 pinned". Worse than cosmetic: this gate is fail-closed
+  # under production, so a Squid digest that fell back to tag-only would have
+  # passed the check silently -- the egress proxy was outside the very
+  # guarantee the gate exists to enforce.
   DIGEST_PIN_COUNT=0
+  DIGEST_PIN_TOTAL=3
   case "$WP_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
   case "$DB_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
   case "$CROWDSEC_IMAGE" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
-  DIGEST_PIN_SUMMARY="${DIGEST_PIN_COUNT}/3 pinned"
-  if [ "$DIGEST_PIN_COUNT" = "3" ]; then
+  if [ "${EGRESS_PROXY:-0}" = "1" ]; then
+    DIGEST_PIN_TOTAL=4
+    case "${SQUID_IMAGE:-}" in *@sha256:*) DIGEST_PIN_COUNT=$((DIGEST_PIN_COUNT+1)) ;; esac
+  fi
+  DIGEST_PIN_SUMMARY="${DIGEST_PIN_COUNT}/${DIGEST_PIN_TOTAL} pinned"
+  if [ "$DIGEST_PIN_COUNT" = "$DIGEST_PIN_TOTAL" ]; then
     ok "Digest pinning: ${DIGEST_PIN_SUMMARY}"
   else
     # BUG FIX (v7-13, ChatGPT Finding 9): under DEPLOYMENT_PROFILE=production
@@ -440,5 +451,5 @@ SQUID_DIGEST="${SQUID_PIN_DIGEST:-}"
 PINNEDENV
 chmod 600 "$_PINNEDENV_TMP"
 mv -f "$_PINNEDENV_TMP" /etc/wp-install/pinned.env
-ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}"
+ok "pinned.env written — WordPress ${WP_TAG_INIT}, MariaDB ${DB_TAG_INIT}, CrowdSec ${CS_TAG_INIT}${SQUID_TAG_INIT:+, Squid ${SQUID_TAG_INIT}}"
 

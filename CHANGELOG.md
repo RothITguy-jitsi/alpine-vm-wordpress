@@ -6,6 +6,120 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11c — The in-VM log: the Squid blocker identified, and wp-cli was never working
+
+The missing in-VM log confirmed the previous round of fixes landed: WordPress
+pulled at 7.0.2 and went healthy, all four images digest-pinned via Skopeo,
+MariaDB started with no spurious red, and MFA reported **active** through the
+deferred verification. It also showed exactly where the install stopped, and
+surfaced a class of bug that had been failing silently since it was written.
+
+**The Squid parse failure: `cache_dir null /tmp`.** The `null` store type
+requires squid to be built with the null storeio module. Alpine's build has it;
+Debian/Ubuntu's typically does not (ufs, aufs, diskd, rock). When the container
+was switched from `alpine + apk add squid` to Canonical's `ubuntu/squid`, that
+line silently became a parse-time fatal, so squid started, rejected its own
+policy, and crash-looped. The line was also redundant -- `cache deny all`
+directly above it already means nothing is ever cached. Removed; squid is now
+memory-only, which is what a filtering forward proxy wants and which parses on
+every build.
+
+**Squid failures now capture their own diagnosis.** The old check reported that
+the policy was rejected and nothing else, which cost a full redeploy to learn
+anything. It now captures the parser output, the container log, the container
+state and the log-directory ownership to /var/log/wasp-squid-parse.log, and
+prints the error lines inline. A fail-closed control that cannot say WHY is only
+half a control.
+
+**wp-cli has never worked.** Two separate bugs, both invisible:
+
+- The wrapper ran `podman run … wordpress:cli plugin install two-factor`. That
+  image's entrypoint execs its arguments directly unless the first starts with a
+  dash, so it tried to exec a program called `plugin` and died with "plugin: not
+  found". The explicit `wp` was missing. Every call site suppresses stderr and
+  falls back to a friendly message, so this looked like nothing.
+- Three tools and the support runbook used `podman exec wordpress wp …`. The
+  official `wordpress:*-apache` image does not contain a `wp` binary at all --
+  wp-cli is a separate image, which is why wp-plugins.sh has WPCLI_IMAGE. So
+  `wp-import.sh`, `wp-rotate-secrets.sh` and the validate two-factor check were
+  all calling a binary that was never there. Worst of these: the MFA console
+  recovery procedure in SUPPORT-RUNBOOK.md, which would have failed at exactly
+  the moment someone was locked out of their own site. All routed through the
+  wp-cli container now.
+
+**A false success report.** `if _wp plugin install "$_slug" 2>&1 | sed …` tests
+SED's exit status, which is always 0. The install printed "✔ Installed
+two-factor" on the line immediately after wp-cli had failed. Output is now
+captured, the real exit status judged, then printed.
+
+**The production digest gate did not cover Squid.** The count was hardcoded to
+three, so an install that pinned four images reported "3/3 pinned". Not
+cosmetic: this gate is fail-closed under production, so a Squid digest that fell
+back to tag-only would have passed silently -- the egress proxy sat outside the
+very guarantee the gate exists to enforce. Now counted, with the denominator
+following whether egress is enabled.
+
+Standing caveat, unchanged: `cache_dir` is a strong, specific hypothesis for the
+parse failure, and the new diagnostic capture is what will confirm or refute it
+on the next run. That is the honest state -- the fix is reasoned from how the
+two squid builds differ, not yet from an error message that named it.
+
+---
+
+## 2026.08.11b — Second hardware run: the tag fix worked, three more bugs behind it
+
+The install got much further. WordPress pulled and started
+(`wordpress-geoip:7.0.2-php8.4-apache`), MariaDB and Squid both came up
+digest-pinned, the operator menu ran and reported the right build. The preflight
+tag check and the two corrected tags did their job. Then three more real bugs.
+
+**Squid crash-looped because of a leftover uid from the image swap.** The log
+directory was chowned to `100:101` — Alpine's squid user, from when this
+container was `alpine + apk add squid`. Canonical's `ubuntu/squid` runs as
+`proxy` (13:13), could not create `cache.log`, exited immediately, and
+`--restart=always` turned that into a silent loop showing "Up Less than a
+second" forever. The ownership is now QUERIED FROM THE IMAGE (`id -u proxy`)
+with a fallback, rather than replacing one magic number with another — the
+whole reason this bug existed was a hardcoded uid outliving the image it
+described.
+
+**Fail-closed aborted mid-install and left the operator with fewer tools.**
+Squid's failure tripped the production fail-closed check, which called `err()`
+in the middle of stage 09. The install stopped there: CrowdSec never started,
+backups were never installed, and stage 10 never ran at all — so
+`validate-wordpress.sh`, `wp-hardening.sh` and `wp-malware-scan.sh` were absent
+from a VM whose operator now urgently needed them. Refusing to certify a broken
+production install is right; aborting the build is not. Fail-closed controls
+now call `block_production()`, which records the reason and lets the install
+FINISH so every diagnostic tool exists, then refuses loudly at the end and
+leaves a durable `/etc/wp-install/PRODUCTION-BLOCKERS` marker. `--check` reports
+it as CRITICAL and the test report banners it, so a non-certified VM cannot fade
+into a green dashboard.
+
+**The test report died mid-run on an undefined helper.** `_p` was called in the
+vulnerability-exceptions section; the report's helpers are
+`ok/no/sk/inf/hdr/sub/run`. Two more latent instances of the same thing were
+found in the UNVERIFIED banner (`warn`, which that file also does not define).
+
+**That class now has a check.** This was its third appearance — `info` in a
+stage, `_p` and `warn` in the report. Every one passed `sh -n`, because calling
+an undefined command is a RUNTIME error in shell, not a syntax error: the shell
+parses `_p "hello"` perfectly and only fails when the line executes. The
+existing syntax sweep is structurally incapable of catching it.
+`check-undefined-helpers.py` collects what each file defines (plus what stages
+inherit from the entrypoint) and flags helper-shaped calls that resolve to
+nothing. It keeps a deliberately narrow vocabulary rather than trying to
+validate every command, so it stays signal. Verified retroactively:
+re-introducing `_p` makes it fail; removing it makes it pass.
+
+The pattern across both hardware runs is consistent. Every bug has been a
+disagreement between the code and something outside it — a registry's tag list,
+a base image's uid, a shell's runtime name resolution, an operator's fingers.
+None were logic errors, and none were catchable by tests that only compare the
+code to itself.
+
+---
+
 ## 2026.08.11 — First hardware run: five real bugs, one of them fatal
 
 The platform ran on real hardware for the first time. It failed. Everything

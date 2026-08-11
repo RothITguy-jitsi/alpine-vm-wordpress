@@ -110,6 +110,10 @@ if [ "${1:-}" = "--check" ]; then
   # An unverified install is a governance finding that should never be silent:
   # surface it in the machine-readable health so a fleet monitor flags it.
   [ -f /etc/wp-install/UNVERIFIED ] && { [ "$_p" -lt 1 ] && _p=1; _msg="${_msg}UNVERIFIED-build "; }
+  # A production blocker means a fail-closed control did not pass at install.
+  # CRITICAL, not warning: the VM completed its build but was explicitly not
+  # certified, and that must not fade quietly into a green dashboard.
+  [ -s /etc/wp-install/PRODUCTION-BLOCKERS ] && { _p=2; _msg="${_msg}PRODUCTION-BLOCKER "; }
 
   # --check --prom : same signal as Prometheus text for a textfile collector or
   # scrape endpoint (docs/FLEET.md Layer C). Stable metric names so a Grafana
@@ -505,7 +509,13 @@ if [ -f "$MU_MFA" ]; then
     # Is enforcement actually turned on in the installed copy?
     if grep -q "define( 'WPVM_MFA_ENFORCE', 1 )" "$MU_MFA" 2>/dev/null; then
       # Enforcement ON -> the Two Factor plugin MUST be active or admins lock out.
-      if podman exec --user 33 wordpress wp --path=/var/www/html plugin is-active two-factor >/dev/null 2>&1; then
+      # via the wp-cli CONTAINER: the wordpress image has no wp binary.
+      _wpcli_img=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
+      [ -n "$_wpcli_img" ] || _wpcli_img="docker.io/library/wordpress:cli"
+      if podman run --rm --network "container:wordpress" --user 33:33 \
+           --env-file /etc/wordpress/env -e WORDPRESS_DB_HOST=mariadb:3306 \
+           -v /home/wpuser/wp/html:/var/www/html \
+           "$_wpcli_img" wp --path=/var/www/html plugin is-active two-factor >/dev/null 2>&1; then
         pass "MFA enforced for admins and the Two Factor plugin is active"
       else
         fail "MFA is ENFORCED but the Two Factor plugin is not active" \

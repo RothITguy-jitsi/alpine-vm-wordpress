@@ -64,7 +64,24 @@ _mdb() { # run SQL as root inside the container
     'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$@"' _ "$@"
 }
 
-_wp() { podman exec --user 33 wordpress wp --path=/var/www/html --allow-root "$@" 2>/dev/null; }
+# wp-cli runs in its OWN container: the official wordpress:*-apache image does
+# NOT ship wp-cli, so `podman exec wordpress wp ...` fails with "wp: not found".
+# This shares the running container's network and env-file so wp-config resolves
+# exactly as it does for the site itself.
+_wpcli_image() {
+  _wi=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
+  [ -n "$_wi" ] || _wi="docker.io/library/wordpress:cli"
+  printf '%s' "$_wi"
+}
+_wp() {
+  podman run --rm \
+    --network "container:wordpress" \
+    --user 33:33 \
+    --env-file /etc/wordpress/env \
+    -e WORDPRESS_DB_HOST=mariadb:3306 \
+    -v /home/wpuser/wp/html:/var/www/html \
+    "$(_wpcli_image)" wp --path=/var/www/html "$@" 2>/dev/null
+}
 
 _snapshot() {
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"

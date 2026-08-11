@@ -20,7 +20,24 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   done
   touch /opt/squid/config/allowlist-maintenance.txt
   chmod 0644 /opt/squid/config/*.txt
-  chown -R 100:101 /opt/squid/logs 2>/dev/null || true
+  # The log directory must be writable by the user squid runs as INSIDE the
+  # container. This was 100:101 -- Alpine's squid uid:gid -- left behind when
+  # the container was switched from `alpine + apk add squid` to Canonical's
+  # ubuntu/squid, which runs as `proxy` (13:13 on Debian/Ubuntu). Squid could
+  # not create cache.log, exited immediately, and --restart=always turned that
+  # into a silent crash loop: `podman ps` showed "Up Less than a second"
+  # forever while nothing worked.
+  #
+  # Rather than swap one magic number for another, ask the image who it runs
+  # as. Falling back to 13 only if the query fails, so a future base-image
+  # change does not reintroduce exactly this bug.
+  _squid_uid=$(PRUN run --rm "${SQUID_IMAGE}" id -u proxy 2>/dev/null | tr -dc '0-9')
+  _squid_gid=$(PRUN run --rm "${SQUID_IMAGE}" id -g proxy 2>/dev/null | tr -dc '0-9')
+  [ -n "$_squid_uid" ] || _squid_uid=13
+  [ -n "$_squid_gid" ] || _squid_gid=13
+  chown -R "${_squid_uid}:${_squid_gid}" /opt/squid/logs 2>/dev/null || true
+  chmod 0755 /opt/squid/logs 2>/dev/null || true
+  ok "  Squid log dir owned by ${_squid_uid}:${_squid_gid} (queried from the image)"
 
   # A fixed address, because the firewall rule names it. A proxy whose address
   # moves is a firewall rule that stops matching, and the failure is silent:
@@ -61,7 +78,7 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
     || _squid_start_failed=1
   if [ "${_squid_start_failed:-0}" = "1" ]; then
     if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      err "Squid did not start and EGRESS_PROXY=1 under DEPLOYMENT_PROFILE=production. Egress fails closed, so ALL WordPress web access (updates, plugin/theme APIs, licence checks) is broken -- completing the install would ship a site that cannot reach the internet at all. Refusing. Check: podman logs squid. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where a dead proxy is acceptable."
+      block_production "Squid did not start (EGRESS_PROXY=1). Egress fails closed, so ALL WordPress web access (updates, plugin/theme APIs, licence checks) is broken -- completing the install would ship a site that cannot reach the internet at all. Refusing. Check: podman logs squid. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where a dead proxy is acceptable."
     fi
     warn "Squid failed to start — WordPress web egress will be denied (fails closed)"
   fi
@@ -79,14 +96,43 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   # workaround remains as defence in depth regardless of package version.
   _sqv=$(PRUN exec squid squid -v 2>/dev/null | sed -n 's/.*Version \([0-9.]*\).*/\1/p' | head -1)
   [ -n "$_sqv" ] && ok "  Squid ${_sqv} (Canonical image; keep current via: update.sh squid)"
-  if PRUN exec squid squid -k parse >/dev/null 2>&1; then
+  # A check that says "this failed" without saying WHY costs a whole
+  # redeploy cycle to diagnose. On a real install this printed "rejected its
+  # own policy" and nothing else, and the operator had no way to know whether
+  # it was a bad directive, an unreadable include, or the container dying
+  # under it. Capture the actual parser output and the container's own log,
+  # print the useful part inline, and keep the full text on disk.
+  _squid_diag=/var/log/wasp-squid-parse.log
+  if _sq_parse=$(PRUN exec squid squid -k parse 2>&1); then
     ok "  Egress policy parsed and loaded"
   else
+    {
+      echo "=== squid -k parse output ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
+      printf '%s\n' "$_sq_parse"
+      echo ""
+      echo "=== podman logs squid (last 50) ==="
+      PRUN logs --tail 50 squid 2>&1
+      echo ""
+      echo "=== container state ==="
+      PRUN ps -a --filter 'name=^squid$' --format '{{.Names}} {{.Status}} {{.Image}}' 2>&1
+      echo ""
+      echo "=== /opt/squid/logs ownership (squid must be able to write here) ==="
+      ls -ln /opt/squid/logs 2>&1
+      stat -c '%n owner=%u:%g mode=%a' /opt/squid/logs 2>&1
+    } > "$_squid_diag" 2>&1
+    chmod 600 "$_squid_diag" 2>/dev/null || true
+
+    warn "  Squid rejected the policy. The parser said:"
+    printf '%s\n' "$_sq_parse" | grep -iE 'error|fatal|cannot|unable|unrecogni|invalid|no such' \
+      | head -8 | sed 's/^/      /'
+    # If nothing matched the filter, the raw tail is still better than silence.
+    printf '%s\n' "$_sq_parse" | grep -qiE 'error|fatal|cannot|unable|unrecogni|invalid|no such' \
+      || printf '%s\n' "$_sq_parse" | tail -8 | sed 's/^/      /'
+    warn "  Full parser output + container log + log-dir ownership: ${_squid_diag}"
+
     if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      err "Squid started but rejected its own policy (squid -k parse failed) under DEPLOYMENT_PROFILE=production. A running proxy with a broken policy is worse than one that did not start: the firewall directs traffic to it and it does not filter. Refusing to complete the install. Check: podman logs squid. Retry once the policy parses, or re-run under DEPLOYMENT_PROFILE=standard for a lab install."
+      block_production "Squid started but rejected its own policy (squid -k parse failed). A running proxy with a broken policy is worse than one that did not start: the firewall directs traffic to it and it does not filter. Diagnostics captured at ${_squid_diag}."
     fi
-    warn "  Squid rejected the policy. Egress is denied until this is fixed:"
-    warn "    podman logs squid"
   fi
   ok "  Prove the boundary holds:  wasp-egress test"
 else

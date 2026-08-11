@@ -267,13 +267,19 @@ _wp() {
   # "Error establishing a database connection" -- which reads like a database
   # or (in wp-mail.sh) a mail-server fault when neither is wrong. Uses the
   # same env-file as the real container so the two cannot drift.
+  # NOTE the explicit `wp` before "$@". The wordpress:cli image's entrypoint
+  # execs its arguments directly unless the first one starts with a dash, so
+  # `podman run … wordpress:cli plugin install x` tries to exec a program
+  # called `plugin` and dies with "plugin: not found". Every _wp call was
+  # silently failing this way, hidden because each call site suppresses stderr
+  # and falls back to a friendly message.
   podman run --rm \
     --network "container:wordpress" \
     --user "${WPCLI_UID}:${WPCLI_UID}" \
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -v "${WP_HTML_DIR}:/var/www/html" \
-    "$WPCLI_IMAGE" "$@"
+    "$WPCLI_IMAGE" wp "$@"
 }
 
 show_status() {
@@ -475,7 +481,13 @@ do_install() {
   if _wp plugin is-installed "$_slug" 2>/dev/null; then
     echo "  ℹ  Already installed."
   else
-    if _wp plugin install "$_slug" 2>&1 | sed 's/^/  /'; then
+    # Capture, then judge, then print. `if _wp … | sed` would test SED's exit
+    # status -- always 0 -- so a failed install reported success. That is
+    # exactly what happened on a real VM: wp-cli died with "plugin: not found"
+    # and the line above it still said "✔ Installed two-factor".
+    _inst_out=$(_wp plugin install "$_slug" 2>&1); _inst_rc=$?
+    printf '%s\n' "$_inst_out" | sed 's/^/  /'
+    if [ "$_inst_rc" -eq 0 ]; then
       echo "  ✔  Installed ${_slug}"
     else
       echo "✗  Install failed. If egress filtering is on, confirm .wordpress.org" >&2
