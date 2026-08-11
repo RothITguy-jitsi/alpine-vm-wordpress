@@ -191,8 +191,99 @@ if [[ "$NET_MODE_SEL" == "2" ]]; then
     read -rp "  Gateway IPv4 address (required) : " VM_GATEWAY
     _valid_ipv4 "$VM_GATEWAY" && break || echo -e "  ${RD}Not a valid IPv4 address — try again.${CL}"
   done
-  read -rp "  DNS servers, space-separated [1.1.1.1 8.8.8.8] : " VM_DNS
-  VM_DNS="${VM_DNS:-1.1.1.1 8.8.8.8}"
+  # ── Resolver choice ────────────────────────────────────────────────────────
+  # The default used to be 1.1.1.1 + 8.8.8.8. Both are fast and reliable, and
+  # both are the wrong default for this product: Cloudflare and Google are US
+  # (Five Eyes) operators whose business is not DNS, and on a box built to
+  # minimise what leaks, every domain this VM ever looks up is exactly the kind
+  # of metadata worth not handing over by default.
+  #
+  # Quad9 is the default instead, and the reason is not only privacy. It
+  # BLOCKS KNOWN-MALICIOUS DOMAINS using threat intelligence, which is a real
+  # security layer on a WordPress host: a compromised plugin phoning home to a
+  # known C2 domain fails at resolution, before Squid, before nftables. It does
+  # not log client IPs, is GDPR-compliant, validates DNSSEC, and answers from
+  # 200+ locations across 90 countries, so it performs acceptably wherever the
+  # Proxmox host happens to be.
+  #
+  # Everything offered below serves PLAIN DNS on port 53, because that is what
+  # /etc/resolv.conf needs. This rules out several otherwise-excellent
+  # providers, and the exclusion is not a judgement on them:
+  #
+  #   * Mullvad          DoH/DoT ONLY. Its own documentation is explicit that
+  #                      the IPs "can only be used with DNS resolvers that
+  #                      support DoH or DoT, not with DNS over UDP/53 or
+  #                      TCP/53". Offering it here would have produced a VM
+  #                      with no working DNS at all.
+  #   * Applied Privacy  DoH/DoT only.
+  #   * Wikimedia DNS    DoH/DoT only.
+  #
+  # If this VM ever grows a local DoH/DoT stub resolver, they become viable and
+  # should be revisited. Until then, do not add them back.
+  echo ""
+  echo -e "  ${BLD}DNS resolver for this VM${CL}"
+  echo -e "  ${YW}Every domain this VM resolves is visible to whoever runs the${CL}"
+  echo -e "  ${YW}resolver. A resolver that also blocks known-malicious domains${CL}"
+  echo -e "  ${YW}stops a compromised plugin reaching its C2 before any other${CL}"
+  echo -e "  ${YW}control in this stack gets involved.${CL}"
+  echo ""
+  echo -e "  ${BLD}Global${CL} — pick these unless you have a reason not to"
+  echo "    1) Quad9              9.9.9.9  149.112.112.112   (recommended)"
+  echo "         blocks malicious domains, no IP logging, DNSSEC, 90 countries"
+  echo "         Swiss-based non-profit — outside Five/Nine/Fourteen Eyes"
+  echo "    2) AdGuard DNS        94.140.14.14  94.140.15.15"
+  echo "         also blocks ads and trackers; 15+ locations"
+  echo "    3) Control D          76.76.2.0  76.76.10.0"
+  echo "         free tier keeps no logs or timestamps; anycast"
+  echo "    4) DNS.SB             185.222.222.222  45.11.45.11"
+  echo "         no logging, no filtering, 30 locations, yearly transparency report"
+  echo ""
+  echo -e "  ${BLD}Europe${CL} — lower latency if the Proxmox host is in the EU"
+  echo "    5) DNS4EU             86.54.11.100  86.54.11.200"
+  echo "         EU-funded, GDPR, IPs anonymised; 1-2ms in Europe"
+  echo "    6) FFMUC              5.1.66.255  185.150.99.255"
+  echo "         non-profit, no logging, no tracking"
+  echo "    7) UncensoredDNS      91.239.100.100  89.233.43.71"
+  echo "         zero logging, warrant canary (Denmark)"
+  echo ""
+  echo -e "  ${BLD}Regional${CL}"
+  echo "    8) CIRA Shield        149.112.121.10  149.112.122.10"
+  echo "         malware/phishing blocking (Canada; slow elsewhere)"
+  echo ""
+  echo "    9) Enter your own"
+  echo ""
+  echo -e "  ${YW}Not offered: 1.1.1.1 and 8.8.8.8. Both are US Five-Eyes${CL}"
+  echo -e "  ${YW}operators; choose 9 if you specifically need them.${CL}"
+  echo ""
+  read -rp "  Resolver [1] : " _DNSC
+  case "${_DNSC:-1}" in
+    1)  VM_DNS="9.9.9.9 149.112.112.112" ;;
+    2)  VM_DNS="94.140.14.14 94.140.15.15" ;;
+    3)  VM_DNS="76.76.2.0 76.76.10.0" ;;
+    4)  VM_DNS="185.222.222.222 45.11.45.11" ;;
+    5)  VM_DNS="86.54.11.100 86.54.11.200" ;;
+    6)  VM_DNS="5.1.66.255 185.150.99.255" ;;
+    7)  VM_DNS="91.239.100.100 89.233.43.71" ;;
+    8)  VM_DNS="149.112.121.10 149.112.122.10" ;;
+    9)
+      while true; do
+        read -rp "  DNS servers, space-separated : " VM_DNS
+        VM_DNS="${VM_DNS:-9.9.9.9 149.112.112.112}"
+        _dns_bad=0
+        for _d in $VM_DNS; do
+          _valid_ipv4 "$_d" || { _dns_bad=1; echo -e "  ${RD}'${_d}' is not a valid IPv4 address.${CL}"; }
+        done
+        [ "$_dns_bad" = "0" ] && break
+      done
+      case "$VM_DNS" in
+        *1.1.1.1*|*8.8.8.8*|*8.8.4.4*|*1.0.0.1*)
+          msg_warn "  Cloudflare/Google chosen deliberately — noted." ;;
+      esac ;;
+    *)  VM_DNS="9.9.9.9 149.112.112.112"
+        msg_warn "  Unrecognised choice — using Quad9." ;;
+  esac
+  unset _DNSC _dns_bad _d
+  msg_ok "DNS: ${VM_DNS}"
   NET_MODE="static"
 
   # CIDR prefix -> dotted-decimal netmask (e.g. 24 -> 255.255.255.0)
@@ -220,6 +311,30 @@ echo -e "  ${YW}Root SSH login is always disabled on this VM. A dedicated admin 
 echo -e "  ${YW}is created instead, in the 'wheel' group, with doas configured for root${CL}"
 echo -e "  ${YW}access after login (root still has a local console password for${CL}"
 echo -e "  ${YW}'qm terminal' access — that's separate from SSH).${CL}"
+echo ""
+echo -e "  ${BLD}Don't have a key yet?${CL} Generate one on the machine you will connect FROM"
+echo -e "  ${YW}(not on this Proxmox host). It takes about ten seconds.${CL}"
+echo ""
+echo -e "  ${BLD}Linux / macOS${CL} — terminal:"
+echo "      ssh-keygen -t ed25519 -C \"\$(whoami)@\$(hostname)-wasp\" -f ~/.ssh/wasp_ed25519"
+echo "      cat ~/.ssh/wasp_ed25519.pub          # copy this whole line"
+echo ""
+echo -e "  ${BLD}Windows 10/11${CL} — PowerShell (OpenSSH is built in):"
+echo "      ssh-keygen -t ed25519 -C \"\$env:USERNAME@\$env:COMPUTERNAME-wasp\" -f \$env:USERPROFILE\\.ssh\\wasp_ed25519"
+echo "      Get-Content \$env:USERPROFILE\\.ssh\\wasp_ed25519.pub | Set-Clipboard"
+echo ""
+echo -e "  ${YW}Naming it (-f …/wasp_ed25519) rather than overwriting the default${CL}"
+echo -e "  ${YW}id_ed25519 keeps this VM's access separate from every other host${CL}"
+echo -e "  ${YW}you reach — you can revoke it without breaking anything else. Give${CL}"
+echo -e "  ${YW}it a passphrase when prompted; a stolen laptop should not be a${CL}"
+echo -e "  ${YW}stolen server.${CL}"
+echo ""
+echo -e "  ${YW}Paste the .pub line (public, safe to share). NEVER paste the file${CL}"
+echo -e "  ${YW}without .pub — that is the private half and must never leave the${CL}"
+echo -e "  ${YW}machine that generated it.${CL}"
+echo ""
+echo -e "  ${YW}Then connect with:  ssh -i ~/.ssh/wasp_ed25519 <admin>@<this-vm-ip>${CL}"
+echo ""
 echo "  Paste your public key (starts with ssh-ed25519 or ssh-rsa),"
 echo "  or press Enter to load from a file path."
 read -rp "  Public key (paste, or blank) : " SSH_KEY_PASTE
@@ -323,6 +438,34 @@ _ask_cidr() {  # $1 prompt text ; echoes validated value (may be empty)
     echo -e "  ${RD}Not a valid IPv4 address or CIDR (e.g. 192.168.1.0/24 or 192.168.1.5). Try again or leave blank.${CL}" >&2
   done
 }
+_ask_ip_list() {  # $1 prompt ; echoes SPACE-separated validated IPv4s (may be empty)
+  # Apache's `Require ip` takes a space-separated list natively, so several
+  # addresses cost nothing structurally -- the previous single-IP limit was
+  # arbitrary, and an MSP realistically has an office IP, a home IP, and one
+  # per travelling admin. Commas are accepted because that is how people
+  # naturally type a list; they are normalised to spaces.
+  local _p="$1" _v _one _bad _out
+  while :; do
+    printf '%s' "$_p" >&2
+    IFS= read -r _v
+    [ -z "$_v" ] && { printf ''; return 0; }
+    _v=$(printf '%s' "$_v" | tr ',;' '  ')
+    _bad=0; _out=""
+    for _one in $_v; do
+      case "$_one" in
+        */*) echo -e "  ${RD}'${_one}' looks like a CIDR range. This field takes single addresses; use the CIDR question above for a range.${CL}" >&2; _bad=1; continue ;;
+      esac
+      if _v15_valid_ipv4 "$_one"; then
+        _out="${_out:+$_out }$_one"
+      else
+        echo -e "  ${RD}'${_one}' is not a valid IPv4 address.${CL}" >&2; _bad=1
+      fi
+    done
+    if [ "$_bad" = "0" ] && [ -n "$_out" ]; then printf '%s' "$_out"; return 0; fi
+    echo -e "  ${YW}Try again, or leave blank for none.${CL}" >&2
+  done
+}
+
 _ask_single_ip() {  # $1 prompt text ; echoes validated single IPv4 (may be empty)
   local _p="$1" _v
   while :; do
@@ -376,7 +519,20 @@ echo -e "  ${YW}Your workstation is likely on one of these subnets (from the Pro
 ip -4 addr show scope global 2>/dev/null | awk '/inet /{split($2,a,"/"); print "    " a[1] "  (subnet: " $2 ")"}' | head -5
 echo ""
 ADMIN_CIDR=$(_ask_cidr "  Local network CIDR for wp-admin?  e.g. 192.168.100.0/24 (blank = open) : ")
-ALLOWED_ADMIN_IP=$(_ask_single_ip "  Additional IP for wp-admin?  (e.g. 203.0.113.5, blank = none)  : ")
+echo ""
+echo -e "  ${YW}  Additional individual addresses that may reach wp-admin, on top of${CL}"
+echo -e "  ${YW}  the CIDR above. Typical entries:${CL}"
+echo -e "  ${YW}    • your own public IP, so you can administer from outside the LAN${CL}"
+echo -e "  ${YW}      (find it with: curl -s ifconfig.me)${CL}"
+echo -e "  ${YW}    • a colleague or client admin working from a different office${CL}"
+echo -e "  ${YW}    • a static VPN exit address your team connects through${CL}"
+echo -e "  ${YW}  Several are fine — separate them with commas or spaces:${CL}"
+echo -e "  ${YW}    203.0.113.5, 198.51.100.20, 192.0.2.44${CL}"
+echo -e "  ${YW}  Leave blank if the CIDR above already covers everyone. Anything${CL}"
+echo -e "  ${YW}  not listed gets a 403 on wp-admin, so a dynamic home IP is worth${CL}"
+echo -e "  ${YW}  thinking about — you can add more later with:${CL}"
+echo -e "  ${YW}    wp-hardening.sh admin-rule${CL}"
+ALLOWED_ADMIN_IP=$(_ask_ip_list "  Additional IP(s) for wp-admin (blank = none) : ")
 echo ""
 echo -e "  ${BLD}Layer 2b — mod_remoteip (only needed if behind a reverse proxy):${CL}"
 echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the proxy IP${CL}"
@@ -633,37 +789,95 @@ SMTP_FROM=""; SMTP_FROM_NAME=""; SMTP_ENCRYPTION="tls"
 read -rp "  Configure outbound email now? [y/N] : " _WANT_SMTP
 case "${_WANT_SMTP}" in
   y|Y|yes|YES)
+    # ── Collect, then REVIEW ────────────────────────────────────────────────
+    # Reported from a real install: a typo in the username ("...@rothitguy-pro"
+    # instead of ".pro") could not be corrected, because a linear prompt flow
+    # has no way back and the only escape was to abort the whole installer.
+    # This section has the most fields and the most typo-prone ones, so it now
+    # ends in a review step: everything is shown back, and any single field can
+    # be re-entered by number without touching the others. Answering blank
+    # accepts and moves on, so the fast path is unchanged for anyone who typed
+    # it correctly the first time.
+    _smtp_collect_all=1
     while :; do
-      read -rp "  SMTP server hostname (e.g. mail.example.com) : " SMTP_HOST
-      SMTP_HOST=$(printf '%s' "$SMTP_HOST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-      [ -n "$SMTP_HOST" ] && break
-      msg_warn "  A hostname is required (or answer N to skip email entirely)."
+      if [ "$_smtp_collect_all" = "1" ]; then
+        while :; do
+          read -rp "  SMTP server hostname (e.g. mail.example.com) : " SMTP_HOST
+          SMTP_HOST=$(printf '%s' "$SMTP_HOST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          [ -n "$SMTP_HOST" ] && break
+          msg_warn "  A hostname is required (or answer N to skip email entirely)."
+        done
+        echo -e "  ${YW}587 = submission with STARTTLS (the standard, and the default).${CL}"
+        echo -e "  ${YW}465 = implicit TLS, encrypted from connect. Both are fine.${CL}"
+        echo -e "  ${YW}25 is deliberately not offered: it is for server-to-server${CL}"
+        echo -e "  ${YW}relay, is widely blocked outbound, and is unauthenticated.${CL}"
+        read -rp "  SMTP port [587] : " _SP
+        case "${_SP:-587}" in
+          465) SMTP_PORT="465"; SMTP_ENCRYPTION="ssl" ;;
+          *)   SMTP_PORT="587"; SMTP_ENCRYPTION="tls" ;;
+        esac
+        read -rp "  SMTP username (the full mailbox address) : " SMTP_USER
+        while :; do
+          read -rsp "  SMTP password / app password : " SMTP_PASS; echo
+          [ -n "$SMTP_PASS" ] && break
+          msg_warn "  Password cannot be empty — authenticated submission is required."
+        done
+        echo -e "  ${YW}The From address matters more than it looks. WordPress otherwise${CL}"
+        echo -e "  ${YW}sends as wordpress@<your-domain>, which is usually not a real${CL}"
+        echo -e "  ${YW}mailbox and usually not a sender your SPF record authorizes --${CL}"
+        echo -e "  ${YW}under a DMARC policy of quarantine or reject that means silent${CL}"
+        echo -e "  ${YW}non-delivery, which is the same invisible failure again. Use an${CL}"
+        echo -e "  ${YW}address on a domain whose SPF/DKIM covers this relay.${CL}"
+        read -rp "  From address [${SMTP_USER}] : " SMTP_FROM
+        SMTP_FROM="${SMTP_FROM:-$SMTP_USER}"
+        read -rp "  From name [${WP_SITE_TITLE:-WordPress}] : " SMTP_FROM_NAME
+        SMTP_FROM_NAME="${SMTP_FROM_NAME:-${WP_SITE_TITLE:-WordPress}}"
+        _smtp_collect_all=0
+      fi
+
+      echo ""
+      echo -e "  ${BLD}Check these before continuing:${CL}"
+      printf "    1) Server      %s\n"  "$SMTP_HOST"
+      printf "    2) Port        %s (%s)\n" "$SMTP_PORT" "$SMTP_ENCRYPTION"
+      printf "    3) Username    %s\n"  "$SMTP_USER"
+      printf "    4) Password    %s\n"  "$(printf '%*s' "${#SMTP_PASS}" '' | tr ' ' '*')"
+      printf "    5) From        %s\n"  "$SMTP_FROM"
+      printf "    6) From name   %s\n"  "$SMTP_FROM_NAME"
+      echo ""
+      read -rp "  Enter a number to change it, or press Enter to accept : " _SFIX
+      case "${_SFIX}" in
+        '') break ;;
+        1) while :; do
+             read -rp "  SMTP server hostname : " SMTP_HOST
+             SMTP_HOST=$(printf '%s' "$SMTP_HOST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+             [ -n "$SMTP_HOST" ] && break
+             msg_warn "  A hostname is required."
+           done ;;
+        2) read -rp "  SMTP port [587/465] : " _SP
+           case "${_SP:-587}" in
+             465) SMTP_PORT="465"; SMTP_ENCRYPTION="ssl" ;;
+             *)   SMTP_PORT="587"; SMTP_ENCRYPTION="tls" ;;
+           esac ;;
+        3) read -rp "  SMTP username (full mailbox address) : " SMTP_USER
+           # The From address usually tracks the username; offer to follow it
+           # rather than leave a stale value behind after a correction.
+           if [ -n "$SMTP_USER" ] && [ "$SMTP_FROM" != "$SMTP_USER" ]; then
+             read -rp "  Set From address to ${SMTP_USER} too? [Y/n] : " _SF
+             case "${_SF}" in n|N|no|NO) : ;; *) SMTP_FROM="$SMTP_USER" ;; esac
+           fi ;;
+        4) while :; do
+             read -rsp "  SMTP password / app password : " SMTP_PASS; echo
+             [ -n "$SMTP_PASS" ] && break
+             msg_warn "  Password cannot be empty."
+           done ;;
+        5) read -rp "  From address [${SMTP_USER}] : " SMTP_FROM
+           SMTP_FROM="${SMTP_FROM:-$SMTP_USER}" ;;
+        6) read -rp "  From name [${WP_SITE_TITLE:-WordPress}] : " SMTP_FROM_NAME
+           SMTP_FROM_NAME="${SMTP_FROM_NAME:-${WP_SITE_TITLE:-WordPress}}" ;;
+        *) msg_warn "  Enter 1-6, or press Enter to accept." ;;
+      esac
     done
-    echo -e "  ${YW}587 = submission with STARTTLS (the standard, and the default).${CL}"
-    echo -e "  ${YW}465 = implicit TLS, encrypted from connect. Both are fine.${CL}"
-    echo -e "  ${YW}25 is deliberately not offered: it is for server-to-server${CL}"
-    echo -e "  ${YW}relay, is widely blocked outbound, and is unauthenticated.${CL}"
-    read -rp "  SMTP port [587] : " _SP
-    case "${_SP:-587}" in
-      465) SMTP_PORT="465"; SMTP_ENCRYPTION="ssl" ;;
-      *)   SMTP_PORT="587"; SMTP_ENCRYPTION="tls" ;;
-    esac
-    read -rp "  SMTP username (the full mailbox address) : " SMTP_USER
-    while :; do
-      read -rsp "  SMTP password / app password : " SMTP_PASS; echo
-      [ -n "$SMTP_PASS" ] && break
-      msg_warn "  Password cannot be empty — authenticated submission is required."
-    done
-    echo -e "  ${YW}The From address matters more than it looks. WordPress otherwise${CL}"
-    echo -e "  ${YW}sends as wordpress@<your-domain>, which is usually not a real${CL}"
-    echo -e "  ${YW}mailbox and usually not a sender your SPF record authorizes --${CL}"
-    echo -e "  ${YW}under a DMARC policy of quarantine or reject that means silent${CL}"
-    echo -e "  ${YW}non-delivery, which is the same invisible failure again. Use an${CL}"
-    echo -e "  ${YW}address on a domain whose SPF/DKIM covers this relay.${CL}"
-    read -rp "  From address [${SMTP_USER}] : " SMTP_FROM
-    SMTP_FROM="${SMTP_FROM:-$SMTP_USER}"
-    read -rp "  From name [${WP_SITE_TITLE:-WordPress}] : " SMTP_FROM_NAME
-    SMTP_FROM_NAME="${SMTP_FROM_NAME:-${WP_SITE_TITLE:-WordPress}}"
+    unset _SFIX _SP _SF _smtp_collect_all
     msg_ok "SMTP: ${SMTP_USER}@${SMTP_HOST}:${SMTP_PORT} (${SMTP_ENCRYPTION}), from ${SMTP_FROM}"
     msg_info "  Verify delivery after install with:  wp-mail.sh test you@example.com"
     ;;
@@ -1234,7 +1448,17 @@ CTI_API_KEY=""; CTI_MONTHLY_BUDGET="40"; CTI_ENRICH_BANS="0"
 read -rsp "  CrowdSec CTI key (blank = skip) : " CTI_API_KEY; echo
 if [[ -n "$CTI_API_KEY" ]]; then
   msg_ok "CTI key captured (${#CTI_API_KEY} chars)"
-  read -rp "  Monthly lookup budget [40 = free tier] : " _CTB
+  # There are TWO free keys and they have different quotas, which is why this
+  # asks rather than assuming: a Community-plan account's free key is 40
+  # lookups/month, while a Premium-plan account's INCLUDED free key is 120.
+  # Both are "the free key" depending on who you ask. The budget matters
+  # because exhausting it mid-month silently stops enrichment.
+  echo ""
+  echo -e "  ${YW}  Free-key quotas (CrowdSec Console → Settings → CTI API Keys):${CL}"
+  echo -e "  ${YW}    Community plan  →  40 lookups/month${CL}"
+  echo -e "  ${YW}    Premium plan    →  120 lookups/month (included free key)${CL}"
+  echo -e "  ${YW}  Paid keys start at 5,000/month. Unused quota does NOT roll over.${CL}"
+  read -rp "  Monthly lookup budget [40] : " _CTB
   case "${_CTB}" in ''|*[!0-9]*) CTI_MONTHLY_BUDGET=40 ;; *) CTI_MONTHLY_BUDGET="$_CTB" ;; esac
   echo ""
   echo -e "  ${BLD}Automatically enrich login brute-force bans?${CL}"
@@ -1505,10 +1729,15 @@ echo -e "  ${YW}             validated, or if fewer than 3/3 container images re
 echo -e "  ${YW}             real digest, the install ABORTS instead of continuing under${CL}"
 echo -e "  ${YW}             unverified state. Right for MSP-graded deployments that need${CL}"
 echo -e "  ${YW}             to demonstrate the verifications actually succeeded.${CL}"
-read -rp "  Deployment profile? [standard/production] (default: standard) : " DEPLOY_SEL
-case "${DEPLOY_SEL:-standard}" in
-  production|prod|p) DEPLOYMENT_PROFILE="production" ;;
-  *)                 DEPLOYMENT_PROFILE="standard"   ;;
+echo ""
+echo "    1) standard    — warns on verification failures, continues (default)"
+echo "    2) production  — verification failures ABORT the install"
+read -rp "  Deployment profile? [1] : " DEPLOY_SEL
+case "${DEPLOY_SEL:-1}" in
+  2|production|prod|p) DEPLOYMENT_PROFILE="production" ;;
+  1|standard|std|s|'') DEPLOYMENT_PROFILE="standard"   ;;
+  *) DEPLOYMENT_PROFILE="standard"
+     msg_warn "  Unrecognised choice — using standard." ;;
 esac
 if [ "$DEPLOYMENT_PROFILE" = "production" ]; then
   msg_ok "Deployment profile: production — verification failures will abort the install"

@@ -241,7 +241,14 @@ fi
 printf "  ║  SSH      :  %-47s║\n" "$_SSH_DESC"
 [[ "${ADMIN_USER_CREATED:-0}" -eq 0 ]] && printf "  ║  ${RD}⚠ Admin account was NOT created — see install log, create by hand${CL}  ║\n"
 printf "  ║  L1 nftables   SSH=%-12s  Web=%-21s║\n" "${SSH_CIDR:-any}" "${WEB_CIDR:-any}"
-printf "  ║  L2 wp-admin   cidr=%-11s  extra-ip=%-16s║\n" "${ADMIN_CIDR:-open}" "${ALLOWED_ADMIN_IP:-none}"
+# extra-ip can now be a LIST, which would blow out this fixed-width box. Show
+# the addresses when they fit and a count when they do not, so the summary
+# stays readable and the border stays aligned.
+_xip="${ALLOWED_ADMIN_IP:-none}"
+if [ "${#_xip}" -gt 16 ]; then
+  _xip="$(printf '%s' "$ALLOWED_ADMIN_IP" | wc -w | tr -d ' ') addresses"
+fi
+printf "  ║  L2 wp-admin   cidr=%-11s  extra-ip=%-16s║\n" "${ADMIN_CIDR:-open}" "$_xip"
 printf "  ║  mod_remoteip  proxy=%-40s║\n"  "${PROXY_IP:-not configured (direct)}"
 echo   "  ╠══════════════════════════════════════════════════════════════╣"
   # Pre-compute summary values (avoids quote-in-subshell issues)

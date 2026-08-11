@@ -56,6 +56,7 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Egress control (Squid)](#egress-control-squid)
 - [Checking the whole VM](#checking-the-whole-vm-at-once)
 - [Alerts](#alerts)
+- [Choosing a DNS resolver](#choosing-a-dns-resolver)
 - [The operator menu](#the-operator-menu)
 - [Capturing a session for review](#capturing-a-session-for-review)
 - [Testing it from the outside](#testing-it-from-the-outside)
@@ -384,6 +385,20 @@ wp-notify.sh --test
 Identical alerts are deduplicated over 24 hours so a recurring fault doesn't become noise, with two exceptions that always send: backup failure and self-test failure. Both are silent-until-it-matters problems, and suppressing a repeat is how they stay unnoticed for months.
 
 `wp-notify.sh` sends governance notices to a separate address, warned about at install if it matches the admin address — a record only the decision-maker receives is a diary, not oversight.
+
+## Choosing a DNS resolver
+
+At install, a static-IP setup asks which resolver the VM should use. The default is **Quad9** (`9.9.9.9` / `149.112.112.112`), and the reason is not only privacy:
+
+- It **blocks known-malicious domains** using threat intelligence. On a WordPress host that is a real control — a compromised plugin phoning home to a known C2 domain fails at *resolution*, before Squid and before nftables ever see the traffic.
+- No client-IP logging, GDPR-compliant, DNSSEC-validating, and a Swiss-based non-profit, so it sits outside the Five/Nine/Fourteen Eyes arrangements.
+- 200+ locations across 90 countries, so it performs acceptably wherever the Proxmox host is.
+
+The prompt offers alternatives grouped by region (global, Europe, regional) with the trade-off for each, plus an option to enter your own.
+
+**`1.1.1.1` and `8.8.8.8` are deliberately not offered.** Both are fast and reliable, and both are US Five-Eyes operators whose business is not DNS. Every domain this VM ever resolves is exactly the metadata worth not handing over by default. If you need them, the custom option accepts them and the installer notes the choice rather than arguing with you.
+
+**Some good resolvers cannot be offered here at all.** `/etc/resolv.conf` needs plain DNS on port 53, and Mullvad, Applied Privacy and Wikimedia DNS are DoH/DoT-only — Mullvad's own documentation is explicit that its addresses do not answer on UDP/TCP 53. Listing one of them would produce a VM with no working DNS. That exclusion is recorded in the code so nobody helpfully adds them back.
 
 ## The operator menu
 

@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11c"
-WASP_VERSION_NOTE="Squid cache_dir null removed (not built in Ubuntu squid - the parse failure); wp-cli invocations fixed (wp-cli is a separate container, and the wp arg was missing); digest gate now covers Squid; squid parse failures now capture diagnostics"
+WASP_VERSION="2026.08.11f"
+WASP_VERSION_NOTE="Operator-requested prompt improvements: privacy-focused DNS menu, ed25519 key generation instructions, described and multi-value wp-admin IPs, SMTP review-and-correct step, accurate CTI quotas, numbered profile choice"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

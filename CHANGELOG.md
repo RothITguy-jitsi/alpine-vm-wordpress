@@ -6,6 +6,161 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11f — Six operator-requested prompt fixes from a real install
+
+All six came from notes written while actually sitting through the installer,
+which is the only way most of these surface.
+
+**SSH key: tell people how to make one.** The prompt asked for a public key and
+assumed you had one. It now gives copy-pasteable ed25519 generation for
+Linux/macOS and Windows PowerShell, explains why to name the key
+(`-f ~/.ssh/wasp_ed25519`) instead of overwriting the default — a per-host key
+can be revoked without breaking every other server you reach — says to set a
+passphrase, warns that the file WITHOUT `.pub` must never be pasted anywhere,
+and shows the resulting `ssh -i` command.
+
+**"Additional IP for wp-admin?" now says what it is for.** It was a bare prompt
+with an example address. It now explains the realistic entries — your own public
+IP (with `curl -s ifconfig.me` to find it), a colleague in another office, a
+static VPN exit — and notes that anything unlisted gets a 403, so a dynamic home
+address is worth thinking about.
+
+**And it accepts several.** The single-IP limit was arbitrary: Apache's
+`Require ip` takes a space-separated list natively. Commas or spaces are
+accepted and normalised, each address validated individually, and a CIDR entered
+here gets a specific message pointing at the CIDR question above rather than a
+generic rejection. The install summary shows a count instead of the list when it
+would overflow the box.
+
+**A review step for SMTP, because a typo was unrecoverable.** Reported directly:
+`contact@rothitguy-pro` was entered instead of `.pro` and there was no way back
+short of aborting the installer. The section now ends by showing every field
+back with a number; enter a number to re-enter just that field, or press Enter
+to accept. Correcting the username offers to update the From address with it,
+since they normally track. The password is shown as asterisks and never echoed.
+The fast path is unchanged — one Enter accepts. Verified against the exact
+reported scenario.
+
+**CrowdSec CTI quota — both numbers are right.** The report said the free key is
+120/month, the installer said 40. Checking CrowdSec's documentation: a Community
+plan's free key is 40/month and a Premium plan's *included* free key is 120. The
+prompt now states both tiers, notes that paid keys start at 5,000 and that
+unused quota does not roll over, and still asks rather than assuming.
+
+**Deployment profile is numbered.** It required typing "standard" or
+"production". Now `1` or `2`, with the consequence of each on the line; the words
+still work for anyone with the muscle memory.
+
+Note on the "back button" more generally: a true undo across a linear shell
+prompt flow would mean restructuring every question into an indexed state
+machine, which is a large change with real risk of its own. The review-step
+pattern gets the actual benefit — recovering from a typo without losing the
+whole run — in the one section with the most fields and the most typo-prone
+ones. If other sections turn out to hurt the same way, the pattern is now there
+to copy.
+
+---
+
+## 2026.08.11e — DNS resolver choice: Quad9 by default, and Cloudflare/Google dropped
+
+Acting on an operator recommendation. The static-network prompt defaulted to
+`1.1.1.1 8.8.8.8` -- fast, reliable, and the wrong default for this product.
+Both are US Five-Eyes operators whose business is not DNS, and on a VM built to
+minimise what leaks, every domain it ever resolves is precisely the metadata
+worth not handing over by default.
+
+**The new default is Quad9, and privacy is only half the argument.** Quad9
+blocks known-malicious domains using threat intelligence, which on a WordPress
+host is a genuine control rather than a nicety: a compromised plugin phoning
+home to a known C2 domain fails at *resolution* -- before Squid, before
+nftables, before anything in this stack is consulted. It also does not log
+client IPs, validates DNSSEC, is GDPR-compliant, is run by a Swiss non-profit
+(outside the Five/Nine/Fourteen Eyes arrangements), and answers from 200+
+locations in 90 countries so it performs acceptably wherever the Proxmox host
+sits.
+
+The prompt is now a menu grouped by region -- global, Europe, regional -- with
+the honest trade-off under each entry, and an option to enter your own.
+Cloudflare and Google are not listed; the custom option accepts them and the
+installer simply notes the choice rather than arguing.
+
+**Verifying the addresses caught a bug that would have broken installs.** The
+recommendation list included Mullvad, which is an excellent resolver and was
+duly added to the menu. Checking its addresses before shipping them turned up
+Mullvad's own documentation stating that its IPs "can only be used with DNS
+resolvers that support DoH or DoT, not with DNS over UDP/53 or TCP/53".
+`/etc/resolv.conf` speaks plain DNS and nothing else, so anyone choosing that
+option would have got a VM with no working DNS at all -- and the listed
+addresses did not match Mullvad's published ones either. Removed, along with
+Applied Privacy and Wikimedia DNS for the same reason, with the disqualification
+written into the code so nobody helpfully restores them. If a local DoH/DoT stub
+resolver is ever added to this VM they become viable and should be revisited.
+
+That check is the same discipline that the container-tag failure earlier in this
+series taught: a plausible-looking address from a good source is still an
+assumption until something authoritative confirms it.
+
+---
+
+## 2026.08.11d — The Squid blocker, actually identified: an overlapping ACL entry
+
+The diagnostic capture added in the previous release did its job on the first
+try, and it proved the previous release's hypothesis WRONG. That is the entry
+worth writing down.
+
+**The real cause.** Squid's own log named it exactly:
+
+    ERROR: 'registry-1.docker.io' is a subdomain of '.docker.io'
+    ERROR: You need to remove 'registry-1.docker.io' from the ACL 'runtime_allow'
+    FATAL: Bungled /etc/squid/squid.conf line 102: acl runtime_allow dstdomain
+
+`allowlist-runtime.txt` listed `.docker.io` and also `registry-1.docker.io` and
+`auth.docker.io`. Squid stores dstdomain ACLs in a splay tree and refuses to
+build one containing both a leading-dot parent and a subdomain of it — FATAL,
+not a warning. The list read as careful and thorough to every human who looked
+at it, including through several reviews.
+
+**The cache_dir theory was wrong, and the comment saying otherwise is
+corrected.** The previous release removed `cache_dir null /tmp` reasoning that
+Debian/Ubuntu's squid lacks the null storeio module. Plausible, and wrong. The
+removal is kept on its own merits — `cache deny all` above it already means
+nothing is cached — but it is now labelled as what it is rather than as a fix
+for something it did not fix. A comment that claims a false fix is how the next
+person loses a day.
+
+**A silent security regression found in the same output.** The IP deny list
+listed `169.254.169.254/32` and `169.254.170.2/32` alongside `169.254.0.0/16`.
+Squid warns about that, and the second line of the warning is the important one:
+
+    WARNING: because of this '169.254.0.0/16' is ignored to keep splay tree
+             searching predictable
+
+Squid DISCARDS the broader range. Listing the specific cloud-metadata addresses
+meant the rest of link-local was no longer denied by that ACL at all — being
+more specific had made the control weaker, and nothing failed to say so. The
+/16 alone is correct and covers every metadata endpoint in that range.
+
+**New check: `check-squid-acl.py`.** Both failures are now caught statically
+before an install: subdomain-inside-parent in dstdomain lists (fatal), and
+CIDR-inside-CIDR in IP lists (silently weakening). Self-tests against the exact
+two real cases plus a clean fixture. Verified retroactively — re-adding
+`registry-1.docker.io` makes it fail.
+
+**The diagnostic capture itself was improved by watching it work.**
+`squid -k parse` needs a running container, and a squid with a bad policy has
+already exited, so that half returned only "can only start exec sessions when
+their container is running". The container's own log carried the real answer.
+The log is now read first and printed first; exec output is the optional extra.
+
+Three hardware runs, and the shape has not changed once: every bug has been a
+disagreement between the code and something outside it — a registry's tag list,
+a base image's uid, a shell's name resolution, and now a proxy's opinion about
+what counts as a duplicate. The checks that keep catching these are the ones
+that model the outside thing, and each was written only after it had already
+cost a redeploy.
+
+---
+
 ## 2026.08.11c — The in-VM log: the Squid blocker identified, and wp-cli was never working
 
 The missing in-VM log confirmed the previous round of fixes landed: WordPress

@@ -8,8 +8,15 @@
 # straight to the IP, which is precisely what an SSRF payload does.
 
 # Cloud metadata — the single highest-value SSRF target
-169.254.169.254/32
-169.254.170.2/32
+# NOTE: 169.254.169.254 (AWS/GCP metadata) and 169.254.170.2 (ECS task
+# metadata) are NOT listed individually. They fall inside 169.254.0.0/16 below,
+# which already denies them, and squid warns on every startup about the overlap:
+#     WARNING: (B) '169.254.169.254' is a subnetwork of (A) '169.254.0.0/16'
+#     WARNING: because of this '169.254.0.0/16' is ignored ...
+# That second line matters -- squid says it DISCARDS the broader range to keep
+# its splay tree predictable, so listing the specific address made the whole
+# link-local block weaker rather than stronger. The /16 alone is correct and
+# covers every cloud metadata endpoint in that range.
 
 # RFC 1918 and friends
 0.0.0.0/8

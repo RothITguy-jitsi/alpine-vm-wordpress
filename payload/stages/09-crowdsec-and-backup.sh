@@ -103,6 +103,13 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   # under it. Capture the actual parser output and the container's own log,
   # print the useful part inline, and keep the full text on disk.
   _squid_diag=/var/log/wasp-squid-parse.log
+  # `squid -k parse` needs a RUNNING container. When the policy is bad, squid
+  # exits immediately and podman answers "can only start exec sessions when
+  # their container is running" -- which tells you nothing. On the install that
+  # found this, the container's OWN LOG carried the real answer (a FATAL naming
+  # the offending line) while the exec output was useless. So read the log
+  # first, and treat exec as the optional extra.
+  _sq_log=$(PRUN logs --tail 80 squid 2>&1)
   if _sq_parse=$(PRUN exec squid squid -k parse 2>&1); then
     ok "  Egress policy parsed and loaded"
   else
@@ -110,8 +117,8 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
       echo "=== squid -k parse output ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
       printf '%s\n' "$_sq_parse"
       echo ""
-      echo "=== podman logs squid (last 50) ==="
-      PRUN logs --tail 50 squid 2>&1
+      echo "=== podman logs squid (last 80) — usually the real answer ==="
+      printf '%s\n' "$_sq_log"
       echo ""
       echo "=== container state ==="
       PRUN ps -a --filter 'name=^squid$' --format '{{.Names}} {{.Status}} {{.Image}}' 2>&1
@@ -122,13 +129,13 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
     } > "$_squid_diag" 2>&1
     chmod 600 "$_squid_diag" 2>/dev/null || true
 
-    warn "  Squid rejected the policy. The parser said:"
-    printf '%s\n' "$_sq_parse" | grep -iE 'error|fatal|cannot|unable|unrecogni|invalid|no such' \
-      | head -8 | sed 's/^/      /'
-    # If nothing matched the filter, the raw tail is still better than silence.
-    printf '%s\n' "$_sq_parse" | grep -qiE 'error|fatal|cannot|unable|unrecogni|invalid|no such' \
-      || printf '%s\n' "$_sq_parse" | tail -8 | sed 's/^/      /'
-    warn "  Full parser output + container log + log-dir ownership: ${_squid_diag}"
+    warn "  Squid rejected the policy. From its own log:"
+    # FATAL/ERROR lines from the container log are the ones that name the
+    # offending directive; they are what actually diagnoses this.
+    printf '%s\n' "$_sq_log" | grep -E 'FATAL|ERROR' | head -8 | sed 's/^/      /'
+    printf '%s\n' "$_sq_log" | grep -qE 'FATAL|ERROR' \
+      || printf '%s\n' "$_sq_log" | tail -8 | sed 's/^/      /'
+    warn "  Full log + parser output + log-dir ownership: ${_squid_diag}"
 
     if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
       block_production "Squid started but rejected its own policy (squid -k parse failed). A running proxy with a broken policy is worse than one that did not start: the firewall directs traffic to it and it does not filter. Diagnostics captured at ${_squid_diag}."
