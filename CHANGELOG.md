@@ -6,6 +6,52 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11i — A silent `set -e` trap that cost the whole second half of the install
+
+The slug fix worked: the log reports "Login slug mu-plugin installed (login at
+/boob)", the dead `-login` suffix is gone from every banner. Then the install
+stopped dead, mid-stage-08, with no error at all — and the operator was left
+with `validate-wordpress.sh: not found`, `wasp-menu: not found`, no backups and
+no stage 10.
+
+**Cause: `_out=$(cmd); _rc=$?` is a trap under `set -e`.** A variable assignment
+takes the exit status of its command substitution, so a failing command kills
+the script AT THE ASSIGNMENT — and the `_rc=$?` on the same line, plus every bit
+of judgement written to use it, never runs. The irony is that this line was
+added two versions ago precisely to stop trusting a pipeline's exit status. It
+replaced a bug that reported false success with a bug that reported nothing at
+all.
+
+The safe form guards the assignment: `_rc=0; _out=$(cmd) || _rc=$?`. Fixed in
+all three places it had been introduced (stage 08, wp-plugins.sh,
+wp-forensics.sh).
+
+**Two ordering bugs made a single failure catastrophic.**
+
+- The Two Factor plugin install — the one network-dependent operation in the
+  stage — ran BEFORE fourteen local `install -m 0755` lines. When the network
+  work failed it took every one of them with it. Local, always-succeeds work
+  now runs first and anything touching the internet runs last, which is free
+  and means a download problem costs one plugin instead of the entire toolset.
+- The bare-name alias loop (`for _t in /usr/local/bin/*.sh`) ran near the TOP of
+  the stage, when only two tools existed. It created two symlinks and reported
+  "Bare-name aliases created", which is why `wasp-menu` was still not found on a
+  VM whose log said the aliases were done. A loop over a directory has to run
+  after the directory is populated. Moved to the end.
+
+**New check: `check-seterr-capture.py`.** It flags the unguarded
+`_out=$(cmd); _rc=$?` form anywhere in the tree, because this one passes
+`sh -n`, passes review (it looks like careful error handling), and fails only at
+runtime — and then fails silently. Verified retroactively: restoring the
+original line makes the check fail naming the file and line number.
+
+Three checks now exist because of failures in this series that were invisible to
+every other form of testing: undefined helpers, slug-rewrite divergence, and
+now this. Each was written after the bug had already cost a redeploy, which is
+the honest pattern — none of them would have been thought of in advance.
+
+---
+
 ## 2026.08.11h — The login slug redirect loop: two generators, two answers
 
 Reported from the live VM: `https://test.rothitguy.pro/boob` returned "The page

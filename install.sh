@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11h"
-WASP_VERSION_NOTE="LOGIN SLUG REDIRECT LOOP FIXED: two rewrite generators disagreed on where the bare slug points, so /<slug> looped forever; new check-slug-rewrites.py keeps them in sync"
+WASP_VERSION="2026.08.11i"
+WASP_VERSION_NOTE="set -e capture trap killed stage 08 silently (14 tools + stage 10 never installed); alias loop ran before the tools existed; network work now runs last so a failed download costs one plugin not the toolset"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
