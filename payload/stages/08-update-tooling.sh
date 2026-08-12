@@ -27,50 +27,6 @@ ok "  pinned.env is now written atomically (temp file + rename) and re-validated
 ts "Installing WordPress plugin/theme update visibility"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
 
-# Two Factor plugin: install it here, where wp-plugins.sh now exists, when MFA
-# enforcement was requested at install time. The enforcement mu-plugin (stage
-# 06) is already in place and waiting for it. Activated only after it installs
-# and parses, so a failed fetch cannot wall the admin login -- the mu-plugin
-# treats "plugin absent" as "do not enforce yet, show a notice".
-if [ "${MFA_ENFORCE:-0}" = "1" ]; then
-  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
-  # status (always 0), which on a real VM printed "installed and activated"
-  # for an install that never happened.
-  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1); _tf_rc=$?
-  printf '%s\n' "$_tf_out" | sed 's/^/  /'
-  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
-    ok "Two Factor plugin installed and activated — admins can now enrol"
-  else
-    warn "Two Factor plugin is NOT active. Admins cannot enrol."
-    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
-    # MFA was explicitly requested and is not actually working. Under
-    # production that must not be certified: an external evaluation flagged
-    # exactly this -- the final marker could be written while the control the
-    # operator asked for was silently absent.
-    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
-    fi
-  fi
-fi
-install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/wasp-verify-integrity.sh
-[ -f "${PAYLOAD_DIR}/bin/wasp-testreport.sh" ] && \
-  install -m 0755 "${PAYLOAD_DIR}/bin/wasp-testreport.sh" /usr/local/bin/wasp-testreport.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-capture.sh" /usr/local/bin/wasp-capture.sh
-install -m 0755 "${PAYLOAD_DIR}/bin/wasp-menu.sh" /usr/local/bin/wasp-menu.sh
-
-# A login hint so operators discover the menu. Written to /etc/motd (shown on
-# interactive login over SSH and on the console) rather than a shell rc, so it
-# does not run code on every shell -- it is just a printed line. The menu is
-# the recommended entry point; the individual tools remain available for anyone
-# who prefers them.
 cat > /etc/motd << 'MOTD'
 
   WASP — WordPress Alpine Security Platform
@@ -79,25 +35,6 @@ cat > /etc/motd << 'MOTD'
 
 MOTD
 
-# ── Bare-name aliases ────────────────────────────────────────────────────────
-# The tools install with a .sh suffix, but everything an operator reads --
-# these installer prompts, the runbooks, the README, the motd -- refers to them
-# by bare name: `wasp-egress test`, `wasp-menu`, `update.sh check`. On the first
-# real install an operator typed `wasp-egress status` exactly as the installer
-# had told them to, and got "not found".
-#
-# Rather than rewrite every reference to add .sh (and have the mismatch come
-# back the next time someone writes a doc from memory), both spellings now
-# work. Symlinks, so `ls -l` shows plainly what they point at.
-for _t in /usr/local/bin/*.sh; do
-  [ -e "$_t" ] || continue
-  _bare="${_t%.sh}"
-  # Never clobber a real binary that happens to share the name.
-  if [ ! -e "$_bare" ]; then
-    ln -sf "$_t" "$_bare" 2>/dev/null || true
-  fi
-done
-ok "Bare-name aliases created (wasp-egress and wasp-egress.sh both work)"
 # The inbox is group-writable by the admin user so SFTP drops a file in
 # without a permissions fight -- the most common reason a non-technical
 # handover stalls. Not world-readable: a client's backup contains their
@@ -191,3 +128,97 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 # CROWDSEC
 # ════════════════════════════════════════════════════════════════════════════
+
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/wasp-verify-integrity.sh
+[ -f "${PAYLOAD_DIR}/bin/wasp-testreport.sh" ] && \
+  install -m 0755 "${PAYLOAD_DIR}/bin/wasp-testreport.sh" /usr/local/bin/wasp-testreport.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-capture.sh" /usr/local/bin/wasp-capture.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-menu.sh" /usr/local/bin/wasp-menu.sh
+
+# A login hint so operators discover the menu. Written to /etc/motd (shown on
+# interactive login over SSH and on the console) rather than a shell rc, so it
+# does not run code on every shell -- it is just a printed line. The menu is
+# the recommended entry point; the individual tools remain available for anyone
+# who prefers them.
+
+
+# ── Bare-name aliases (after every tool is installed) ────────────────────────
+# ORDERING BUG FIXED. This loop symlinks /usr/local/bin/*.sh to bare names, but
+# it used to run near the TOP of the stage -- at which point only update.sh and
+# wp-plugins.sh existed. It dutifully reported "Bare-name aliases created" and
+# had created two, so `wasp-menu` and a dozen others were still "not found"
+# while the log said the aliases were done. A loop over a directory has to run
+# after the directory is populated.
+# The tools install with a .sh suffix, but everything an operator reads --
+# these installer prompts, the runbooks, the README, the motd -- refers to them
+# by bare name: `wasp-egress test`, `wasp-menu`, `update.sh check`. On the first
+# real install an operator typed `wasp-egress status` exactly as the installer
+# had told them to, and got "not found".
+#
+# Rather than rewrite every reference to add .sh (and have the mismatch come
+# back the next time someone writes a doc from memory), both spellings now
+# work. Symlinks, so `ls -l` shows plainly what they point at.
+for _t in /usr/local/bin/*.sh; do
+  [ -e "$_t" ] || continue
+  _bare="${_t%.sh}"
+  # Never clobber a real binary that happens to share the name.
+  if [ ! -e "$_bare" ]; then
+    ln -sf "$_t" "$_bare" 2>/dev/null || true
+  fi
+done
+ok "Bare-name aliases created (wasp-egress and wasp-egress.sh both work)"
+
+
+# ── Two Factor plugin (LAST, deliberately) ───────────────────────────────────
+# This runs at the END of the stage, after every tool above is already on disk.
+#
+# It used to run immediately after wp-plugins.sh was installed, which put a
+# NETWORK-DEPENDENT operation in front of fourteen local file installs. On a
+# real VM the plugin install failed and took the whole stage with it: no
+# validate-wordpress.sh, no backups, no menu, no stage 10 -- the operator was
+# left with a half-built box because a plugin download did not work. Ordering
+# local, always-succeeds work before anything that talks to the internet is
+# free, and it means a network problem costs you one plugin instead of the
+# entire toolset.
+# Two Factor plugin: install it here, where wp-plugins.sh now exists, when MFA
+# enforcement was requested at install time. The enforcement mu-plugin (stage
+# 06) is already in place and waiting for it. Activated only after it installs
+# and parses, so a failed fetch cannot wall the admin login -- the mu-plugin
+# treats "plugin absent" as "do not enforce yet, show a notice".
+if [ "${MFA_ENFORCE:-0}" = "1" ]; then
+  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
+  # status (always 0), which on a real VM printed "installed and activated"
+  # for an install that never happened.
+  #
+  # NOTE THE `|| _tf_rc=$?`. Writing this as `_out=$(cmd); _rc=$?` is a trap
+  # under `set -e`: the ASSIGNMENT inherits the command substitution's exit
+  # status, so a failing command kills the script at that line and the _rc that
+  # follows is never read. That is exactly what happened on a live install --
+  # the stage stopped dead after printing its header, with no error, and the
+  # whole rest of the tooling (validate-wordpress.sh, backups, stage 10) was
+  # never installed. Guarding the assignment is what makes the capture safe.
+  _tf_rc=0
+  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1) || _tf_rc=$?
+  printf '%s\n' "$_tf_out" | sed 's/^/  /'
+  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
+    ok "Two Factor plugin installed and activated — admins can now enrol"
+  else
+    warn "Two Factor plugin is NOT active. Admins cannot enrol."
+    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
+    # MFA was explicitly requested and is not actually working. Under
+    # production that must not be certified: an external evaluation flagged
+    # exactly this -- the final marker could be written while the control the
+    # operator asked for was silently absent.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
+    fi
+  fi
+fi

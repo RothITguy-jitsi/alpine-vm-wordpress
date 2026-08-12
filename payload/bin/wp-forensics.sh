@@ -218,7 +218,8 @@ case "$CMD" in
         _note "${_n} distinct public address(es). Each uncached one costs a lookup."
         echo ""
         for _i in $_ips; do
-          _r=$(wp-hardening.sh cti-lookup "$_i" 2>/dev/null); _rc=$?
+          _rc=0
+          _r=$(wp-hardening.sh cti-lookup "$_i" 2>/dev/null) || _rc=$?
           case "$_rc" in
             0) printf '  %-16s %s\n' "$_i" \
                  "$(printf '%s' "$_r" | awk -F'|' '{printf "%s · noise %s/10 · %s (%s) · %s", $1,$2,$3,$4,$5}')"

@@ -507,7 +507,10 @@ do_install() {
     # status -- always 0 -- so a failed install reported success. That is
     # exactly what happened on a real VM: wp-cli died with "plugin: not found"
     # and the line above it still said "✔ Installed two-factor".
-    _inst_out=$(_wp plugin install "$_slug" 2>&1); _inst_rc=$?
+    # `|| _inst_rc=$?` -- an unguarded `_x=$(cmd); _rc=$?` dies at the
+    # assignment under set -e before the rc is ever read.
+    _inst_rc=0
+    _inst_out=$(_wp plugin install "$_slug" 2>&1) || _inst_rc=$?
     printf '%s\n' "$_inst_out" | sed 's/^/  /'
     if [ "$_inst_rc" -eq 0 ]; then
       echo "  ✔  Installed ${_slug}"
