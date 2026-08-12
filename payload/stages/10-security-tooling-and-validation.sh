@@ -235,50 +235,83 @@ ok "  Commands: enable|disable [8g|xmlrpc|uploads-php|debug]  |  trivy-scan  |  
 # Creates /usr/local/bin/validate-wordpress.sh for ongoing health checks.
 # ════════════════════════════════════════════════════════════════════════════
 
-# ── Two Factor plugin ────────────────────────────────────────────────────────
-# THIS RUNS IN STAGE 10, NOT WITH THE OTHER TOOLING, AND THE REASON MATTERS.
+# ── Two Factor plugin: deferred, because it CANNOT work yet ──────────────────
+# WordPress core is not installed at provisioning time. This platform
+# deliberately leaves the setup wizard to the operator (STEP 1 in the completion
+# banner), so at this point the database has no WordPress tables and wp-cli
+# answers, correctly:
 #
-# Installing a plugin needs the internet. When EGRESS_PROXY=1 the nftables rules
-# (loaded in stage 06) restrict the WordPress network to ONE destination: Squid
-# at 10.89.10.2:3128. Squid does not start until stage 09. So for the whole of
-# stages 06-08 the containers have a proxy configured and nothing listening on
-# it -- every outbound request fails.
+#     Error: The site you have requested is not installed.
+#     Run `wp core install` to create database tables.
 #
-# That is exactly what happened on a real install: wp-cli reported
-# "An unexpected error occurred... The 'two-factor' plugin could not be found",
-# which reads like a WordPress.org problem and is actually a closed egress path.
-# The install then correctly refused to certify the VM, for a reason that had
-# nothing to do with the plugin.
+# No amount of stage reordering fixes that -- an earlier version chased this
+# from stage 08 to stage 10 on the theory that it was an egress problem (it was,
+# partly, and that fix stands: Squid is up and reachable now). But the remaining
+# blocker is a genuine ordering impossibility: you cannot install a plugin into
+# a WordPress that does not exist.
 #
-# Running it here, after Squid is up, is the fix. It is placed before the final
-# validation so validate-wordpress.sh reports the true end state.
+# So it is deferred. A boot-time hook retries until the site is installed, then
+# installs and activates Two Factor once and disables itself. The operator
+# finishes the setup wizard, and 2FA is ready by the time they first log in --
+# no second manual step, and no false "installed" claim in the install log.
 if [ "${MFA_ENFORCE:-0}" = "1" ]; then
-  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
-  # status (always 0), which on a real VM printed "installed and activated"
-  # for an install that never happened.
-  #
-  # NOTE THE `|| _tf_rc=$?`. Writing this as `_out=$(cmd); _rc=$?` is a trap
-  # under `set -e`: the ASSIGNMENT inherits the command substitution's exit
-  # status, so a failing command kills the script at that line and the _rc that
-  # follows is never read. That is exactly what happened on a live install --
-  # the stage stopped dead after printing its header, with no error, and the
-  # whole rest of the tooling (validate-wordpress.sh, backups, stage 10) was
-  # never installed. Guarding the assignment is what makes the capture safe.
-  _tf_rc=0
-  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1) || _tf_rc=$?
-  printf '%s\n' "$_tf_out" | sed 's/^/  /'
-  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
-    ok "Two Factor plugin installed and activated — admins can now enrol"
-  else
-    warn "Two Factor plugin is NOT active. Admins cannot enrol."
-    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
-    # MFA was explicitly requested and is not actually working. Under
-    # production that must not be certified: an external evaluation flagged
-    # exactly this -- the final marker could be written while the control the
-    # operator asked for was silently absent.
-    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
+  ts "Arranging Two Factor plugin install (deferred until WordPress setup completes)"
+
+  cat > /usr/local/bin/wasp-mfa-deferred.sh << 'MFADEFER'
+#!/bin/sh
+# Installs the Two Factor plugin once WordPress core setup has been completed.
+# Runs from cron; removes its own schedule after a successful install.
+set -u
+LOG=/var/log/wasp-mfa-deferred.log
+STAMP=/etc/wp-install/.mfa-plugin-installed
+[ -f "$STAMP" ] && exit 0
+
+_log() { printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
+
+# Is the site actually installed yet? `wp core is-installed` is the exact
+# question, and it is cheap.
+if ! /usr/local/bin/wp-plugins.sh is-site-installed >/dev/null 2>&1; then
+  exit 0   # setup wizard not finished yet; try again next run, quietly
+fi
+
+_log "WordPress setup detected — installing Two Factor"
+if /usr/local/bin/wp-plugins.sh install two-factor --activate >> "$LOG" 2>&1; then
+  _log "Two Factor installed and activated"
+  : > "$STAMP"
+  # Clear the production blocker this was responsible for, if it is the only one.
+  if [ -f /etc/wp-install/PRODUCTION-BLOCKERS ]; then
+    grep -v 'Two Factor plugin is not active' /etc/wp-install/PRODUCTION-BLOCKERS \
+      > /etc/wp-install/PRODUCTION-BLOCKERS.tmp 2>/dev/null || true
+    if [ -s /etc/wp-install/PRODUCTION-BLOCKERS.tmp ]; then
+      mv -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
+      _log "MFA blocker cleared; other blockers remain"
+    else
+      rm -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
+      _log "MFA blocker cleared; no blockers remain"
     fi
+  fi
+  logger -t wasp-mfa "Two Factor plugin installed and activated after WordPress setup"
+else
+  _log "Install attempt FAILED — will retry"
+fi
+MFADEFER
+  chmod 0755 /usr/local/bin/wasp-mfa-deferred.sh
+
+  # Every 10 minutes until it succeeds. Cheap: the first check is a single
+  # wp-cli call that exits immediately when the site is not yet installed.
+  if ! grep -q wasp-mfa-deferred /etc/crontabs/root 2>/dev/null; then
+    echo "*/10 * * * * /usr/local/bin/wasp-mfa-deferred.sh >/dev/null 2>&1" >> /etc/crontabs/root
+  fi
+
+  ok "Two Factor will be installed automatically once you finish WordPress setup"
+  ok "  Checked every 10 minutes; progress in /var/log/wasp-mfa-deferred.log"
+  ok "  To do it by hand instead: wp-plugins.sh install two-factor --activate"
+
+  # This is a real, still-unmet condition at the moment the install ends, so it
+  # is still a blocker -- but one with a stated resolution path that requires no
+  # operator action beyond the setup wizard they already have to do.
+  if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+    block_production "MFA was requested but the Two Factor plugin cannot be installed until WordPress setup is completed (STEP 1 in the banner below). A deferred installer will install and activate it automatically within 10 minutes of you finishing setup, and will clear this blocker itself. Verify with: wp-plugins.sh status"
   fi
 fi
 

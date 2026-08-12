@@ -364,16 +364,30 @@ EOF
       _cc_skip=$((_cc_skip+1)); return 0
     fi
     printf '%s   $ %s %s%s\n' "$DIM" "$_t" "$*" "$R"
-    if "$BIN/$_t" "$@" >/tmp/.cc.$$ 2>&1; then
+    _cc_log="/var/log/wasp-commission-${_t%.sh}.log"
+    if "$BIN/$_t" "$@" >"$_cc_log" 2>&1; then
       printf '   %sPASS%s\n' "$GRN" "$R"
       _cc_pass=$((_cc_pass+1))
+      rm -f "$_cc_log"
     else
       _rc=$?
-      printf '   %sFAIL%s (exit %s) — last lines:\n' "$RED" "$R" "$_rc"
-      tail -6 /tmp/.cc.$$ | sed 's/^/       /'
+      printf '   %sFAIL%s (exit %s)\n' "$RED" "$R" "$_rc"
+      # Show the lines that actually SAY something. A blind `tail` gave six
+      # lines of summary boilerplate ("Result: FAILED") and hid the one line
+      # naming the failing probe -- on a real commission run that made two of
+      # four failures undiagnosable without re-running the tool by hand.
+      # Prefer explicit failure markers; fall back to the tail only if none
+      # are found.
+      if grep -qE '✗|FAIL|failed|not holding|Unknown option' "$_cc_log" 2>/dev/null; then
+        grep -E '✗|FAIL|failed|not holding|Unknown option' "$_cc_log" \
+          | grep -vE 'CHECKS FAILED|Result: FAILED|failed [0-9]+$' \
+          | head -8 | sed 's/^/       /'
+      else
+        tail -8 "$_cc_log" | sed 's/^/       /'
+      fi
+      printf '       %sfull output: %s%s\n' "$DIM" "$_cc_log" "$R"
       _cc_fail=$((_cc_fail+1))
     fi
-    rm -f /tmp/.cc.$$
   }
 
   _step "Health — does it work at all"        validate-wordpress.sh --check

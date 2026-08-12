@@ -59,6 +59,22 @@ QUICK=0
 SEND_TEST_MAIL=""
 ONLY=""
 
+# --check / --check --prom are intercepted BEFORE the option loop below.
+#
+# BUG FIXED (found by the commission check on a live VM): the loop rejected
+# --check with "Unknown option" and exited 2, so the machine-readable health
+# path was unreachable -- and even without the rejection, the loop shifts every
+# argument away, leaving $1 empty by the time the handler tested it. Both the
+# monitoring integration and the menu's first health entry were broken by this,
+# and nothing noticed because no test invoked the flag.
+CHECK_MODE=0; CHECK_PROM=0
+case "${1:-}" in
+  --check)
+    CHECK_MODE=1
+    [ "${2:-}" = "--prom" ] && CHECK_PROM=1
+    set -- ;;
+esac
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --quiet|-q)   QUIET=1 ;;
@@ -91,7 +107,7 @@ done
 # backup < 26h -- because those are the conditions worth paging on; the rest of
 # this script is diagnosis, not alerting, and mixing the two makes a check too
 # chatty to alert on. See docs/FLEET.md (Layer 2) and SUPPORT-RUNBOOK.md.
-if [ "${1:-}" = "--check" ]; then
+if [ "$CHECK_MODE" = "1" ]; then
   _p=0; _msg=""; _age=9999
   for c in wordpress mariadb; do
     podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c" || { _p=2; _msg="${_msg}${c}-down "; }
@@ -118,7 +134,7 @@ if [ "${1:-}" = "--check" ]; then
   # --check --prom : same signal as Prometheus text for a textfile collector or
   # scrape endpoint (docs/FLEET.md Layer C). Stable metric names so a Grafana
   # panel built against them keeps working.
-  if [ "${2:-}" = "--prom" ]; then
+  if [ "$CHECK_PROM" = "1" ]; then
     printf '# HELP wasp_health Overall WASP health (0 ok 1 warn 2 critical)\n# TYPE wasp_health gauge\nwasp_health %s\n' "$_p"
     printf '# HELP wasp_disk_percent Root filesystem usage percent\n# TYPE wasp_disk_percent gauge\nwasp_disk_percent %s\n' "${_disk:-0}"
     printf '# HELP wasp_backup_age_hours Age of the newest local backup\n# TYPE wasp_backup_age_hours gauge\nwasp_backup_age_hours %s\n' "${_age:-9999}"

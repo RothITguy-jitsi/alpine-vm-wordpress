@@ -183,15 +183,37 @@ restore_test() {
   # Read the real prefix; it is randomised per install.
   _pfx=$(_wp_prefix)
   _i "Table prefix: ${_pfx}"
-  # The specific rows that make a restore *useful*: without siteurl and a
-  # user, you have a schema, not a site.
-  _su=$(_q "SELECT option_value FROM ${WPDB}.${_pfx}options WHERE option_name='siteurl' LIMIT 1;")
-  [ -n "$_su" ] && _p "siteurl present in restored data: ${_su}" \
-                || _f "siteurl missing from the restored options table" "The dump may not include the options table"
+  # Before judging the CONTENT of a restore, establish whether the source site
+  # had any content to begin with. On a freshly provisioned VM the operator has
+  # not run the WordPress setup wizard yet, so the database is an empty schema:
+  # no options table, no users, no siteurl. Reporting that as "siteurl missing
+  # from the restored options table -- the dump may not include the options
+  # table" is actively misleading. It accuses the backup of losing data that
+  # never existed, on exactly the install where an operator is least equipped
+  # to tell the difference.
+  #
+  # So: detect the not-yet-set-up case once, and report it as a SKIP with the
+  # real reason. A backup of an empty site restoring as an empty site is
+  # correct behaviour, and the structural checks above (gzip integrity, schema
+  # loads, tables present) have already done the work that IS meaningful here.
+  _optcount=$(_q "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${WPDB}' AND table_name='${_pfx}options';")
+  if [ "${_optcount:-0}" -eq 0 ]; then
+    _i "WordPress setup has not been completed on this site yet:"
+    _i "  the database holds no options table, so there is no siteurl or user"
+    _i "  data for a backup to contain. The structural checks above still apply."
+    _i "  Re-run this after finishing setup to validate real content:"
+    _i "    wasp-selftest.sh restore-test"
+  else
+    # The specific rows that make a restore *useful*: without siteurl and a
+    # user, you have a schema, not a site.
+    _su=$(_q "SELECT option_value FROM ${WPDB}.${_pfx}options WHERE option_name='siteurl' LIMIT 1;")
+    [ -n "$_su" ] && _p "siteurl present in restored data: ${_su}" \
+                  || _f "siteurl missing from the restored options table" "The dump may not include the options table"
 
-  _users=$(_q "SELECT COUNT(*) FROM ${WPDB}.${_pfx}users;")
-  [ "${_users:-0}" -ge 1 ] && _p "Restored users table has ${_users} user(s)" \
-                           || _f "Restored users table is empty" "A restore with no users is not recoverable"
+    _users=$(_q "SELECT COUNT(*) FROM ${WPDB}.${_pfx}users;")
+    [ "${_users:-0}" -ge 1 ] && _p "Restored users table has ${_users} user(s)" \
+                             || _f "Restored users table is empty" "A restore with no users is not recoverable"
+  fi
 
   _posts=$(_q "SELECT COUNT(*) FROM ${WPDB}.${_pfx}posts;")
   _i "Restored posts: ${_posts:-0}"

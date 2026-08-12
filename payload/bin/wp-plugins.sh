@@ -513,7 +513,19 @@ do_install() {
   # see WordPress at all, and on a real install that ambiguity produced a
   # cheerful "installed and activated" against a site wp-cli had never found.
   # Prove the tool works before trusting anything it says about a plugin.
+  # Distinguish the two failure modes that look identical from here. "Site not
+  # installed" means finish the setup wizard; "cannot reach" means a container
+  # or network problem. Telling an operator to check egress when the real
+  # answer is "you have not run the setup wizard yet" wastes an afternoon.
+  _probe=""
   if ! _probe=$(_wp core version 2>&1) || [ -z "$_probe" ]; then
+    case "$_probe" in
+      *"not installed"*|*"core install"*)
+        echo "ℹ  WordPress core setup has not been completed yet." >&2
+        echo "   Finish the setup wizard in a browser first, then re-run:" >&2
+        echo "     wp-plugins.sh install ${_slug} --activate" >&2
+        return 1 ;;
+    esac
     echo "✗  wp-cli cannot reach the WordPress install." >&2
     printf '%s\n' "$_probe" | sed 's/^/     /' >&2
     echo "   Nothing was installed. Check the container is running and healthy:" >&2
@@ -565,6 +577,10 @@ do_install() {
 case "${1:-status}" in
   status) show_status ;;
   install|add) shift; do_install "$@" ;;
+  # Cheap yes/no used by the deferred MFA installer: has the WordPress setup
+  # wizard actually been completed? Silent by design -- it is called from cron
+  # every 10 minutes and must not fill a log with noise while waiting.
+  is-site-installed) _wp core is-installed >/dev/null 2>&1 && exit 0 || exit 1 ;;
   vulns|vuln|cve)
     case "${2:-}" in --nvd) vuln_scan 1 ;; *) vuln_scan 0 ;; esac ;;
   vuln-sources)
