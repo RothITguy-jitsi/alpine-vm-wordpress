@@ -279,7 +279,7 @@ _wp() {
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -v "${WP_HTML_DIR}:/var/www/html" \
-    "$WPCLI_IMAGE" wp "$@"
+    "$WPCLI_IMAGE" wp --path=/var/www/html "$@"
 }
 
 show_status() {
@@ -453,8 +453,18 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
 #
 # This installs by slug from WordPress.org over the already-allowlisted
 # .wordpress.org egress path, records what it did, and REFUSES an arbitrary
-# URL or ZIP -- only directory slugs, so the source is always the signed
-# WordPress.org directory and never a random download. Activation is the
+# URL or ZIP -- only directory slugs, so the source is always the official
+# WordPress.org directory and never a random download.
+#
+# CORRECTION (external evaluation, and it was right): an earlier version of
+# this comment called that directory "signed". IT IS NOT. WordPress.org serves
+# plugin packages over HTTPS, which authenticates the SERVER, but the packages
+# themselves carry no cryptographic signature that this VM verifies. The
+# guarantee here is "official source over TLS, never an arbitrary URL" -- which
+# is worth having and is NOT the same as a signed artifact. Overstating a
+# control is worse than not having it, because it stops anyone looking for the
+# real one. See TODO for `wp plugin verify-checksums`, which is the closest
+# available integrity check and is not yet wired in. Activation is the
 # caller's choice, because a plugin that activates before its settings exist
 # can lock a login.
 do_install() {
@@ -464,7 +474,7 @@ do_install() {
       --activate) _activate=1 ;;
       http*://*|*.zip)
         echo "✗  Refusing a URL or ZIP. Only WordPress.org directory slugs are" >&2
-        echo "   allowed, so the source is always the signed directory:" >&2
+        echo "   allowed, so the source is always the official directory:" >&2
         echo "     wp-plugins.sh install two-factor" >&2
         exit 1 ;;
       -*) : ;;
@@ -478,7 +488,19 @@ do_install() {
   esac
 
   echo "── Installing ${_slug} from WordPress.org ──"
-  if _wp plugin is-installed "$_slug" 2>/dev/null; then
+  # A REACHABILITY probe first. `plugin is-installed` returning non-zero means
+  # "not installed" -- but it means exactly the same thing when wp-cli cannot
+  # see WordPress at all, and on a real install that ambiguity produced a
+  # cheerful "installed and activated" against a site wp-cli had never found.
+  # Prove the tool works before trusting anything it says about a plugin.
+  if ! _probe=$(_wp core version 2>&1) || [ -z "$_probe" ]; then
+    echo "✗  wp-cli cannot reach the WordPress install." >&2
+    printf '%s\n' "$_probe" | sed 's/^/     /' >&2
+    echo "   Nothing was installed. Check the container is running and healthy:" >&2
+    echo "     podman ps --filter name=wordpress ; wp-plugins.sh doctor" >&2
+    return 1
+  fi
+  if _wp plugin is-installed "$_slug" >/dev/null 2>&1; then
     echo "  ℹ  Already installed."
   else
     # Capture, then judge, then print. `if _wp … | sed` would test SED's exit
@@ -497,9 +519,16 @@ do_install() {
   fi
 
   if [ "$_activate" = 1 ]; then
-    _wp plugin activate "$_slug" >/dev/null 2>&1 \
-      && echo "  ✔  Activated" \
-      || echo "  ⚠  Could not activate — activate from wp-admin once configured"
+    _wp plugin activate "$_slug" >/dev/null 2>&1 || true
+    # Confirm by asking, not by trusting the exit status of the thing we just
+    # ran. "Installed and activated" was printed on a VM where neither had
+    # happened; a claim about state should be a reading of state.
+    if _wp plugin is-active "$_slug" >/dev/null 2>&1; then
+      echo "  ✔  Activated (verified)"
+    else
+      echo "  ⚠  Not active after the activate call — activate from wp-admin," >&2
+      echo "     or retry: wp-plugins.sh install ${_slug} --activate" >&2
+    fi
   else
     echo "  ℹ  Not activated. Activate when ready:  wp-plugins.sh ... (or in wp-admin)"
   fi

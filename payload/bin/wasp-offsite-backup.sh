@@ -123,6 +123,7 @@ AGE_RECIPIENT="${OFFSITE_AGE_RECIPIENT:-}"
 _ok()   { printf '  \033[32m✔\033[0m  %s\n' "$1"; }
 _bad()  { printf '  \033[31m✗\033[0m  %s\n' "$1" >&2; }
 _note() { printf '  %s\n' "$1"; }
+_hdr()  { printf '\n\033[1m%s\033[0m\n' "$1"; }   # section heading; added after `_hdr: not found` broke the restore drill on a live VM
 
 _configured() { [ "$OFFSITE_METHOD" != "none" ] && [ -n "${OFFSITE_DEST:-}" ]; }
 
@@ -637,20 +638,34 @@ case "${1:-status}" in
     fi
     # wait for readiness
     _rdy=0; _n=0; while [ "$_n" -lt 30 ]; do
-      podman exec "$_cont" sh -c 'mariadb-admin ping --silent -uroot -p"'"$_rpw"'"' >/dev/null 2>&1 && { _rdy=1; break; }
+      podman exec -e MYSQL_PWD="$_rpw" "$_cont" \
+        mariadb-admin ping --silent -uroot >/dev/null 2>&1 && { _rdy=1; break; }
       sleep 2; _n=$((_n+1)); done
     [ "$_rdy" = 1 ] || { _bad "Throwaway database did not become ready"; podman rm -f "$_cont" >/dev/null 2>&1; exit 1; }
 
     _note "Restoring the decrypted dump…"
-    if gzip -dc "$_plain" | podman exec -i "$_cont" sh -c 'exec mariadb -uroot -p"'"$_rpw"'" drill' 2>"$_ERRF"; then
+    # Password via MYSQL_PWD in the environment, not -p on the command line.
+    # On a real drill the readiness ping succeeded and the restore then failed
+    # with ERROR 1045, using identical nested quoting -- the difference being
+    # that the restore pipes a dump on stdin. Passing the credential as an
+    # environment variable removes the quoting from the equation entirely and
+    # keeps it out of argv inside the container as a bonus.
+    if gzip -dc "$_plain" | podman exec -i -e MYSQL_PWD="$_rpw" "$_cont" \
+         mariadb -uroot --database=drill 2>"$_ERRF"; then
       _ok "Restore completed into the throwaway database"
     else
-      _bad "Restore FAILED even though the object decrypted: $(head -c 160 "$_ERRF")"
+      _bad "Restore FAILED even though the object decrypted."
+      _note "  mariadb said:"
+      head -5 "$_ERRF" 2>/dev/null | sed 's/^/    /'
+      _note "  If this is an auth error, the dump may contain CREATE USER or"
+      _note "  GRANT statements from the source system. Inspect the decrypted"
+      _note "  file before assuming the backup itself is bad."
       podman rm -f "$_cont" >/dev/null 2>&1; podman network rm "$_net" >/dev/null 2>&1; exit 1
     fi
 
     # 5. Sanity-check content: a restore that loads an empty dump is not a pass.
-    _tables=$(podman exec "$_cont" sh -c 'exec mariadb -uroot -p"'"$_rpw"'" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"drill\";"' 2>/dev/null)
+    _tables=$(podman exec -e MYSQL_PWD="$_rpw" "$_cont" \
+      mariadb -uroot -N -e 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema="drill";' 2>/dev/null)
     if [ "${_tables:-0}" -gt 0 ]; then
       _ok "Restored database contains ${_tables} table(s)"
     else

@@ -44,6 +44,26 @@ _cfg() {
 
 _configured() { [ -r "$SMTP_FILE" ] && [ -n "$(_cfg host)" ]; }
 
+# wp-cli runs in its OWN container: the wordpress image ships no `wp` binary.
+# This file called _wp without ever defining it, so `wp-mail.sh test` died with
+# "_wp: not found" on a live VM -- the mail path could not be verified at all.
+_wpcli_image() {
+  _wi=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
+  [ -n "$_wi" ] || _wi="docker.io/library/wordpress:cli"
+  printf '%s' "$_wi"
+}
+_wp() {
+  # shellcheck disable=SC2086
+  podman run --rm \
+    --network "container:wordpress" \
+    --user 33:33 \
+    --env-file /etc/wordpress/env \
+    -e WORDPRESS_DB_HOST=mariadb:3306 \
+    ${WPCLI_ENV:-} \
+    -v /home/wpuser/wp/html:/var/www/html \
+    "$(_wpcli_image)" wp --path=/var/www/html "$@"
+}
+
 show_status() {
   echo ""
   echo "Outbound email status"

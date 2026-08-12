@@ -146,6 +146,31 @@ ts "Starting WordPress (pulling ~180 MB)"
 # hardcoded string, because the site-address handling below is conditional.
 WP_CONFIG_EXTRA='define("WP_DEBUG",false);define("DISALLOW_FILE_EDIT",true);define("WP_POST_REVISIONS",10);define("WP_AUTO_UPDATE_CORE","minor");define("WP_MEMORY_LIMIT","256M");define("WP_MAX_MEMORY_LIMIT","512M");define("DISABLE_WP_CRON",true);'
 
+# DISALLOW_FILE_MODS under production, from an external evaluation and it is a
+# fair point. DISALLOW_FILE_EDIT above only removes the theme/plugin CODE
+# EDITOR; an administrator (or anyone who has taken over an admin session) can
+# still install a plugin from wp-admin, which is a far more direct route to
+# running arbitrary PHP than the editor ever was. DISALLOW_FILE_MODS closes
+# installs, updates and deletes for plugins and themes together.
+#
+# It is deliberately NOT the default for standard/lab installs: it makes the
+# admin UI meaningfully less useful, and someone running this for a personal
+# site should not have that forced on them. Under production -- the profile
+# that already refuses unverified releases and fails closed on Squid -- the
+# trade lands the other way, and plugins are installed deliberately from the
+# console with `wp-plugins.sh install`, which is auditable and logged.
+if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+  WP_CONFIG_EXTRA="${WP_CONFIG_EXTRA}define(\"DISALLOW_FILE_MODS\",true);"
+  # Verified: WP-CLI is NOT affected by this constant (the sole documented
+  # exception is `wp core language install`), so wp-plugins.sh keeps working.
+  # That is precisely the split we want -- blocked in the admin UI where a
+  # hijacked session lives, available from the console path that is logged.
+  # It also happens to make the site immune to CVE-2024-31210, whose advisory
+  # states sites with DISALLOW_FILE_MODS set are not affected.
+  ok "  DISALLOW_FILE_MODS enabled (production): plugin/theme installs and"
+  ok "  updates from wp-admin are blocked. Use: wp-plugins.sh install <slug>"
+fi
+
 # ── Proxy configuration for WordPress ────────────────────────────────────────
 # The FIREWALL enforces the egress boundary; this is what makes well-behaved
 # code take the sanctioned path rather than being dropped at it. Without
@@ -586,7 +611,7 @@ install -m 0644 "${PAYLOAD_DIR}/mu-plugins/00-wpvm-login-slug.php" "${MU_DIR}/00
     warn "Login slug mu-plugin still contains a placeholder — slug will NOT work."
     warn "  Fix by hand: ${MU_DIR}/00-wpvm-login-slug.php"
   else
-    ok "Login slug mu-plugin installed (/${WP_ADMIN_SLUG}-login)"
+    ok "Login slug mu-plugin installed (login at /${WP_ADMIN_SLUG})"
     # Confirm PHP can actually parse it. A syntax error in an mu-plugin is a
     # site-wide fatal, and mu-plugins can't be disabled from the admin UI —
     # so this is checked now, while there's still a console to report it on.

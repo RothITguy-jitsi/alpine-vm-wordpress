@@ -542,8 +542,16 @@ APACHE_CONF=/home/wpuser/wp/apache-conf/wp-security.conf
 if grep -q 'Require ip' "$APACHE_CONF" 2>/dev/null; then
   # Pull the actual value(s) from the config so the message is accurate even
   # when the variable isn't set in this shell.
+  # DEDUPLICATE. The same allow list appears in more than one <Directory>
+  # block (wp-admin and the custom login slug), and an allow list can now hold
+  # several addresses, so a naive concatenation printed
+  # "192.168.100.0/24 72.208.112.108 192.168.100.0/24 72.208.112.108" and read
+  # like a config bug when the config was correct. Split on whitespace, keep
+  # first occurrences, and strip any trailing comment the sed picked up.
   _cfg_ips=$(grep 'Require ip' "$APACHE_CONF" 2>/dev/null \
-             | sed 's/.*Require ip//' | tr -s ' ' | tr '\n' ' ' | sed 's/^ *//;s/ *$//')
+             | sed 's/#.*$//' | sed 's/.*Require ip//' \
+             | tr -s ' \t' '\n' | grep -v '^$' \
+             | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/ *$//')
   pass "wp-admin IP restriction present (${_cfg_ips:-see ${APACHE_CONF}})"
 elif [ -n "${ADMIN_CIDR}${ALLOWED_ADMIN_IP}" ]; then
   # Variable says one was requested, but the config doesn't have it — a real

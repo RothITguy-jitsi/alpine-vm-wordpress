@@ -468,3 +468,14 @@ construction, not yet by a real-hardware run. The first live install should
 deliberately lock out a test admin and confirm the console recovery path brings
 them back — that is the test that matters most, because it is the one whose
 failure is a client locked out of their own site.
+
+### Single generator for the slug rewrite rules
+
+The login-slug rewrite is currently produced twice — once into
+`wp-security.conf` by `lib/03-dynamic-configs.sh`, once into `.htaccess` by
+`payload/stages/04-apache-hardening.sh`. They drifted, and the result was a
+redirect loop that no individual check caught (see the 2026.08.11h entry).
+`check-slug-rewrites.py` now fails loudly if they disagree, which makes the
+duplication safe, but the real fix is one function emitting both. Worth doing
+the next time this area is touched.
+

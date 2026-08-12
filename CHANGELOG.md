@@ -6,6 +6,131 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11h — The login slug redirect loop: two generators, two answers
+
+Reported from the live VM: `https://test.rothitguy.pro/boob` returned "The page
+isn't redirecting properly", and the same URL was 403 from outside the LAN while
+never routing on the LAN either. The site itself loaded fine.
+
+**Root cause: the slug rewrite is generated in two places and they disagreed.**
+
+    lib/03-dynamic-configs.sh   ->  wp-security.conf :  ^<slug>/?$  ->  /wp-login.php
+    payload/stages/04-...       ->  .htaccess        :  ^<slug>/?$  ->  /wp-admin/index.php
+
+Whichever ruleset won, a request to `/<slug>` reached wp-admin
+unauthenticated. WordPress redirected to the login page. The login-slug
+mu-plugin, doing its job, rewrote that URL back to `/<slug>`. The browser
+looped until it gave up.
+
+Nothing failed. Nothing logged an error. `validate-wordpress.sh` even reported
+"Login slug /boob serves the login page (HTTP 302)" — which was true, and was
+the first hop of the loop. This is the failure mode where every individual
+check passes and the composed system does not work.
+
+**A dead rule made it look handled.** Stage 04 also carried
+`^<slug>-login -> /wp-login.php`. That suffix was deliberately removed from the
+mu-plugin some time ago (a `-login` suffix made the secret path guessable), so
+nothing ever requested it. Reading the block, the login entry point appeared to
+be covered; the live rule sent it elsewhere. Two other places still advertised
+the dead URL too — the install message ("Login slug mu-plugin installed
+(/boob-login)") and the completion banner's STEP 2 login line — so the log told
+the operator to visit a URL that had not existed for several versions, while
+the URL that did exist looped.
+
+**Fixed:** the bare slug now routes to `/wp-login.php` in both generators, the
+dead `-login` rule is gone, and both the install message and the completion
+banner print the real login URL.
+
+**New check: `check-slug-rewrites.py`.** It parses the rewrite rules out of both
+generators and fails if they map the same slug pattern to different targets, or
+if either still references the removed `-login` suffix. Verified retroactively:
+restoring the divergence makes it fail with the exact mismatch named; removing
+it makes it pass.
+
+The proper fix is one generator feeding both files, and that refactor is worth
+doing — it is in TODO. Until then this check makes the duplication safe by
+making divergence loud instead of silent, which is the difference between a
+five-minute fix and a redeploy cycle spent staring at a browser.
+
+---
+
+## 2026.08.11g — First install with no fatal blocker, and the bugs behind it
+
+The install completed. Squid parsed, CrowdSec ran, stage 10 ran, the operator
+menu worked. What the log then showed is a set of failures that only appear once
+things get far enough to be exercised — and a fresh external evaluation
+independently found the most important one.
+
+**wp-cli was missing `--path`, so every plugin operation silently did nothing.**
+`wp-plugins.sh` invoked wp-cli without `--path=/var/www/html`, which
+`wp-import.sh` and `wp-rotate-secrets.sh` both had. wp-cli defaulted to a
+working directory that is not the docroot, found no WordPress, printed nothing,
+and exited 0. The install therefore reported "Two Factor plugin installed and
+activated" for an install that never happened, and validate-wordpress.sh later
+correctly reported MFA enforced with the plugin inactive. Three fixes: the
+`--path`, a reachability probe (`wp core version`) that proves wp-cli can see
+WordPress before anything is trusted, and activation confirmed by ASKING
+(`plugin is-active`) rather than trusting the exit status of the activate call.
+A claim about state should be a reading of state.
+
+**That failure could still certify a production install.** Under production, a
+requested MFA that is not actually working now writes a PRODUCTION-BLOCKER
+rather than passing quietly — the external evaluation raised the same point
+("Final production marker can be written without proving requested MFA is
+active"), and it was right.
+
+**Two undefined helpers reached a live VM, and the checker that exists to catch
+them reported CLEAN.** `_hdr` broke the remote-restore drill's output and `_wp`
+broke `wp-mail.sh test` outright. The checker had two gaps: its command-position
+regex only matched calls at column zero, so anything inside a case arm or if
+block — which is most calls — was never examined; and its trailing pattern
+required the first argument to be quoted, so `_wp eval '...'` slipped through.
+Both fixed, with regression fixtures for the indented call, the `$( )` call, and
+a false positive it started producing (the English word "pass" inside a message
+string). A checker that reports clean while the bug it was written for sits in
+the tree is worse than no checker, because it is trusted.
+
+**The restore drill failed on MariaDB auth.** The readiness ping succeeded and
+the restore then failed with ERROR 1045 using identical nested quoting; the
+difference is that the restore pipes a dump on stdin. Credentials now go through
+`MYSQL_PWD` in the container environment instead of `-p` on a command line built
+from nested quotes — which removes the quoting from the equation and keeps the
+password out of argv as a bonus. The failure path now prints mariadb's actual
+first lines and notes that a dump carrying CREATE USER/GRANT statements from the
+source system is a plausible cause worth inspecting before blaming the backup.
+
+**A duplicated allow-list display that looked like a config bug.** The validator
+printed "192.168.100.0/24 72.208.112.108 192.168.100.0/24 72.208.112.108"
+because the same list legitimately appears in two `<Directory>` blocks and the
+display concatenated all matches. Deduplicated.
+
+**From the evaluation, three documentation and hardening corrections:**
+
+- The plugin installer called WordPress.org a "signed" directory. It is not.
+  WordPress.org serves packages over HTTPS, which authenticates the server; the
+  packages carry no signature this VM verifies. Overstating a control is worse
+  than lacking it, because it stops anyone looking for the real one.
+- README's Known Limitations still said no signed release manifest exists,
+  contradicting the section three screens earlier that documents verifying
+  against one. Corrected to the true statement: signing exists and production
+  refuses unverified installs; a *development checkout* has no manifest to
+  verify against. The stale backup limitation was corrected the same way, since
+  both restore drills now exist.
+- `DISALLOW_FILE_MODS` is now set under production. `DISALLOW_FILE_EDIT` only
+  removed the code editor; an administrator — or a hijacked admin session —
+  could still install a plugin from wp-admin, which is a far more direct route
+  to arbitrary PHP. Verified that WP-CLI is explicitly unaffected by the
+  constant (language installs are the sole documented exception), so
+  `wp-plugins.sh install` still works: blocked in the UI where a stolen session
+  lives, available from the console path that is logged. It also makes the site
+  immune to CVE-2024-31210 by that advisory's own text.
+
+Remaining evaluation findings — plugin checksum verification, candidate testing
+against cloned data, destination-enforced immutability, cross-control semantic
+tests — are real and larger, and go to TODO rather than being rushed.
+
+---
+
 ## 2026.08.11f — Six operator-requested prompt fixes from a real install
 
 All six came from notes written while actually sitting through the installer,

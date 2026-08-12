@@ -361,7 +361,7 @@ IP="${IP:-<run: ip addr show eth0 | grep inet>}"
 # default path regardless of custom slug. The slug only applies AFTER
 # setup completes — for day-to-day login and admin access.
 if [ -n "${WP_ADMIN_SLUG}" ]; then
-  LOGIN_URL="http://${IP}/${WP_ADMIN_SLUG}-login"
+  LOGIN_URL="http://${IP}/${WP_ADMIN_SLUG}"
   ADMIN_URL="http://${IP}/${WP_ADMIN_SLUG}/"
 else
   LOGIN_URL="http://${IP}/wp-login.php"

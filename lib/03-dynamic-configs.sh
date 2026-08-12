@@ -450,7 +450,7 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
     # How it works:
     #   Requests to /${WP_ADMIN_SLUG}/, /${WP_ADMIN_SLUG}/anything.php, etc. are
     #   rewritten internally to the matching literal file under /wp-admin/.
-    #   Requests to /${WP_ADMIN_SLUG}-login  → rewritten to /wp-login.php  (internally)
+    #   Requests to /${WP_ADMIN_SLUG}  → rewritten to /wp-login.php  (internally)
     #   Direct access to /wp-admin/ and /wp-login.php is then controlled
     #   by the Require ip block below — bots hitting the default paths
     #   get 403 if they are not on the allowed ADMIN_CIDR.

@@ -45,12 +45,25 @@ HELPER_NAMES = {
     "info", "pass", "fail", "die", "debug", "say", "_p", "_ok", "_no", "_warn",
     "_err", "_info", "_note", "_hdr", "_sub", "_bad", "_pause", "_missing",
     "msg_ok", "msg_warn", "msg_error", "msg_info",
+    # Wrapper helpers, not output helpers, but the same failure shape: a file
+    # calls _wp expecting a wp-cli wrapper it never defined. Found on a real
+    # VM in wp-mail.sh, where `_wp: not found` broke the mail test.
+    "_wp", "_wpcli", "_db", "_sql", "_run", "_exec", "_curl",
 }
 
 DEF_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", re.M)
 # A call: the name at the start of a command position, followed by an argument.
+# Command position: start of a line (any indentation), or after a shell
+# operator, or immediately inside a command substitution. The original regex
+# anchored on ^ with no allowance for leading whitespace, so a helper called
+# from inside a case arm or an if block -- which is most of them -- was never
+# examined at all. That is why two real undefined helpers passed this check.
 CALL_RE = re.compile(
-    r"(?:^|\|\|\s+|&&\s+|;\s*|then\s+|else\s+|do\s+|\{\s+)([A-Za-z_][A-Za-z0-9_]*)\s+[\"'$]",
+    r"(?:^[ \t]*|\|\|\s+|&&\s+|;\s*|then\s+|else\s+|do\s+|\{\s+|\$\(\s*|`\s*)"
+    # The first argument may be bare (`_wp eval "x"`), not just quoted. The
+    # original class required a quote or $ here, which is exactly how a real
+    # `_wp eval` call escaped this check and reached a VM.
+    r"([A-Za-z_][A-Za-z0-9_]*)\s+\S",
     re.M,
 )
 
@@ -63,6 +76,12 @@ def calls_in(text: str):
     # Ignore heredoc bodies and comments: text inside them is not executed.
     text = re.sub(r"<<-?\s*'?([A-Z_]+)'?.*?^\1", " ", text, flags=re.S | re.M)
     text = re.sub(r"^\s*#.*$", " ", text, flags=re.M)
+    # Blank the CONTENTS of quoted strings. English prose inside a message is
+    # not a command: `_note "…then pass the new value here."` was reported as a
+    # call to a helper named `pass`. A check that cries wolf gets switched off,
+    # so precision here is worth more than catching an exotic edge case.
+    text = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text)
+    text = re.sub(r"'(?:[^'])*'", "''", text)
     return {n for n in CALL_RE.findall(text) if n in HELPER_NAMES}
 
 
@@ -101,6 +120,31 @@ def self_test():
         hd = os.path.join(d, "hd.sh")
         open(hd, "w").write("cat <<'EOF'\n_p \"inside a heredoc\"\nEOF\n")
         assert not scan([hd]), "self-test: heredoc body treated as code"
+
+        # REGRESSION: an INDENTED call inside a case arm. Two real bugs
+        # (_hdr in wasp-offsite-backup.sh, _wp in wp-mail.sh) reached a live
+        # VM because the old regex only matched calls at column zero.
+        indented = os.path.join(d, "indented.sh")
+        open(indented, "w").write(
+            'ok() { echo "$1"; }\ncase "$1" in\n  drill)\n    _hdr "a heading"\n    ;;\nesac\n'
+        )
+        found = scan([indented])
+        assert any(n == "_hdr" for _, n in found), \
+            "self-test: indented call inside a case arm was not examined"
+
+        # REGRESSION: an English word inside a quoted message is not a call.
+        prose = os.path.join(d, "prose.sh")
+        open(prose, "w").write(
+            '_note() { echo "$1"; }\n_note "then pass the new value here"\n'
+        )
+        assert not scan([prose]), "self-test: prose inside a string treated as a call"
+
+        # REGRESSION: a call inside a command substitution.
+        subst = os.path.join(d, "subst.sh")
+        open(subst, "w").write('ok() { echo "$1"; }\n_out=$(_wp eval "x")\n')
+        found = scan([subst])
+        assert any(n == "_wp" for _, n in found), \
+            "self-test: call inside $( ) was not examined"
     return True
 
 

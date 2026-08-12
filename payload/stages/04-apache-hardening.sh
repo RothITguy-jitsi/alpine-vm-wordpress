@@ -103,9 +103,20 @@ if [ -n "${WP_ADMIN_SLUG}" ]; then
     echo ""
     echo "    # Slug -> real admin paths. E=WPVM_SLUG:1 marks the request as having"
     echo "    # legitimately come through the secret URL."
-    echo "    RewriteRule ^${WP_ADMIN_SLUG}/?\$ /wp-admin/index.php [L,QSA,E=WPVM_SLUG:1]"
+    # BARE SLUG -> THE LOGIN PAGE. This is the entry point and it must match
+    # what the mu-plugin emits, which is the bare slug with no suffix.
+    #
+    # BUG FIXED HERE (found on a live VM: "The page isn't redirecting
+    # properly"). This file used to send the bare /<slug> to
+    # /wp-admin/index.php while lib/03-dynamic-configs.sh -- the OTHER
+    # generator of the same rules -- sent it to /wp-login.php. Two generators,
+    # two answers. Whichever ruleset won, /<slug> landed on wp-admin, WordPress
+    # saw an unauthenticated request and redirected to the login page, the
+    # mu-plugin rewrote that back to /<slug>, and the browser looped until it
+    # gave up. The `-login` suffix rule below it was dead: the suffix was
+    # deliberately removed from the mu-plugin, so nothing ever requested it.
+    echo "    RewriteRule ^${WP_ADMIN_SLUG}/?\$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]"
     echo "    RewriteRule ^${WP_ADMIN_SLUG}/(.+)\$ /wp-admin/\$1 [L,QSA,E=WPVM_SLUG:1]"
-    echo "    RewriteRule ^${WP_ADMIN_SLUG}-login/?\$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]"
     echo ""
     echo "    # Block the default login path unless it came via the slug above."
     echo "    # install.php and setup-config.php are exempt: first-run WordPress"

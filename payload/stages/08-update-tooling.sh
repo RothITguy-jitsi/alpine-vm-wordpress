@@ -33,11 +33,23 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wp-plugins.sh" /usr/local/bin/wp-plugins.sh
 # and parses, so a failed fetch cannot wall the admin login -- the mu-plugin
 # treats "plugin absent" as "do not enforce yet, show a notice".
 if [ "${MFA_ENFORCE:-0}" = "1" ]; then
-  if /usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1 | sed 's/^/  /'; then
+  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
+  # status (always 0), which on a real VM printed "installed and activated"
+  # for an install that never happened.
+  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1); _tf_rc=$?
+  printf '%s\n' "$_tf_out" | sed 's/^/  /'
+  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
     ok "Two Factor plugin installed and activated — admins can now enrol"
   else
-    warn "Two Factor plugin install failed. Admins cannot enrol until present."
+    warn "Two Factor plugin is NOT active. Admins cannot enrol."
     warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
+    # MFA was explicitly requested and is not actually working. Under
+    # production that must not be certified: an external evaluation flagged
+    # exactly this -- the final marker could be written while the control the
+    # operator asked for was silently absent.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
+    fi
   fi
 fi
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh

@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11f"
-WASP_VERSION_NOTE="Operator-requested prompt improvements: privacy-focused DNS menu, ed25519 key generation instructions, described and multi-value wp-admin IPs, SMTP review-and-correct step, accurate CTI quotas, numbered profile choice"
+WASP_VERSION="2026.08.11h"
+WASP_VERSION_NOTE="LOGIN SLUG REDIRECT LOOP FIXED: two rewrite generators disagreed on where the bare slug points, so /<slug> looped forever; new check-slug-rewrites.py keeps them in sync"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
