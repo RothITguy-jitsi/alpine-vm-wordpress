@@ -6,6 +6,65 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11k — First commission check: 4 pass, 4 fail, and two were mine
+
+The install completed, the fail-closed gate refused to certify with a stated
+reason, and the commission check ran for the first time. That is the whole
+design working. Then it found four failures, two of which were my own bugs and
+one of which was a design impossibility that three previous "fixes" had been
+chasing.
+
+**`validate-wordpress.sh --check` was rejected by its own argument parser.** The
+option loop hit `--check`, fell through to the default arm, printed
+"Unknown option" and exited 2 — while the handler for it sat unreachable
+twenty lines below, testing a `$1` the loop had already shifted away. So the
+machine-readable health path, the menu's first health entry, and any external
+monitor polling it were all broken, and nothing noticed because no test ever
+invoked the flag. Now intercepted before the loop, with `--prom` carried
+through a captured variable rather than a `$2` that no longer exists. All four
+invocation paths tested.
+
+**The Two Factor install could never have worked at provision time.** The error
+changed from "plugin could not be found" to the honest one:
+
+    Error: The site you have requested is not installed.
+    Run `wp core install` to create database tables.
+
+WordPress core is not installed during provisioning — this platform
+deliberately leaves the setup wizard to the operator (STEP 1 of the completion
+banner). You cannot install a plugin into a WordPress that has no database
+tables. The previous two attempts moved this between stages on the theory that
+it was an egress problem; that diagnosis was partly right and the fix stands
+(Squid is up and reachable now, and the error changed *because* of it), but the
+remaining blocker was ordering that no stage can satisfy.
+
+Now deferred: a boot-time hook checks every ten minutes whether setup has been
+completed, installs and activates Two Factor the moment it has, clears its own
+production blocker, and disables itself. The operator finishes the wizard they
+already had to finish, and 2FA is ready before their first login. `wp-plugins.sh`
+gained an `is-site-installed` predicate for it, and its install probe now
+distinguishes "setup not finished" from "cannot reach WordPress" — telling
+someone to check egress when the real answer is "run the setup wizard" costs an
+afternoon.
+
+**The commission check hid the evidence it existed to surface.** It tailed six
+lines, which for two of the four failures was pure summary boilerplate
+("Result: FAILED — 1 issue(s)") while the line naming the actual failing probe
+scrolled past above it. It now greps for failure markers, filters out the
+summary lines, and keeps the complete output at
+`/var/log/wasp-commission-<tool>.log`. A diagnostic that truncates away the
+diagnosis is worse than no diagnostic, because it looks like it did its job.
+
+**Two failures remain undiagnosed and I will not guess at them.** The egress
+boundary test reports "The boundary is NOT holding", and `wasp-selftest.sh all`
+reports 17 passed / 1 failed — both truncated to summary lines by the bug
+above. The egress one matters most: it means the firewall may not be enforcing
+the destination restriction and only WordPress's own proxy settings are, which
+is exactly the gap the control exists to close. Both need their full output,
+which the next run will now produce.
+
+---
+
 ## 2026.08.11j — Install completes; the last failure was egress, not the plugin
 
 A milestone worth stating plainly: **the install ran to completion.** Every tool

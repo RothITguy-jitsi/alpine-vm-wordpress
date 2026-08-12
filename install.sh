@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11j"
-WASP_VERSION_NOTE="Two Factor install moved to stage 10 (it needed the internet while Squid was not yet running); wp-cli now uses the egress proxy instead of connecting directly and being dropped"
+WASP_VERSION="2026.08.11l"
+WASP_VERSION_NOTE="self-test no longer reports a backup failure for a site whose setup wizard was never run; content checks skip with a stated reason instead of accusing the backup of losing data that never existed"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
