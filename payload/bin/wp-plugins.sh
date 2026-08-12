@@ -273,11 +273,31 @@ _wp() {
   # called `plugin` and dies with "plugin: not found". Every _wp call was
   # silently failing this way, hidden because each call site suppresses stderr
   # and falls back to a friendly message.
+  # EGRESS PROXY. The wp-cli container shares the WordPress network namespace,
+  # so it is subject to the same nftables rules: when EGRESS_PROXY=1 the ONLY
+  # reachable destination is Squid at 10.89.10.2:3128. WordPress itself knows
+  # this via WP_PROXY_HOST in wp-config, but wp-cli is a separate process that
+  # would otherwise try to connect DIRECTLY and be silently dropped -- which
+  # surfaces as "An unexpected error occurred... plugin could not be found",
+  # a message that blames WordPress.org for a local firewall decision.
+  #
+  # Read the setting rather than assume it: when egress filtering is off these
+  # variables stay empty and wp-cli connects directly, which is correct then.
+  _wpcli_proxy=""
+  # Strip quotes with sed, not a nested-quote `tr -d` -- that construct has
+  # broken dash parsing in this repo twice before.
+  _egress_on=$(sed -n 's/^EGRESS_PROXY=//p' /etc/wp-install/vars.sh 2>/dev/null \
+               | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+  if [ "${_egress_on}" = "1" ]; then
+    _wpcli_proxy="-e HTTP_PROXY=http://10.89.10.2:3128 -e HTTPS_PROXY=http://10.89.10.2:3128 -e NO_PROXY=localhost,127.0.0.1,mariadb,10.89.10.0/24,10.89.20.0/24"
+  fi
+  # shellcheck disable=SC2086
   podman run --rm \
     --network "container:wordpress" \
     --user "${WPCLI_UID}:${WPCLI_UID}" \
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
+    ${_wpcli_proxy} \
     -v "${WP_HTML_DIR}:/var/www/html" \
     "$WPCLI_IMAGE" wp --path=/var/www/html "$@"
 }

@@ -176,49 +176,6 @@ for _t in /usr/local/bin/*.sh; do
 done
 ok "Bare-name aliases created (wasp-egress and wasp-egress.sh both work)"
 
-
-# ── Two Factor plugin (LAST, deliberately) ───────────────────────────────────
-# This runs at the END of the stage, after every tool above is already on disk.
-#
-# It used to run immediately after wp-plugins.sh was installed, which put a
-# NETWORK-DEPENDENT operation in front of fourteen local file installs. On a
-# real VM the plugin install failed and took the whole stage with it: no
-# validate-wordpress.sh, no backups, no menu, no stage 10 -- the operator was
-# left with a half-built box because a plugin download did not work. Ordering
-# local, always-succeeds work before anything that talks to the internet is
-# free, and it means a network problem costs you one plugin instead of the
-# entire toolset.
-# Two Factor plugin: install it here, where wp-plugins.sh now exists, when MFA
-# enforcement was requested at install time. The enforcement mu-plugin (stage
-# 06) is already in place and waiting for it. Activated only after it installs
-# and parses, so a failed fetch cannot wall the admin login -- the mu-plugin
-# treats "plugin absent" as "do not enforce yet, show a notice".
-if [ "${MFA_ENFORCE:-0}" = "1" ]; then
-  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
-  # status (always 0), which on a real VM printed "installed and activated"
-  # for an install that never happened.
-  #
-  # NOTE THE `|| _tf_rc=$?`. Writing this as `_out=$(cmd); _rc=$?` is a trap
-  # under `set -e`: the ASSIGNMENT inherits the command substitution's exit
-  # status, so a failing command kills the script at that line and the _rc that
-  # follows is never read. That is exactly what happened on a live install --
-  # the stage stopped dead after printing its header, with no error, and the
-  # whole rest of the tooling (validate-wordpress.sh, backups, stage 10) was
-  # never installed. Guarding the assignment is what makes the capture safe.
-  _tf_rc=0
-  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1) || _tf_rc=$?
-  printf '%s\n' "$_tf_out" | sed 's/^/  /'
-  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
-    ok "Two Factor plugin installed and activated — admins can now enrol"
-  else
-    warn "Two Factor plugin is NOT active. Admins cannot enrol."
-    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
-    # MFA was explicitly requested and is not actually working. Under
-    # production that must not be certified: an external evaluation flagged
-    # exactly this -- the final marker could be written while the control the
-    # operator asked for was silently absent.
-    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
-      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
-    fi
-  fi
-fi
+# NOTE: the Two Factor plugin install used to live here. It moved to stage 10,
+# because it needs the INTERNET and the egress proxy does not exist yet at this
+# point -- see the comment at its new home for the full reasoning.

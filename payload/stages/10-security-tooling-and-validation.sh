@@ -234,6 +234,54 @@ ok "  Commands: enable|disable [8g|xmlrpc|uploads-php|debug]  |  trivy-scan  |  
 # Verifies every critical component before declaring the install complete.
 # Creates /usr/local/bin/validate-wordpress.sh for ongoing health checks.
 # ════════════════════════════════════════════════════════════════════════════
+
+# ── Two Factor plugin ────────────────────────────────────────────────────────
+# THIS RUNS IN STAGE 10, NOT WITH THE OTHER TOOLING, AND THE REASON MATTERS.
+#
+# Installing a plugin needs the internet. When EGRESS_PROXY=1 the nftables rules
+# (loaded in stage 06) restrict the WordPress network to ONE destination: Squid
+# at 10.89.10.2:3128. Squid does not start until stage 09. So for the whole of
+# stages 06-08 the containers have a proxy configured and nothing listening on
+# it -- every outbound request fails.
+#
+# That is exactly what happened on a real install: wp-cli reported
+# "An unexpected error occurred... The 'two-factor' plugin could not be found",
+# which reads like a WordPress.org problem and is actually a closed egress path.
+# The install then correctly refused to certify the VM, for a reason that had
+# nothing to do with the plugin.
+#
+# Running it here, after Squid is up, is the fix. It is placed before the final
+# validation so validate-wordpress.sh reports the true end state.
+if [ "${MFA_ENFORCE:-0}" = "1" ]; then
+  # Judge the exit status, then VERIFY the end state. `| sed` would test sed's
+  # status (always 0), which on a real VM printed "installed and activated"
+  # for an install that never happened.
+  #
+  # NOTE THE `|| _tf_rc=$?`. Writing this as `_out=$(cmd); _rc=$?` is a trap
+  # under `set -e`: the ASSIGNMENT inherits the command substitution's exit
+  # status, so a failing command kills the script at that line and the _rc that
+  # follows is never read. That is exactly what happened on a live install --
+  # the stage stopped dead after printing its header, with no error, and the
+  # whole rest of the tooling (validate-wordpress.sh, backups, stage 10) was
+  # never installed. Guarding the assignment is what makes the capture safe.
+  _tf_rc=0
+  _tf_out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1) || _tf_rc=$?
+  printf '%s\n' "$_tf_out" | sed 's/^/  /'
+  if [ "$_tf_rc" -eq 0 ] && printf '%s' "$_tf_out" | grep -q "Activated (verified)"; then
+    ok "Two Factor plugin installed and activated — admins can now enrol"
+  else
+    warn "Two Factor plugin is NOT active. Admins cannot enrol."
+    warn "  Retry once egress/DNS is confirmed: wp-plugins.sh install two-factor --activate"
+    # MFA was explicitly requested and is not actually working. Under
+    # production that must not be certified: an external evaluation flagged
+    # exactly this -- the final marker could be written while the control the
+    # operator asked for was silently absent.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      block_production "MFA was requested (MFA_ENFORCE=1) but the Two Factor plugin is not active, so administrators cannot enrol a second factor. The enforcement mu-plugin fails safe (it will not lock anyone out), which means the site is running with NO admin MFA despite it being requested. Fix with: wp-plugins.sh install two-factor --activate"
+    fi
+  fi
+fi
+
 ts "Running post-install validation"
 
 PASS=0; FAIL=0
