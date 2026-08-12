@@ -6,6 +6,49 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.11j — Install completes; the last failure was egress, not the plugin
+
+A milestone worth stating plainly: **the install ran to completion.** Every tool
+installed, the alias loop found them all, Squid came up with its log directory
+owned 13:13 (queried from the image, as intended), the policy parsed, and the
+fail-closed design did precisely its job — it refused to certify the VM, named
+the reason, left a durable marker, and pointed at the tools to diagnose with,
+instead of dying silently mid-build as it did two versions ago.
+
+The one remaining blocker was real, and it was not the plugin.
+
+**wp-cli reported "the 'two-factor' plugin could not be found", which was a
+firewall decision wearing a WordPress.org error message.** Two compounding
+causes:
+
+- **Stage ordering.** The Two Factor install ran in stage 08. When
+  EGRESS_PROXY=1, the nftables rules loaded in stage 06 restrict the WordPress
+  network to exactly one destination: Squid at 10.89.10.2:3128. Squid does not
+  start until stage 09. So every outbound request in stages 06-08 goes to a
+  proxy that is not there yet. Moved to stage 10, after Squid is up and before
+  the final validation, so validate-wordpress.sh reports the true end state.
+- **wp-cli did not know about the proxy.** WordPress itself has WP_PROXY_HOST
+  in wp-config, but wp-cli runs as a separate container process sharing the
+  same network namespace, and it had no HTTP_PROXY. Even with Squid running it
+  would have connected directly and been dropped — so fixing the ordering alone
+  would have produced the same error for a different reason. It now reads
+  EGRESS_PROXY from vars.sh and sets HTTP_PROXY/HTTPS_PROXY/NO_PROXY only when
+  filtering is actually enabled.
+
+The allowlist was already correct: `.wordpress.org` covers both
+`api.wordpress.org` and `downloads.wordpress.org`. Nothing there needed
+widening, which is the right outcome — the failure was a path problem, not a
+policy one.
+
+**A near-miss worth recording.** The first version of the proxy fix used
+`tr -d` with nested shell quotes to strip quotes from the vars.sh value, and
+dash rejected it immediately. That is the third appearance of that exact
+construct in this project, and it was caught this time only because the syntax
+sweep runs three parsers. Replaced with sed, and verified against both quoted
+and unquoted values.
+
+---
+
 ## 2026.08.11i — A silent `set -e` trap that cost the whole second half of the install
 
 The slug fix worked: the log reports "Login slug mu-plugin installed (login at
