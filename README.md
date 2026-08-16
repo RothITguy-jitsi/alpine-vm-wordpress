@@ -31,6 +31,12 @@ A note on how to read that sentence, and this README generally: "integrity-check
 
 ---
 
+## Credits
+
+WASP is a provisioner: most of what it installs is other people's work. Every component, feed and service it uses is credited in [NOTICE.md](NOTICE.md), with licences.
+
+One deserves naming here: the **8G Firewall** by **Jeff Starr** ([Perishable Press](https://perishablepress.com/8g-firewall/)) is the only third-party source embedded directly in this repository, because it has to exist before WordPress serves its first request.
+
 ## Why I built this
 
 I kept standing up WordPress for people and watching the same three failures, in the same order:

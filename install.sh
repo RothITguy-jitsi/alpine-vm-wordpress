@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.11l"
-WASP_VERSION_NOTE="self-test no longer reports a backup failure for a site whose setup wizard was never run; content checks skip with a stated reason instead of accusing the backup of losing data that never existed"
+WASP_VERSION="2026.08.12c"
+WASP_VERSION_NOTE="CRITICAL: update.sh wp swapped the image but never updated WordPress core files, so patched-looking VMs served vulnerable core; core now synced from the verified image and the mismatch is a validator failure"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

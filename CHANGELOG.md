@@ -6,6 +6,209 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12c — `update.sh wp` never actually updated WordPress
+
+Asked whether 7.0.3 could be digest-pinned or whether a patch was needed. The
+answer to the first is yes and always was — the installer resolves the tag to a
+digest with Skopeo at install time, so nothing needs hardcoding. Checking the
+second uncovered something much worse.
+
+**The official WordPress image copies core into the docroot ONLY when that
+directory is empty.** On every later run it deliberately leaves it alone,
+because it cannot know what you have changed there. This is documented upstream
+behaviour, not a bug in the image.
+
+WASP bind-mounts the docroot. So on any existing VM, `update.sh wp` pulled a new
+digest, CVE-scanned it, booted a validation candidate, cut production over,
+wrote pinned.env, printed a tick — and the site carried on serving **the
+WordPress version extracted on first boot**. The image moved. WordPress did not.
+
+The consequence is that this platform's central patching claim was false for
+core, which is precisely where the CVEs that matter live. A VM would report
+itself pinned to 7.0.3 while serving 7.0.2 and its pre-auth login-page XSS
+(CVE-2026-64638, CVSS 8.9). Nothing anywhere would have contradicted that: the
+tag was right, the digest was right, the scan was clean, and the version being
+served was wrong.
+
+**Fixed three ways.**
+
+- `update.sh wp` now syncs core out of `/usr/src/wordpress` **inside the new
+  image** after the cutover, excluding `wp-content` so themes, plugins, uploads
+  and the mu-plugins survive. Taking the files from the verified image rather
+  than downloading them from wordpress.org keeps the digest guarantee intact:
+  what runs is what was scanned. It reports the before → after version, and
+  applies any schema migration via wp-cli.
+- `wp-plugins.sh core-version` reads the version out of `wp-includes/version.php`
+  — the files actually being served — and compares it to the pinned tag,
+  reporting a mismatch explicitly. Also on the Testing menu.
+- `validate-wordpress.sh` now FAILS on that mismatch, with the honest wording:
+  the site is serving the older version, so any CVE fixed in the newer release
+  is still exploitable here.
+
+The failure path matters too: if the sync cannot run, it says so on stderr and
+tells the operator to verify by reading `version.php` rather than trusting the
+tag. A silent partial update is what caused this.
+
+This is the most consequential defect found in the whole series. Every other bug
+broke something visibly. This one made a vulnerable system look patched.
+
+---
+
+## 2026.08.12b — Pre-production sweep: a live CVE on the login page, and missing credits
+
+A full pass ahead of production: syntax, every bug class from this series, CVEs
+on the shipped stack, documentation accuracy, and attribution.
+
+**SECURITY — WordPress 7.0.2 was shipping with a known login-page CVE.**
+WordPress 7.0.3 was released 2026-08-06 fixing 12 vulnerabilities, the most
+serious being **CVE-2026-64638** (CVSS 8.9): a *pre-authentication reflected
+XSS on the login page*, requiring no attacker privileges, which can lead to PHP
+code execution via the plugin/theme editor if an administrator is phished into
+clicking a crafted link.
+
+That is precisely the surface this entire platform is built around. The custom
+login slug, the wp-admin IP restriction and DISALLOW_FILE_MODS all reduce the
+exposure — none of them is the fix. Updated to 7.0.3 everywhere.
+
+Context that belongs in the record: the PREVIOUS core chain (CVE-2026-60137 /
+CVE-2026-63030, fixed in 7.0.2) entered CISA's Known Exploited Vulnerabilities
+catalog, with exploitation attempts observed roughly 90 minutes after
+disclosure. WordPress core CVEs are weaponised in hours now. That is the
+argument for running `update.sh check` weekly rather than quarterly, and it is
+worth telling clients.
+
+MariaDB `11.4`, CrowdSec `v1.7.8` and Canonical's Squid were checked and are
+current; the June MariaDB Galera CVEs remain inapplicable (single-node).
+
+**Missing attribution — fixed.** The 8G Firewall by **Jeff Starr**
+(Perishable Press) is embedded verbatim in this repository and carried only a
+URL, with no author credit. That is the one third-party *source* WASP ships
+rather than downloads, and it was the least credited. Added inline where anyone
+reading the generated `.htaccess` will see it, plus a new `NOTICE.md` crediting
+every component, feed and service with its licence — container images, base
+system, security tooling, crypto, mail, the Two Factor plugin, and the data
+feeds including the attribution Wordfence's terms require when their data is
+displayed. Linked from the README.
+
+**Clean across the board.** All eight bug classes from this series verified
+clean by their own checks; dash/bash syntax verified on every file with the
+bash-only host scripts correctly separated from the dash-only payload; no
+call-before-define; `rm -rf` targets all rooted in literal constants; no stale
+version claims outside frozen CHANGELOG history; 18 tools documented, 56 menu
+entries real, 78 doc links resolving.
+
+---
+
+## 2026.08.12a — Every alert path was dead. Reported from the terminal, missed by me.
+
+Spotted by the operator in their own session output, in a line I had read past:
+
+    testpress:~$ doas wp-db-backup.sh
+    /usr/local/bin/wp-notify.sh: line 269: STATE: parameter not set
+
+This is the most serious defect found in this series, and it is not close.
+
+**`STATE` was referenced in six places in `wp-notify.sh` and assigned in none.**
+Under `set -u` that is fatal, not a warning, so the notifier exited before
+sending anything. Everything that alerts goes through it:
+
+  * the backup-FAILED email — the alert this platform argues most strongly for,
+    on the grounds that "a backup that has been failing silently for months is
+    the single most common way people discover they have no backups"
+  * malware scan findings
+  * vulnerability scan findings
+  * the heartbeat, which is the only mechanism that detects the VM being GONE
+  * update and hardening alerts
+
+A monitoring system that cannot report is worse than not having one, because
+its silence is indistinguishable from all-clear. This platform had exactly that,
+and it would have looked healthy right up until someone needed a backup.
+
+Fixed: `STATE` defaults to `/var/lib/wasp-notify`, created 0700 at startup.
+
+**This was the THIRD instance of the same bug in the same file.** The comments
+above the fix record the previous two verbatim — `SECRETS_DIR: parameter not
+set`, then `NOTIFY_COOLDOWN_HOURS: parameter not set`. Three times is not bad
+luck, it is a missing check.
+
+**New check: `check-setu-unset.py`.** For every script that sets `-u`, it
+collects the ALL-CAPS variables referenced and the ones assigned, and reports
+any reference with no assignment and no `${X:-default}`. All three historical
+instances would have been caught. Verified retroactively: removing the new
+`STATE=` line makes it fail naming the file and variable.
+
+Building it took two rounds of false positives, both worth recording because
+they are the reason the check is trustworthy rather than noise:
+
+  * `$MARIADB_ROOT_PASSWORD` inside `podman exec sh -c '...'` is expanded by
+    the CONTAINER, not the host shell, so single-quoted spans had to be
+    excluded — six false positives on the first run.
+  * Stripping those spans file-wide desynchronised on a stray apostrophe in a
+    trailing comment ("don't"), leaving two real container commands looking
+    like host references. Quote stripping is now line-scoped so one stray
+    quote cannot poison everything after it.
+
+The honest note: I read this log line and did not act on it. The operator did.
+Every check in this suite exists because something got through, and the ones
+that matter most came from someone looking at real output rather than at the
+code.
+
+---
+
+## 2026.08.12 — All four commission failures resolved
+
+The improved diagnostics from the previous release did their job: every failure
+this time named itself, and three of the four turned out to be tooling bugs
+rather than platform faults. Recorded in the order they matter.
+
+**The egress test was probing a URL that is not a 200, and could not tell a
+policy denial from a connection failure.** It requested
+`https://api.wordpress.org/` with `curl -sf`. The root of that host does not
+return 200, and `-f` makes curl exit nonzero on any 4xx — so an allowlisted,
+perfectly reachable host looked blocked. Worse, the probe only asked "did curl
+exit zero", which cannot distinguish *Squid refused this* from *Squid could not
+resolve it* from *nothing answered at all*, and those need completely different
+fixes.
+
+It now captures the HTTP status and classifies: 2xx/3xx allow; **403** refused
+by policy; **407** proxy auth misconfigured; **503** Squid reached but could not
+resolve or connect; **000** nothing answered. On a mismatch it prints which of
+those it was and what to check. The allow probe now uses
+`api.wordpress.org/core/version-check/1.7/` — the endpoint WordPress itself
+calls, which returns 200.
+
+Worth stating plainly, because it was buried under a red line: **the boundary
+was holding the whole time.** Every deny probe passed — not-allowlisted hosts,
+cloud metadata, bare IP literals, and CONNECT to a non-443 port were all
+refused. The single failure was a broken test, and it cascaded into the MFA
+failure behind it.
+
+**Backup tooling did not auto-elevate, and failed silently.** Running
+`wp-db-backup.sh` as the admin user printed
+`install: can't create directory '/root/wp-db-backups': Permission denied` —
+blaming the filesystem for a privilege problem. Every other operator tool in
+the suite already auto-elevates via doas; this one, `wasp-testreport.sh` and
+`wp-geoip-setup.sh` did not. Added to all three.
+
+Separately, the failure path emailed and syslogged but printed **nothing to the
+terminal**, so an operator running it by hand got silence and exit 1. It now
+prints mariadb-dump's actual stderr plus the three things worth checking, in
+the order worth checking them. And `wasp-selftest.sh` no longer runs the backup
+under `>/dev/null 2>&1` — that suppression is why "a backup could not be taken"
+was all anyone saw.
+
+**`validate-wordpress.sh --check` is working.** Its `FAIL (exit 2)` this run was
+not a bug: it correctly reported `CRITICAL - no-backup PRODUCTION-BLOCKER`, both
+of which were true. The fix from the previous release landed.
+
+**The MFA failure was downstream of the egress test's own bug.** With
+api.wordpress.org genuinely reachable, the deferred installer should now
+succeed once WordPress setup is completed. A `MFA / Two Factor status` entry was
+added to the Testing menu so this can be confirmed without remembering a log
+path.
+
+---
+
 ## 2026.08.11k — First commission check: 4 pass, 4 fail, and two were mine
 
 The install completed, the fail-closed gate refused to certify with a stated
