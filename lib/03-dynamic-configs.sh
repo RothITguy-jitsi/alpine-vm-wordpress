@@ -38,6 +38,19 @@ fi
 # the same bridge and is exempt because it IS the sanctioned path out.
 #
 # Placed BEFORE the general container-egress accept, or it never matches.
+# One accept per configured resolver. Built here rather than inlined so an
+# operator who picked three DNS servers gets three rules, and so a malformed
+# entry cannot silently produce a rule that matches nothing.
+SQUID_DNS_RULES=""
+for _d in ${VM_DNS:-9.9.9.9 149.112.112.112}; do
+  case "$_d" in
+    *[!0-9.]*|"") continue ;;
+  esac
+  SQUID_DNS_RULES="${SQUID_DNS_RULES}        ip saddr 10.89.10.2 ip daddr ${_d} udp dport 53 accept"$'\n'
+  SQUID_DNS_RULES="${SQUID_DNS_RULES}        ip saddr 10.89.10.2 ip daddr ${_d} tcp dport 53 accept"$'\n'
+done
+SQUID_DNS_RULES="${SQUID_DNS_RULES%$'\n'}"
+
 if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
   EGRESS_PROXY_FORWARD="        # WordPress -> Squid only. Everything else outbound is dropped.
         ip saddr 10.89.10.0/24 ip daddr 10.89.10.2 tcp dport 3128 accept
@@ -58,6 +71,14 @@ if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
         # gateway resolver rather than anywhere.
         ip saddr 10.89.10.2 ip daddr 10.89.10.1 udp dport 53 accept
         ip saddr 10.89.10.2 ip daddr 10.89.10.1 tcp dport 53 accept
+        # Squid resolves external names itself, so it must reach the REAL
+        # resolvers -- not only the podman gateway. Relying on aardvark-dns to
+        # forward external queries was the single point of failure that made
+        # every outbound request fail: Squid could not resolve anything, and
+        # the symptom looked exactly like a policy denial. These are the
+        # specific servers chosen at install, so DNS is still pinned to named
+        # destinations and the tunnel stays closed.
+${SQUID_DNS_RULES}
         ip saddr 10.89.10.2 tcp dport { 80, 443 } accept
         # Everything else from wp-front, logged then dropped. The log is what
         # discovery reads to find destinations the allowlist is missing, and

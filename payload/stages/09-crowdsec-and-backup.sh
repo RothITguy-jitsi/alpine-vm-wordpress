@@ -18,6 +18,15 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   for _f in squid.conf hard-deny.txt allowlist-runtime.txt threat-deny.txt allowlist-maintenance.txt; do
     [ -f "${PAYLOAD_DIR}/squid/${_f}" ] && install -m 0644 "${PAYLOAD_DIR}/squid/${_f}" "/opt/squid/config/${_f}"
   done
+  # Substitute the resolvers Squid should use. VM_DNS is what the operator
+  # chose at install; fall back to Quad9, which is the installer's default.
+  _sq_dns="${VM_DNS:-9.9.9.9 149.112.112.112}"
+  sed -i "s|WASP_DNS_SERVERS_PLACEHOLDER|${_sq_dns}|" /opt/squid/config/squid.conf 2>/dev/null || true
+  if grep -q "WASP_DNS_SERVERS_PLACEHOLDER" /opt/squid/config/squid.conf 2>/dev/null; then
+    warn "Squid resolver placeholder not substituted — Squid will not resolve names"
+  else
+    ok "  Squid resolvers: ${_sq_dns}"
+  fi
   touch /opt/squid/config/allowlist-maintenance.txt
   chmod 0644 /opt/squid/config/*.txt
   # The log directory must be writable by the user squid runs as INSIDE the

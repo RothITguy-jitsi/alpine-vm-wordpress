@@ -589,7 +589,7 @@ case "${1:-status}" in
   # synced, which was a real and silent failure mode -- the image said 7.0.3
   # while the site served 7.0.2. Never trust the tag for this question.
   core-version)
-    _iv=$(podman exec wordpress sh -c 'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
+    _iv=$(podman exec wordpress sh -c 'sed -n "s/^[[:space:]]*\\\$wp_version[[:space:]]*=[[:space:]]*[\x27\"]\\([^\x27\"]*\\)[\x27\"].*/\\1/p" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
     _tag=$(sed -n 's/^WP_TAG=//p' /etc/wp-install/pinned.env 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
     echo "  Core files serving : ${_iv:-unknown}"
     echo "  Image tag pinned   : ${_tag:-unknown}"

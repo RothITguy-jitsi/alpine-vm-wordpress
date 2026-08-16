@@ -511,7 +511,7 @@ fi
 # WordPress image only extracts core when the docroot is empty. An image update
 # alone leaves the OLD core in place, so a VM can report a patched tag while
 # serving a version with a known login-page CVE. Read the files, not the tag.
-_wpver=$(podman exec wordpress sh -c 'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
+_wpver=$(podman exec wordpress sh -c 'sed -n "s/^[[:space:]]*\\\$wp_version[[:space:]]*=[[:space:]]*[\x27\"]\\([^\x27\"]*\\)[\x27\"].*/\\1/p" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
 _wptag=$(sed -n 's/^WP_TAG=//p' /etc/wp-install/pinned.env 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
 if [ -n "$_wpver" ] && [ -n "$_wptag" ]; then
   case "$_wptag" in

@@ -1193,7 +1193,7 @@ do_wp_update() {
       # and the mu-plugins this platform installs all survive untouched.
       echo "  → Syncing WordPress core files from the new image…"
       _core_before=$(podman exec wordpress sh -c \
-        'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
+        'sed -n "s/^[[:space:]]*\\\$wp_version[[:space:]]*=[[:space:]]*[\x27\"]\\([^\x27\"]*\\)[\x27\"].*/\\1/p" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
       if podman exec wordpress sh -c '
              set -e
              [ -d /usr/src/wordpress ] || exit 3
@@ -1211,7 +1211,7 @@ do_wp_update() {
            ' 2>/dev/null; then
         podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
         _core_after=$(podman exec wordpress sh -c \
-          'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
+          'sed -n "s/^[[:space:]]*\\\$wp_version[[:space:]]*=[[:space:]]*[\x27\"]\\([^\x27\"]*\\)[\x27\"].*/\\1/p" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
         if [ "$_core_before" = "$_core_after" ]; then
           echo "  ℹ  Core files already at ${_core_after}"
         else
@@ -2055,7 +2055,12 @@ show_check_summary() {
     [ -n "$DB_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
     [ -n "$CS_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
     [ -n "$SQUID_DIGEST" ] && _PIN_COUNT=$((_PIN_COUNT+1))
-    echo "║  Digest pinning: enabled — ${_PIN_COUNT}/3 currently pinned"
+    # Denominator counts what is actually PRESENT. It was hardcoded to 3, so a
+    # VM running Squid as well reported "4/3 currently pinned" -- arithmetic
+    # that makes a reader distrust everything else in the box.
+    _PIN_TOTAL=3
+    [ -n "$SQUID_TAG" ] && _PIN_TOTAL=4
+    echo "║  Digest pinning: enabled — ${_PIN_COUNT}/${_PIN_TOTAL} currently pinned"
   else
     echo "║  Digest pinning: disabled"
   fi

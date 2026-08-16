@@ -148,12 +148,47 @@ test)
   # is not a 200.
   _code() { # description, url  -> echoes the classification
     _u="$2"
-    _hc=$(podman exec wordpress curl -s -m 12 -o /dev/null -w '%{http_code}' \
-          -x "$_PX" "$_u" 2>/dev/null || echo 000)
-    printf '%s' "${_hc:-000}"
+    # Values go through the ENVIRONMENT, never interpolated into the PHP
+    # source, so a URL containing a quote cannot alter the code being run.
+    export WASP_PROBE_URL="$_u" WASP_PROBE_PROXY="${_PX_FOR_PROBE:-}"
+    # curl's %{http_code} ALREADY prints 000 when it never got a response, so
+    # a `|| echo 000` fallback concatenates a second one and yields "000000",
+    # which then matched no case arm and printed as a nonsense status.
+    # Probe with PHP, not curl. The official WordPress image is minimal -- it
+    # has no netstat, no ss, and curl is not guaranteed either. When curl is
+    # absent, `podman exec wordpress curl ...` produces no output at all, the
+    # status comes back empty, and the test reports "000 / no response" for
+    # what is actually a missing binary. That sent a real investigation after
+    # a firewall that was working.
+    #
+    # PHP is guaranteed present, and it is a BETTER probe: it exercises the
+    # exact runtime and proxy path WordPress itself uses to reach the network,
+    # so a pass here means the thing we care about works, not merely that some
+    # tool in the container could reach the internet.
+    _hc=$(podman exec -e WASP_PROBE_URL -e WASP_PROBE_PROXY wordpress php -r '
+        $u = getenv("WASP_PROBE_URL"); $p = getenv("WASP_PROBE_PROXY");
+        $o = ["http" => ["method"=>"GET","timeout"=>12,"ignore_errors"=>true]];
+        if ($p !== false && $p !== "") {
+          $o["http"]["proxy"] = str_replace("http://","tcp://",$p);
+          $o["http"]["request_fulluri"] = true;
+        }
+        $c = stream_context_create($o);
+        $f = @file_get_contents($u, false, $c);
+        $code = "000";
+        if (isset($http_response_header[0]) &&
+            preg_match("~ (\d{3}) ~x", $http_response_header[0], $m)) { $code = $m[1]; }
+        echo $code;
+      ' 2>/dev/null)
+    case "$_hc" in
+      ''|*[!0-9]*) _hc=000 ;;
+      ???) : ;;
+      *) _hc=000 ;;   # anything not exactly three digits is not a status
+    esac
+    printf '%s' "$_hc"
   }
   _tc() { # expected(allow|deny), description, url
     _e="$1"; _d="$2"; _u="$3"
+    _PX_FOR_PROBE="$_PX"
     _hc=$(_code "$_d" "$_u")
     case "$_hc" in
       2*|3*)  _r=allow; _why="HTTP ${_hc}" ;;
