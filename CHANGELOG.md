@@ -6,6 +6,97 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12e — MFA root cause: Squid could not resolve anything
+
+Setup had been completed, a theme installed, and `wp-plugins.sh install
+two-factor --activate` still failed. The output settled it:
+
+    Warning: two-factor: An unexpected error occurred. Something may be wrong
+    with WordPress.org or this server's configuration.
+    Warning: The 'two-factor' plugin could not be found.
+
+That is WordPress's own message, rendered through wp-cli — so wp-cli was
+talking to a working WordPress, WordPress had its `WP_PROXY_HOST` constants,
+and the request still could not complete. Independent confirmation that the
+earlier egress failure was REAL and not the curl artifact of the previous
+release.
+
+**Squid had no working way to resolve names.** It inherited the container's
+`/etc/resolv.conf`, which points at the podman gateway where aardvark-dns
+listens. Aardvark resolves CONTAINER names; forwarding external names onward
+depends on it being configured with upstreams and working. That link failed —
+and the failure mode is genuinely nasty, because a proxy that cannot resolve
+anything produces the exact same symptom as a proxy denying everything:
+
+  * `api.wordpress.org` looked blocked by policy
+  * every deny-probe "passed", because those also fail when nothing resolves
+  * the egress self-test concluded "the boundary is NOT holding"
+  * the plugin install blamed WordPress.org
+
+All four of those were the same missing DNS answer wearing different clothes.
+It also explains why the previous release's diagnosis stalled: I attributed the
+whole thing to a missing `curl` binary, which was a real bug in the test but
+not the reason the plugin failed.
+
+**Fixed by naming the resolvers instead of inheriting them.** `squid.conf` now
+carries `dns_nameservers`, substituted at provision with the servers the
+operator chose at install (Quad9 by default), and the firewall opens
+`10.89.10.2 → <each configured resolver>:53` — the specific addresses, not DNS
+generally, so the tunnel this project deliberately closed stays closed. If the
+placeholder is ever left unsubstituted, the install warns rather than shipping
+a Squid that silently resolves nothing.
+
+**Also fixed:** `update.sh status` reported "Digest pinning: enabled — 4/3
+currently pinned". The denominator was hardcoded to three before Squid joined
+the digest model. Arithmetic like that makes a reader distrust every other
+number in the box.
+
+---
+
+## 2026.08.12d — Two false alarms, both in checks I added yesterday
+
+The install completed and the fail-closed gate behaved correctly. Of the four
+commission failures, **two were bugs in checks added in the last two releases**
+— my own tooling reporting problems that did not exist. That is the failure
+mode I have warned about repeatedly in this log, and it happened anyway.
+
+**The core-version check read `1.2.0` and declared a mismatch.** WordPress's
+`wp-includes/version.php` opens with a docblock containing `@since 1.2.0`
+before it reaches `$wp_version = '7.0.3';`. My grep took the first
+version-shaped string in the file. So a correctly-updated 7.0.3 site was
+reported as serving 1.2.0 and failing validation — the exact opposite of the
+bug the check was written to catch, and worse, because it would train an
+operator to ignore a real mismatch. Now parses the `$wp_version` assignment
+specifically, verified against a real version.php.
+
+**The egress probe used `curl`, which is not in the WordPress image.** That
+image is minimal — the same log says `(no netstat/ss in image)`. With curl
+absent, `podman exec wordpress curl ...` produces nothing, the status comes
+back empty, and the test reported `HTTP 000 — nothing answered` and
+"The boundary is NOT holding" for a firewall that was working correctly.
+(The `000000` in the output was a second bug in the same line: curl's
+`%{http_code}` already prints `000` on failure, and my `|| echo 000` fallback
+appended another.)
+
+Replaced with a PHP probe. PHP is guaranteed present, and it is the better
+test: it exercises the exact runtime and proxy path WordPress itself uses, so
+a pass means the thing that matters works rather than that some tool in the
+container could reach the internet.
+
+**Not a bug: `podman logs squid` returning "no such container".** The
+containers are rootful; that command was run without `doas`, so rootless
+podman correctly reported an empty namespace. Squid was up throughout — the
+same log shows `squid  Up 11 minutes` and a parsed policy.
+
+The lesson is one this project keeps relearning from the other direction: a
+check that fires wrongly is not a harmless false positive. It sends an
+operator to investigate a working control during the week they are trying to
+ship, and it erodes the trust that makes the checks useful at all. Both of
+these shipped because they were verified against the CODE and not against a
+real container.
+
+---
+
 ## 2026.08.12c — `update.sh wp` never actually updated WordPress
 
 Asked whether 7.0.3 could be digest-pinned or whether a patch was needed. The
