@@ -21,6 +21,14 @@
 # not enough to reuse. The report is worth skimming before sending, because a
 # redaction that misses something is my mistake to fix, not yours to discover.
 # =============================================================================
+# Auto-elevate. Every other operator tool in this suite does this, and the
+# inconsistency was found the hard way: running this as the admin user printed
+# "install: can't create directory '/root/wp-db-backups': Permission denied",
+# which reads like a broken path rather than "you need doas".
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then exec doas "$0" "$@"; fi
+  echo "This must run as root (or via doas)." >&2; exit 1
+fi
 set -u
 
 WITH_MAIL=0; WITH_RESTORE=0; MAIL_TO=""; PERIMETER=""

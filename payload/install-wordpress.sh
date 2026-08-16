@@ -60,7 +60,23 @@ block_production() {
 # values is only to be a safe, current-enough baseline at first boot.
 #
 # Verified against upstream (Aug 2026):
-#   - WordPress 7.0.2 is what the Docker official image publishes as current
+#   - WordPress 7.0.3 (2026-08-06) is a SECURITY release fixing 12 issues,
+#     including CVE-2026-64638 -- a pre-authentication reflected XSS on the
+#     LOGIN PAGE, CVSS 8.9, which can lead to PHP code execution via the
+#     plugin/theme editor if an administrator is phished into clicking a
+#     crafted link. That is precisely the surface this platform is built to
+#     protect, so shipping 7.0.2 was not acceptable. (The custom login slug,
+#     the wp-admin IP restriction and DISALLOW_FILE_MODS under production all
+#     reduce the exposure, but none of them is the fix; the fix is 7.0.3.)
+#
+#     Context worth knowing: the PREVIOUS chain (CVE-2026-60137 /
+#     CVE-2026-63030, fixed in 7.0.2) entered CISA's Known Exploited
+#     Vulnerabilities catalog and saw exploitation attempts roughly 90 minutes
+#     after disclosure. WordPress core CVEs are now weaponised in hours, which
+#     is the argument for `update.sh check` being run often rather than
+#     quarterly.
+#
+#   - The tag below is what the Docker official image publishes as current
 #     (it is also what `latest` points at). LESSON LEARNED THE HARD WAY: an
 #     earlier version of this file pinned 6.9.6-php8.4-apache, reasoning from
 #     the WordPress *release* history. That tag never existed. The docker
@@ -75,7 +91,7 @@ block_production() {
 #   - mariadb:11.4 is LTS, supported to May 2029 -- the longest runway of any
 #     current release. The bare "11.4" branch tag tracks patch releases
 #     (11.4.12 latest); "11.4-lts" is NOT a real tag and must not be used.
-WP_IMAGE="docker.io/wordpress:7.0.2-php8.4-apache"
+WP_IMAGE="docker.io/wordpress:7.0.3-php8.4-apache"
 DB_IMAGE="docker.io/mariadb:11.4"
 # BUG FIX (v7-5): v1.7.6 → v1.7.8. v1.7.8 (2026-05-11) is a security release
 # patching CVE-2026-44982 (a HIGH-impact partial WAF bypass in the AppSec

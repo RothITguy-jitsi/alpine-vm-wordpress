@@ -226,7 +226,7 @@ ok "Storage driver: ${DRIVER_CHOSEN}"
 DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 
 _skopeo_digest() {
-  # $1 = full tag reference, e.g. docker.io/wordpress:7.0.2-php8.4-apache
+  # $1 = full tag reference, e.g. docker.io/wordpress:7.0.3-php8.4-apache
   # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
   # missing, network error, unparseable output) — treated as "fall back",
   # never as fatal.

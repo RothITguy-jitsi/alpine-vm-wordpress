@@ -107,11 +107,27 @@ restore_test() {
     # test needs" trains people to ignore the output. Observed exactly that:
     # the first self-test failed, a backup was taken, the re-run passed 18/18.
     _i "No backup archive yet — taking one now so this test can run"
-    if /usr/local/bin/wp-db-backup.sh >/dev/null 2>&1; then
+    # Capture the output. `>/dev/null 2>&1` here meant that when the on-demand
+    # backup failed, the ONLY thing anyone saw was "one could not be taken" --
+    # no exit code, no error, nothing to act on. That happened on a real VM and
+    # cost a full redeploy cycle to work out why.
+    _bkrc=0
+    _bkout=$(/usr/local/bin/wp-db-backup.sh 2>&1) || _bkrc=$?
+    if [ "$_bkrc" -eq 0 ]; then
       _bk=$(ls -1t "$BACKUP_DIR"/*.sql.gz 2>/dev/null | head -1)
       [ -n "$_bk" ] && _p "Took a backup to test with"
     fi
     if [ -z "$_bk" ]; then
+      _i "wp-db-backup.sh exited ${_bkrc}. What it said:"
+      printf '%s\n' "$_bkout" | tail -12 | sed 's/^/      /'
+      # The dump writes its own stderr to a sidecar file; that is where a
+      # mariadb-dump failure actually explains itself.
+      for _e in "$BACKUP_DIR"/*.err; do
+        [ -f "$_e" ] || continue
+        [ -s "$_e" ] || continue
+        _i "  ${_e}:"
+        tail -6 "$_e" | sed 's/^/      /'
+      done
       _f "No backup archive in ${BACKUP_DIR} and one could not be taken" \
          "Run wp-db-backup.sh by hand and read its output"
       return

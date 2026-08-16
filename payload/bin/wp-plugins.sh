@@ -581,6 +581,26 @@ case "${1:-status}" in
   # wizard actually been completed? Silent by design -- it is called from cron
   # every 10 minutes and must not fill a log with noise while waiting.
   is-site-installed) _wp core is-installed >/dev/null 2>&1 && exit 0 || exit 1 ;;
+  # Applies any schema migrations a core file update requires. Called by
+  # update.sh after it syncs core out of a new image.
+  core-update-db) _wp core update-db ;;
+  # The version ACTUALLY BEING SERVED, read from the files on disk rather than
+  # from the image tag. Those two disagree whenever core files have not been
+  # synced, which was a real and silent failure mode -- the image said 7.0.3
+  # while the site served 7.0.2. Never trust the tag for this question.
+  core-version)
+    _iv=$(podman exec wordpress sh -c 'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
+    _tag=$(sed -n 's/^WP_TAG=//p' /etc/wp-install/pinned.env 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+    echo "  Core files serving : ${_iv:-unknown}"
+    echo "  Image tag pinned   : ${_tag:-unknown}"
+    case "${_tag}" in
+      "${_iv}"*) echo "  ✔  They agree." ;;
+      "") : ;;
+      *) echo "  ⚠  MISMATCH — the image was updated but core files were not."
+         echo "     The site is serving ${_iv:-?}, not ${_tag%%-*}."
+         echo "     Fix: update.sh wp ${_tag}"
+         exit 1 ;;
+    esac ;;
   vulns|vuln|cve)
     case "${2:-}" in --nvd) vuln_scan 1 ;; *) vuln_scan 0 ;; esac ;;
   vuln-sources)

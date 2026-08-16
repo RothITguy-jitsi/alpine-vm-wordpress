@@ -81,7 +81,7 @@ set -e
 # exist yet, or is missing an entry for a component (fresh VM never
 # updated through this script, or the file was lost). Once pinned.env has
 # a value for a component, THAT value is authoritative, not this constant.
-PINNED_WP_VER="7.0.2-php8.4-apache"
+PINNED_WP_VER="7.0.3-php8.4-apache"
 PINNED_DB_VER="11.4"
 PINNED_CS_VER="v1.7.8"
 WP_REGISTRY="docker.io/wordpress"
@@ -367,7 +367,7 @@ require_clean_container_state() {
 }
 
 # ── Skopeo: remote digest lookup, no image pull ────────────────────────────
-# $1 = full tag reference, e.g. docker.io/wordpress:7.0.2-php8.4-apache
+# $1 = full tag reference, e.g. docker.io/wordpress:7.0.3-php8.4-apache
 # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
 # missing, network error, unparseable output) — every caller treats that as
 # "fall back to the old method", never as fatal.
@@ -1169,6 +1169,69 @@ do_wp_update() {
       sleep 3
       podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
       echo "✔  WordPress base image updated to ${target_ver}"
+
+      # ── SYNC THE CORE FILES OUT OF THE NEW IMAGE ─────────────────────────
+      # THIS IS NOT OPTIONAL, AND ITS ABSENCE WAS A SECURITY BUG.
+      #
+      # The official WordPress image copies core into /var/www/html ONLY when
+      # that directory is empty. On every subsequent run it leaves it alone --
+      # by design, because it cannot know whether you have modified it. So on
+      # an existing install, swapping the image updates PHP and Apache and
+      # NOTHING ELSE: the site keeps serving the WordPress version that was
+      # extracted on first boot.
+      #
+      # Until this block existed, `update.sh wp` would pull a new digest,
+      # report success, write pinned.env, and leave a site running vulnerable
+      # core. The claim "this platform keeps WordPress patched" was false for
+      # core itself, which is where the CVEs that matter live -- e.g.
+      # CVE-2026-64638, a pre-auth XSS on the login page.
+      #
+      # The files are taken from /usr/src/wordpress INSIDE the new image, not
+      # downloaded from wordpress.org. That keeps the digest-pinning guarantee
+      # intact: what runs is what was verified and scanned, not a fresh
+      # unverified fetch. wp-content is excluded so themes, plugins, uploads
+      # and the mu-plugins this platform installs all survive untouched.
+      echo "  → Syncing WordPress core files from the new image…"
+      _core_before=$(podman exec wordpress sh -c \
+        'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
+      if podman exec wordpress sh -c '
+             set -e
+             [ -d /usr/src/wordpress ] || exit 3
+             cd /usr/src/wordpress
+             # Everything except wp-content, which is site state, not core.
+             for _i in *; do
+               [ "$_i" = "wp-content" ] && continue
+               cp -a "./$_i" /var/www/html/
+             done
+             # Drop-in files WordPress ships at the root of wp-content.
+             for _f in wp-content/index.php; do
+               [ -f "$_f" ] && cp -a "$_f" /var/www/html/wp-content/ || true
+             done
+             exit 0
+           ' 2>/dev/null; then
+        podman exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
+        _core_after=$(podman exec wordpress sh -c \
+          'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null || echo "unknown")
+        if [ "$_core_before" = "$_core_after" ]; then
+          echo "  ℹ  Core files already at ${_core_after}"
+        else
+          echo "  ✔  WordPress core files ${_core_before} → ${_core_after}"
+        fi
+        # A core update may need database migrations. wp-cli applies them; if
+        # it is unavailable, WordPress prompts an admin on next login instead,
+        # so this is a convenience rather than a correctness requirement.
+        if [ -x /usr/local/bin/wp-plugins.sh ]; then
+          /usr/local/bin/wp-plugins.sh core-update-db >/dev/null 2>&1 \
+            && echo "  ✔  Database schema updated" \
+            || echo "  ℹ  Run the DB update from wp-admin if prompted"
+        fi
+      else
+        echo "  ⚠  Could not sync core files from the image." >&2
+        echo "     The container is running the NEW image but may still be" >&2
+        echo "     serving OLD WordPress core. Verify before trusting this:" >&2
+        echo "       podman exec wordpress grep wp_version /var/www/html/wp-includes/version.php" >&2
+      fi
+
       WP_TAG="$target_ver"; WP_DIGEST="${_UPD_DIGEST}"
       _save_pinned
       # GeoIP is a locally-built image layered on top of whatever WordPress
@@ -2012,7 +2075,7 @@ show_check_summary() {
   echo "     jump to a new version on their own, so an unattended update can't swap in"
   echo "     a new major WordPress or a new MariaDB line."
   echo "   • 'versions' / 'upgrade' find and move to newer RELEASES (e.g. WordPress"
-  echo "     7.0.2 -> 7.0.3 for a CVE fix). Run 'update.sh versions' to see what's out,"
+  echo "     7.0.3 -> 7.0.4 for a CVE fix). Run 'update.sh versions' to see what's out,"
   echo "     then 'update.sh upgrade' (guided, with candidate-test + rollback) or name"
   echo "     one directly: update.sh wp <version>."
   show_status
@@ -2023,7 +2086,7 @@ show_check_summary() {
 # ═══════════════════════════════════════════════════════════════════════════
 # digest-check answers "has the tag I'm on been rebuilt?" (same version, new
 # digest). This answers a different question: "has a newer VERSION been
-# published?" — e.g. you're pinned to WordPress 7.0.2 and 7.0.3 is out with a
+# published?" — e.g. you're pinned to WordPress 7.0.3 and 7.0.4 is out with a
 # security fix. It lists available tags from the registry (Skopeo list-tags),
 # filters to the real release tags for each image, and compares versions so
 # you can SEE a newer release and choose to move the pin to it. `upgrade` then

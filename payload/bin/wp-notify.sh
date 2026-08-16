@@ -56,6 +56,21 @@ fi
 # the command an operator runs to check that notifications work.
 NOTIFY_COOLDOWN_HOURS="${NOTIFY_COOLDOWN_HOURS:-24}"
 SECRETS_DIR="${SECRETS_DIR:-/home/wpuser/wp/secrets}"
+# THIRD instance of this same bug (SECRETS_DIR, then NOTIFY_COOLDOWN_HOURS, now
+# STATE). Reported from a live VM:
+#     doas wp-db-backup.sh
+#     /usr/local/bin/wp-notify.sh: line 269: STATE: parameter not set
+# STATE holds the dedup markers and the last-error file. It is referenced in six
+# places and was never assigned, so under `set -u` EVERY notification path died
+# before sending anything -- backup-failure email, malware findings, vulnerability
+# findings, and the heartbeat that is the only thing detecting a VM being gone.
+#
+# A monitoring system that cannot report is worse than not having one, because
+# its silence is indistinguishable from "all clear". That is precisely the
+# failure this script exists to prevent, and it had it.
+STATE="${STATE:-/var/lib/wasp-notify}"
+mkdir -p "$STATE" 2>/dev/null || true
+chmod 0700 "$STATE" 2>/dev/null || true
 SMTP_FILE="${SECRETS_DIR}/smtp.ini"
 SMTP_FILE_LEGACY="${SECRETS_DIR}/smtp.php"
 _cfg() {

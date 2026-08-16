@@ -506,6 +506,24 @@ else
   info "No custom login slug configured (default /wp-login.php in use)"
 fi
 
+# --- WordPress core version actually being served ---
+# The image tag and the core files on disk can disagree, because the official
+# WordPress image only extracts core when the docroot is empty. An image update
+# alone leaves the OLD core in place, so a VM can report a patched tag while
+# serving a version with a known login-page CVE. Read the files, not the tag.
+_wpver=$(podman exec wordpress sh -c 'grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" /var/www/html/wp-includes/version.php 2>/dev/null | head -1' 2>/dev/null)
+_wptag=$(sed -n 's/^WP_TAG=//p' /etc/wp-install/pinned.env 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+if [ -n "$_wpver" ] && [ -n "$_wptag" ]; then
+  case "$_wptag" in
+    "${_wpver}"*) pass "WordPress core ${_wpver} matches the pinned image" ;;
+    *) fail "WordPress core files (${_wpver}) do not match the pinned image (${_wptag})" \
+            "The image was updated but core was not, so the site is serving the OLDER version. Any CVE fixed in the newer release is still exploitable here." \
+            "update.sh wp ${_wptag}" ;;
+  esac
+elif [ -n "$_wpver" ]; then
+  info "WordPress core ${_wpver} (no pinned tag recorded to compare against)"
+fi
+
 # --- MFA enforcement (mu-plugin + Two Factor plugin) ---
 # Three things can be wrong and each matters: the mu-plugin could have a syntax
 # error (site-wide fatal), enforcement could be ON while the Two Factor plugin

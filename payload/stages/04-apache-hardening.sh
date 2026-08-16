@@ -8,8 +8,17 @@
 ts "Installing 8G Firewall v1.4"
 mkdir -p /home/wpuser/wp/htaccess
 cat > /home/wpuser/wp/htaccess/.htaccess << '8GEOF'
-# 8G FIREWALL v1.4 — https://perishablepress.com/8g-firewall/
-# Installed by create-wordpress-vm.sh
+# 8G FIREWALL v1.4
+#   Author : Jeff Starr (Perishable Press)
+#   Source : https://perishablepress.com/8g-firewall/
+#
+# Embedded rather than downloaded, deliberately: this ruleset must exist before
+# WordPress serves its first request, and fetching it at install time would mean
+# trusting an unauthenticated download -- the supply-chain pattern this project
+# otherwise refuses. Used unmodified in substance. If it is useful to you, the
+# author's work is worth supporting directly.
+#
+# Installed by WASP (create-wordpress-vm.sh). See NOTICE.md.
 
 # ── 8G[QUERY STRING] ────────────────────────────────────────────────────────
 <IfModule mod_rewrite.c>

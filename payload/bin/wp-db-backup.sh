@@ -1,6 +1,14 @@
 #!/bin/sh
 # wp-db-backup.sh — verified daily MariaDB backup. Called from cron.
 # Design mirrors do_db_update()'s in-flight backup step in update.sh.
+# Auto-elevate. Every other operator tool in this suite does this, and the
+# inconsistency was found the hard way: running this as the admin user printed
+# "install: can't create directory '/root/wp-db-backups': Permission denied",
+# which reads like a broken path rather than "you need doas".
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then exec doas "$0" "$@"; fi
+  echo "This must run as root (or via doas)." >&2; exit 1
+fi
 set -eu
 
 # Per-run, not a fixed path. A predictable file under /tmp that a root process
@@ -85,6 +93,27 @@ if [ "${BACKUP_OK}" != "1" ]; then
   # anything (a monitoring script, an operator, or the rotation below).
   [ -s "${BACKUP_RAW}.err" ] && \
     logger -t wp-db-backup "stderr: $(head -c 500 "${BACKUP_RAW}.err")"
+
+  # SAY IT ON THE TERMINAL TOO. This used to go only to syslog and email, so an
+  # operator running the tool by hand -- or a self-test running it on their
+  # behalf -- got silence and exit 1 with no reason. On a real VM the
+  # commission check reported "a backup could not be taken" and there was
+  # nothing anywhere to say why. The whole point of the .err file is diagnosis;
+  # it should reach whoever is standing there.
+  {
+    printf '\n✗  Backup FAILED.\n'
+    if [ -s "${BACKUP_RAW}.err" ]; then
+      printf '   mariadb-dump said:\n'
+      head -c 1200 "${BACKUP_RAW}.err" | sed 's/^/     /'
+      printf '\n'
+    else
+      printf '   No stderr was captured, which usually means the dump never started.\n'
+    fi
+    printf '   Common causes, in the order worth checking:\n'
+    printf '     df -h /                          # a full disk is the most common\n'
+    printf '     podman ps --filter name=mariadb  # is the database running?\n'
+    printf '     podman logs --tail 30 mariadb\n'
+  } >&2
   # Email on failure. A backup that has been failing silently for months is
   # the single most common way people discover they have no backups -- at the
   # exact moment they need one. This is the alert most worth having: it is

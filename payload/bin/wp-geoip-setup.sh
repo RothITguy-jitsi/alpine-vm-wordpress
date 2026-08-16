@@ -4,6 +4,14 @@
 # Reads credentials/mode from /etc/wp-install/vars.sh, written at
 # provisioning time (edit that file to fix bad credentials, then re-run
 # this script). Exit code 0 = applied, 1 = failed (see the log below).
+# Auto-elevate. Every other operator tool in this suite does this, and the
+# inconsistency was found the hard way: running this as the admin user printed
+# "install: can't create directory '/root/wp-db-backups': Permission denied",
+# which reads like a broken path rather than "you need doas".
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v doas >/dev/null 2>&1; then exec doas "$0" "$@"; fi
+  echo "This must run as root (or via doas)." >&2; exit 1
+fi
 LOG=/var/log/wp-geoip.log
 exec >> "$LOG" 2>&1
 echo ""
@@ -67,7 +75,7 @@ command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 \
   || { echo "FATAL: curl is unavailable and 'apk add curl' failed — cannot fetch GeoLite2-Country"; exit 1; }
 
 CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/null)
-[ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:7.0.2-php8.4-apache"
+[ -z "$CURRENT_WP_IMAGE" ] && CURRENT_WP_IMAGE="docker.io/wordpress:7.0.3-php8.4-apache"
 # Derive a human-friendly tag for naming the local GeoIP image.
 # BUG FIX (v7-6f): the Skopeo rewrite of digest pinning dropped the "does
 # this Podman accept a combined tag+digest reference" test — every pinned
@@ -78,7 +86,7 @@ CURRENT_WP_IMAGE=$(PRUN inspect wordpress --format '{{.Config.Image}}' 2>/dev/nu
 # string, only falling back to a short digest fragment when none was
 # present) would now hit that fallback on every single run — every GeoIP
 # rebuild producing a digest-fragment tag (wordpress-geoip:a1b2c3d4e5f6)
-# instead of a readable one (wordpress-geoip:7.0.2-php8.4-apache).
+# instead of a readable one (wordpress-geoip:7.0.3-php8.4-apache).
 # /etc/wp-install/pinned.env carries the tag separately from the image
 # reference for exactly this reason (see the installer's PERSIST comment) —
 # read WP_TAG from there first. Only fall back to parsing CURRENT_WP_IMAGE

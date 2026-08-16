@@ -128,11 +128,63 @@ test)
     if [ "$_r" = "$_e" ]; then _pass=$((_pass+1)); printf '  \033[32m✔\033[0m  %-52s %s\n' "$_d" "$_r"
     else _fail=$((_fail+1)); printf '  \033[31m✗\033[0m  %-52s got %s, expected %s\n' "$_d" "$_r" "$_e"; fi
   }
+
+  # A pass/fail probe that only asks "did curl exit zero" cannot tell a POLICY
+  # denial from a connectivity failure, and those need completely different
+  # fixes. On a real VM this reported "api.wordpress.org: got deny" and the
+  # operator had no way to know whether Squid had refused it, DNS was broken,
+  # or the URL simply 404s. Capture the HTTP status instead and classify:
+  #
+  #   200-399  reached it            -> allow
+  #   403      Squid refused it      -> deny BY POLICY (the allowlist)
+  #   407      proxy auth demanded   -> misconfiguration
+  #   503      Squid could not resolve or connect upstream
+  #   000      never reached Squid   -> firewall, or Squid is down
+  #
+  # Note the removal of `-f`: with it, any 4xx from the DESTINATION also makes
+  # curl exit nonzero, so an allowlisted host that returns 404 for the probed
+  # path looks identical to a blocked one. That is exactly the trap the old
+  # probe fell into by requesting `https://api.wordpress.org/`, whose root path
+  # is not a 200.
+  _code() { # description, url  -> echoes the classification
+    _u="$2"
+    _hc=$(podman exec wordpress curl -s -m 12 -o /dev/null -w '%{http_code}' \
+          -x "$_PX" "$_u" 2>/dev/null || echo 000)
+    printf '%s' "${_hc:-000}"
+  }
+  _tc() { # expected(allow|deny), description, url
+    _e="$1"; _d="$2"; _u="$3"
+    _hc=$(_code "$_d" "$_u")
+    case "$_hc" in
+      2*|3*)  _r=allow; _why="HTTP ${_hc}" ;;
+      403)    _r=deny;  _why="403 — refused by the proxy policy" ;;
+      407)    _r=deny;  _why="407 — proxy demanded auth (misconfigured)" ;;
+      503)    _r=deny;  _why="503 — Squid could not resolve or reach it" ;;
+      000)    _r=deny;  _why="no response — Squid unreachable or blocked by the firewall" ;;
+      *)      _r=deny;  _why="HTTP ${_hc}" ;;
+    esac
+    if [ "$_r" = "$_e" ]; then
+      _pass=$((_pass+1)); printf '  \033[32m✔\033[0m  %-52s %s\n' "$_d" "$_why"
+    else
+      _fail=$((_fail+1)); printf '  \033[31m✗\033[0m  %-52s %s (expected %s)\n' "$_d" "$_why" "$_e"
+      # A 503 or 000 on a line that should ALLOW is a connectivity problem, not
+      # an allowlist problem, and saying so saves an afternoon of editing a
+      # file that was never wrong.
+      case "${_e}:${_hc}" in
+        allow:503) printf '       %s\n' "Squid reached, but it could not resolve/connect. Check Squid's DNS:" ;;
+        allow:000) printf '       %s\n' "Nothing answered. Is Squid running? podman ps --filter name=squid" ;;
+        allow:403) printf '       %s\n' "Squid refused it. Confirm the host is in allowlist-runtime.txt." ;;
+      esac
+    fi
+  }
   _PX="http://${PROXY_HOST}:${PROXY_PORT}"
 
   echo "  Through the proxy — allowlisted destination should work:"
-  _t allow "api.wordpress.org via proxy" \
-     podman exec wordpress curl -sf -m 12 -x "$_PX" https://api.wordpress.org/ -o /dev/null
+  # The core version-check endpoint, which returns 200 and is what WordPress
+  # itself calls. The bare root of api.wordpress.org does not return 200, so
+  # probing it made a working proxy look broken.
+  _tc allow "api.wordpress.org via proxy" \
+     "https://api.wordpress.org/core/version-check/1.7/"
 
   echo ""
   echo "  Through the proxy — everything else should be refused:"
