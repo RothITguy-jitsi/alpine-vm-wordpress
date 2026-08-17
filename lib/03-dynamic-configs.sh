@@ -51,7 +51,63 @@ for _d in ${VM_DNS:-9.9.9.9 149.112.112.112}; do
 done
 SQUID_DNS_RULES="${SQUID_DNS_RULES%$'\n'}"
 
+# SMTP rules are built HERE, before the egress-proxy block below, because that
+# block now expands ${SMTP_RATE_LIMIT} inside itself -- ahead of its own
+# catch-all drop. Defining it afterwards expanded to an empty string and the
+# rule silently vanished, which is exactly the failure this move is fixing.
+# ── Destination restriction for SMTP ─────────────────────────────────────────
+# An external evaluation's top finding, and it was already noted as a known gap
+# in the comment below: rate-limiting submission stops bulk exfiltration but
+# does not stop a compromised WordPress talking to an attacker's OWN mail server
+# on 587. Thirty connections an hour is plenty to leak credentials or stage
+# small payloads to a destination of the attacker's choosing.
+#
+# So the rule is now pinned to the relay's addresses when they can be resolved
+# at install time. Note the honest limits of this:
+#
+#   * It resolves the relay ONCE, here. A relay that changes IP -- common with
+#     hosted providers behind load balancers -- will stop working until this is
+#     re-run. That is a real operational cost, and it is why this degrades to
+#     the old port-only rule with a WARNING rather than failing the install:
+#     silently breaking a client's password resets to close a theoretical
+#     channel is the wrong trade to make on their behalf.
+#   * A relay on shared infrastructure (Google, Microsoft 365) resolves to
+#     addresses shared with thousands of tenants, so pinning buys less there.
+#     It still removes "any host on the internet".
+SMTP_DEST_RULE=""
+if [[ -n "${SMTP_HOST:-}" ]]; then
+  _smtp_ips=$(getent ahostsv4 "$SMTP_HOST" 2>/dev/null | awk '{print $1}' | sort -u | head -8)
+  if [[ -n "$_smtp_ips" ]]; then
+    for _sip in $_smtp_ips; do
+      case "$_sip" in
+        *[!0-9.]*) continue ;;
+      esac
+      SMTP_DEST_RULE="${SMTP_DEST_RULE}${SMTP_DEST_RULE:+ }${_sip}"
+    done
+  fi
+fi
+if [[ -n "$SMTP_DEST_RULE" ]]; then
+  _SMTP_DADDR="ip daddr { $(printf '%s' "$SMTP_DEST_RULE" | tr ' ' ',') } "
+  msg_ok "SMTP egress pinned to ${SMTP_HOST} (${SMTP_DEST_RULE})"
+  msg_info "  If the relay changes IP, mail stops until you re-run:"
+  msg_info "    doas wp-hardening.sh smtp-repin"
+else
+  _SMTP_DADDR=""
+  [[ -n "${SMTP_HOST:-}" ]] && msg_warn "Could not resolve ${SMTP_HOST} — SMTP egress stays port-only (any destination on those ports)."
+fi
+
+SMTP_RATE_LIMIT="        # Outbound mail submission — rate limited AND, where the relay
+        # resolved at install time, destination-restricted. See lib/03.
+        ip saddr 10.89.10.0/24 ${_SMTP_DADDR}tcp dport ${_SMTP_PORTS} ct state new limit rate ${_SMTP_RATE} burst ${_SMTP_BURST} packets counter accept
+        ip saddr 10.89.10.0/24 tcp dport ${_SMTP_PORTS} ct state new limit rate 5/minute counter log prefix \"nft-smtp-ratelimit \" level warn
+        ip saddr 10.89.10.0/24 tcp dport ${_SMTP_PORTS} ct state new counter drop"
+
+# When the proxy is ON, SMTP is handled inside that block; expanding it twice
+# would duplicate the rules and the rate limit would count each connection once
+# per copy, halving the effective allowance.
+SMTP_RATE_LIMIT_IF_NO_PROXY="${SMTP_RATE_LIMIT}"
 if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
+  SMTP_RATE_LIMIT_IF_NO_PROXY=""
   EGRESS_PROXY_FORWARD="        # WordPress -> Squid only. Everything else outbound is dropped.
         ip saddr 10.89.10.0/24 ip daddr 10.89.10.2 tcp dport 3128 accept
         # DNS is pinned to the network's OWN resolver (the wp-front gateway,
@@ -80,6 +136,25 @@ if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
         # destinations and the tunnel stays closed.
 ${SQUID_DNS_RULES}
         ip saddr 10.89.10.2 tcp dport { 80, 443 } accept
+        # ── SMTP, and it MUST be here rather than further down the chain ──────
+        # nftables is first-match-wins, and the drop immediately below matches
+        # the whole container subnet. The SMTP allow rule used to live AFTER
+        # this block (as ${SMTP_RATE_LIMIT}, six lines later in the chain), so
+        # it was never reached: enabling the egress proxy silently broke
+        # WordPress's ability to send mail entirely. Password resets, order
+        # confirmations and admin notifications all failed, and the only
+        # symptom was `wp-mail.sh doctor` reporting
+        # \"TCP 587: UNREACHABLE (Connection timed out)\" while every other
+        # mail check passed.
+        #
+        # Mail cannot go through Squid: Squid is an HTTP proxy and speaks
+        # nothing else. So submission needs its own hole, and the honest
+        # framing is that this is a real gap in the egress boundary -- one
+        # outbound TCP path that is not destination-filtered. The rate limit is
+        # what keeps it from being a bulk exfiltration channel: 30 new
+        # connections/hour with a burst of 10 is ample for a WordPress site
+        # and useless for moving a database.
+${SMTP_RATE_LIMIT}
         # Everything else from wp-front, logged then dropped. The log is what
         # discovery reads to find destinations the allowlist is missing, and
         # now also catches any attempt to reach an off-network resolver.
@@ -215,10 +290,6 @@ fi
 _SMTP_PORTS="{ 25, 465, 587 }"
 _SMTP_RATE="${SMTP_RATE_LIMIT_RATE:-30/hour}"
 _SMTP_BURST="${SMTP_RATE_LIMIT_BURST:-10}"
-SMTP_RATE_LIMIT="        # Outbound mail submission — rate limited, see note in lib/03
-        ip saddr 10.89.10.0/24 tcp dport ${_SMTP_PORTS} ct state new limit rate ${_SMTP_RATE} burst ${_SMTP_BURST} packets counter accept
-        ip saddr 10.89.10.0/24 tcp dport ${_SMTP_PORTS} ct state new limit rate 5/minute counter log prefix \"nft-smtp-ratelimit \" level warn
-        ip saddr 10.89.10.0/24 tcp dport ${_SMTP_PORTS} ct state new counter drop"
 
 if [[ "${BLOCK_PVE_MGMT:-1}" == "1" ]]; then
   _PVE_RULE="ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } tcp dport { 8006, 8007, 3128, 5900-5999 } counter log prefix \"nft-drop-pve-mgmt \" level warn limit rate 5/minute drop"
@@ -309,7 +380,11 @@ ${EGRESS_PROXY_FORWARD}
         # wp-db (10.89.20.0/24) is --internal: netavark never routes it to
         # the internet, so this permits only the container-to-container path.
         ip saddr 10.89.20.0/24 accept
-${SMTP_RATE_LIMIT}
+        # NOTE: ${SMTP_RATE_LIMIT} used to be expanded here. It is now inside
+        # the egress-proxy block above, because the drop at the end of that
+        # block made this position unreachable. When the proxy is OFF, the
+        # block below still needs it -- see EGRESS_SMTP_FALLBACK.
+${SMTP_RATE_LIMIT_IF_NO_PROXY}
 ${EGRESS_FORWARD}
     }
     chain output {

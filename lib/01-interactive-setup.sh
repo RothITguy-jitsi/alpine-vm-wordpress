@@ -913,7 +913,12 @@ case "${_WANT_SMTP}" in
       esac
     done
     unset _SFIX _SP _SF _smtp_collect_all
-    msg_ok "SMTP: ${SMTP_USER}@${SMTP_HOST}:${SMTP_PORT} (${SMTP_ENCRYPTION}), from ${SMTP_FROM}"
+    # `${SMTP_USER}@${SMTP_HOST}` produced "contact@rothitguy.pro@mail.example.com"
+    # on a real install, because the username IS an email address. The config
+    # itself was correct (user and host are separate keys in the msmtp file) --
+    # this was display only, but a summary line that looks malformed makes an
+    # operator doubt the config it is summarising.
+    msg_ok "SMTP: ${SMTP_USER} via ${SMTP_HOST}:${SMTP_PORT} (${SMTP_ENCRYPTION}), from ${SMTP_FROM}"
     msg_info "  Verify delivery after install with:  wp-mail.sh test you@example.com"
     ;;
   *)
