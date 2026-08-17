@@ -202,6 +202,19 @@ restore drill, and (if MFA is enforced) a deliberate admin lockout to confirm
 console recovery works. Those are the two failures that actually cost a client
 their site.
 
+**If the client uses a commercial theme**, install it from a file rather than
+lowering the hardening, and allow its licence domain so it keeps updating:
+
+```sh
+scp divi.zip admin@vm:/var/lib/wasp-import/incoming/
+doas wp-plugins.sh install-file /var/lib/wasp-import/incoming/divi.zip --activate
+doas wasp-egress.sh allow .elegantthemes.com
+```
+
+Then enter the vendor API key in wp-admin. Without it the theme is frozen at
+the version you installed — which for a page builder means no security fixes,
+and that is the client's problem to be told about, not one to discover later.
+
 **Enable admin MFA as part of onboarding.** If the VM was provisioned with MFA
 enforcement, confirm the Two Factor plugin is active and walk the client's
 administrators through enrolling — an authenticator app plus **printed backup

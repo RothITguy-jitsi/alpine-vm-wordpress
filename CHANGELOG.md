@@ -6,6 +6,431 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12n — File integrity: checksums here, FIM to Wazuh
+
+Closes the last open finding from the external evaluation, and splits the work
+where it belongs: WordPress.org checksums verify what WordPress.org publishes,
+and a SIEM handles everything else.
+
+**`wp-plugins.sh verify`** compares core and plugin files against published
+checksums, detecting a file modified since installation — the signature of a
+backdoor injected through a vulnerable plugin, which is how most WordPress
+compromises persist. Weekly (Monday 04:30) and step nine of the commission
+check.
+
+**It does not trust wp-cli's exit code.** Documented behaviour, confirmed in a
+report published four days ago: `wp plugin verify-checksums --all` can print
+"Verified 2 of 3 plugins (1 skipped)" and still exit 0, because a plugin with
+no checksum on WordPress.org is skipped rather than failed — true of every
+commercial and bespoke plugin. A caller trusting the exit status sees success
+while a plugin went unchecked. This project has been bitten by exactly that
+shape three times now (the pipeline that masked a failed install, the report
+that claimed a plugin was active, the commission check that hid its own
+evidence), so the pattern was recognisable.
+
+Three states are reported separately because they mean different things:
+VERIFIED, MODIFIED (the finding), and SKIPPED (expected for Divi and anything
+bespoke — not a failure, but those files are outside this control).
+
+**The primary test is arithmetic, not phrasing.** If
+`total − verified − skipped > 0`, something was checked and failed, and that is
+treated as a finding even when no message matched. wp-cli's wording changes
+between releases; grepping for "doesn't verify" is a useful hint and a poor
+primary test. Verified against four count combinations including the exact
+"2 of 3 (1 skipped)" case.
+
+**Wazuh integration is the log format, not an agent script.** Every outcome goes
+to syslog tagged `wasp-integrity` in key=value form at a severity matching its
+meaning — `auth.crit` for FAIL, `auth.notice` for SKIP, `auth.info` for PASS:
+
+    wasp_integrity result=FAIL component=core reason=checksum_mismatch
+    wasp_integrity result=SKIP component=plugins reason=no_published_checksum count=2
+
+A decoder matching `wasp_integrity` and alerting on `result=FAIL` is the whole
+integration. The shape is documented as an interface so it is not casually
+changed.
+
+The SKIP line is the one worth wiring deliberately: it names the files this
+control cannot cover, which is exactly where Wazuh's own FIM should point.
+Checksums cover what WordPress.org publishes; FIM covers the commercial theme,
+the bespoke plugin, and the uploads directory. Stating that boundary is more
+useful than pretending one tool does both.
+
+---
+
+## 2026.08.12m — CIS gap analysis: PHP shell functions were never blocked
+
+Checked WASP against current hardening standards rather than against my own
+assumptions. The useful finding first: **CIS publishes no WordPress benchmark**
+and deliberately does not — their position is that WordPress is a CMS running
+on infrastructure, and if the OS, web server, PHP runtime and database are
+hardened, WordPress inherits that. That is exactly the shape of this project,
+which is a reassuring result: the architecture is aligned with where the
+standards bodies think the work belongs, not with the plugin-shaped hardening
+most WordPress advice offers.
+
+Against CIS Level 1 items specifically, WASP already covers directory listing
+disabled, TRACE/TRACK blocked, server tokens minimised, `expose_php = Off`,
+`allow_url_include = Off`, restrictive file ownership, and a segmented
+database. One gap was real and significant.
+
+**`disable_functions` was not set.** PHP could call `system()`, `shell_exec()`,
+`exec()` and `proc_open()`. Nearly every off-the-shelf PHP webshell — c99, r57,
+WSO and the hundreds of variants dropped through a vulnerable plugin — reaches
+for one of those in its first few lines. Blocking them does not stop a
+determined attacker writing a bespoke shell, but it breaks the commodity ones
+outright, and commodity is what actually lands on a WordPress site. This is
+arguably the highest-value single line in the PHP config, and it was missing
+while considerably more exotic controls were present.
+
+Now set by default, with `proc_open`, `popen`, `pcntl_exec` and `dl` included
+because they are the usual fallbacks once `system()` is gone — leaving them is
+most of the way to leaving all of it.
+
+WordPress core needs none of these. Some plugins do: image optimisers that shell
+out to `jpegoptim`, backup plugins that call `mysqldump` directly, server-status
+plugins. So it is a toggle, `wp-hardening.sh enable|disable php-exec`, in the
+menu, with the honest framing that turning it off restores the exact capability
+commodity webshells depend on — and the suggestion that a plugin needing shell
+access is usually replaceable with one that does the same job in PHP.
+
+**A bug in the toggle, caught before shipping.** The first version ran `sed`
+inside the container against `/usr/local/etc/php/conf.d/security.ini`. Two
+things wrong: the file is mounted there as `wp-security.ini`, and it is mounted
+READ-ONLY. The toggle would have reported success while changing nothing —
+the worst kind of security control, one that lies about its own state. It now
+edits the host file and restarts the container, verified to round-trip.
+
+---
+
+## 2026.08.12l — Commercial theme installs, and a pre-review sweep
+
+**`wp-plugins.sh install-file <zip>`** — for Divi, Elementor Pro, or a client's
+bespoke plugin: anything not in the WordPress.org directory. It takes a LOCAL
+file only, never a URL, because `install <slug>` exists precisely so that its
+source is always the official directory over TLS and accepting a URL would
+collapse that into "download and run anything". Here the trust decision is made
+off-box by a human at `scp` time. `--sha256` verifies before installing;
+without it the hash is recorded so what was installed can be compared later
+against what the vendor shipped. Detects theme vs plugin from the archive, logs
+every install, and is in `wasp-menu` → Security.
+
+On the question of committing the .zip to a repository: don't. Divi's PHP is
+GPLv2 so redistribution is lawful, but it freezes the theme at one version
+while the vendor ships security fixes, adds tens of megabytes to git history
+forever, does not save the licensing step (each site still needs its own vendor
+API key), and puts a commercial product under your name — the GPL covers code,
+not trademarks. All four documented in the code and the README.
+
+**A disclosure bug in that feature, found and fixed before it shipped.** The
+first version staged the zip in `wp-content/upgrade/` so wp-cli could reach it.
+That directory is inside the web root. Only `wp-content/uploads` is protected
+here, and `.zip` is blocked by the 8G ruleset — which is a TOGGLE. On a VM with
+8G disabled, a commercial theme or a client's bespoke plugin was downloadable by
+anyone who guessed the filename during the install window. Now the file is
+mounted read-only into the wp-cli container at `/tmp`, so nothing is ever
+written under the docroot.
+
+**And a word-splitting bug in the fix.** The mount argument expands unquoted
+(podman needs the flag and value as separate words), so a filename containing a
+space or semicolon split into garbage arguments. Not shell injection — nothing
+re-evaluates the value — but a broken mount and a baffling error. The path
+charset is now constrained.
+
+**A note for external reviewers, because this WILL be flagged.** Several
+commands read `-p"$MARIADB_ROOT_PASSWORD"`, which looks like a credential on a
+command line. It is not: the string is single-quoted, so the host shell never
+expands it — the variable resolves inside the container from that container's
+own environment, and the password never touches the host's argv. The obvious
+"fix", `podman exec -e MYSQL_PWD=...`, is strictly worse: it puts the credential
+in the HOST's argv where any local user can read it from `/proc`. That reasoning
+is now recorded at the call site so nobody improves it into a vulnerability.
+
+**Adding that note tripped one of this project's own checks**, which is worth
+recording: the comment landed inside a line continuation, which would have
+truncated the backup command. `check-line-continuation.py` caught it
+immediately. A check written after an earlier bug catching a new one in the act
+is the whole argument for writing them.
+
+**Sweep results.** All 17 checks clean. Spelling checked with codespell across
+every document and script — the four hits (`covert channel`, `ans`, `iif`,
+`pre-emptively`) are all correct as written. No overclaiming introduced, no
+world-readable secrets, no leftover TODO/FIXME in shipped code, 79 internal doc
+links resolving, all mermaid diagrams balanced.
+
+---
+
+## 2026.08.12k — Page-builder domains are chosen, not shipped
+
+The previous release added nine builder licence domains to the runtime
+allowlist. That was backwards, and the operator caught it immediately: this
+file is the list of destinations a COMPROMISED WordPress may still reach, so
+shipping Elementor's licence server to a site running Divi is pure surface for
+no benefit. Nine entries, eight of them useless on any given site.
+
+They are now selected at install. The prompt only appears when the egress proxy
+is enabled — without it the allowlist is not enforcing anything and the
+question has no consequence — and it says plainly to pick only what the site
+will actually run, with the reason: each entry is somewhere a compromised
+WordPress may reach.
+
+The shipped allowlist is back to ten entries, all of which every install
+genuinely needs. The builder section remains in the file as a comment
+explaining why it is empty and how to add one later, so the next person does
+not assume it was an oversight.
+
+Selections are validated before they are written: anything containing a scheme,
+a path or a space is skipped with a warning, because this file feeds a
+`dstdomain` ACL and one malformed line makes Squid reject the entire list —
+the failure mode that cost several cycles earlier in this series. The parser
+accepts commas or spaces, ignores blanks, and warns on numbers that are not on
+the menu.
+
+Also added to the pre-install requirements list, since knowing which builder a
+client uses is exactly the kind of thing worth checking before starting rather
+than three prompts in.
+
+---
+
+## 2026.08.12j — Theme upload restored, page builders allowlisted, mu-plugins explained
+
+Post-setup feedback from the live site. Three of the four are addressed; the
+fourth needs evidence I do not have.
+
+**"I do not see the theme upload section" — that was my change.**
+`DISALLOW_FILE_MODS` is set automatically under
+`DEPLOYMENT_PROFILE=production` (added two releases ago on an external
+evaluation's recommendation), and it removes Plugins → Add New, Appearance →
+Themes → Add New, and the upload form entirely. That is the intent — a hijacked
+admin session cannot install arbitrary PHP — but it also blocks an operator
+uploading a commercial theme, which is a normal thing to need to do. I shipped
+the restriction without a way to lift it.
+
+Now a toggle, exactly as requested, alongside the other hardening switches:
+
+    doas wp-hardening.sh disable file-mods    # allow uploads
+    doas wp-hardening.sh enable  file-mods    # restore the block
+
+Both are in `wasp-menu` → Security, with the "allow" direction marked
+destructive so it asks for confirmation. The disable path states the trade
+plainly: while it is off, anyone with an admin session — including a stolen one
+— can install arbitrary PHP through the upload form. Turn it back on when the
+upload is done.
+
+**Page-builder licence domains are allowlisted.** A paid theme that installs
+but cannot reach its licence server never receives updates, which for a page
+builder means it silently stops getting security fixes. Verified against each
+vendor's own documentation rather than guessed: Elementor activates against
+`my.elementor.com` with licence/api subdomains (their docs say to allow
+outbound HTTPS to it at the firewall), and Divi validates through Elegant
+Themes. Added `.elementor.com` and `.elegantthemes.com` plus seven common
+builders, in a clearly-marked section with the instruction to trim it — every
+entry is a destination a compromised WordPress may reach, and a builder you do
+not run is pure surface.
+
+**The Must-Use Plugins descriptions are rewritten.** WordPress shows only
+Plugin Name, Description, Version and Author on that screen; the rest of the
+file's documentation is invisible there. Each description now stands alone,
+says what the plugin does AND what breaks if the file is deleted, and is
+credited to RothITguy. That last part matters more than vanity: an mu-plugin
+cannot be deactivated from the UI, so the only way to remove one is to delete
+the file, and anyone about to do that should know whether they are switching
+off a nicety or locking themselves out. The login-slug description says
+outright that deleting it does not restore /wp-login.php — Apache still blocks
+that path — so it locks everyone out.
+
+**The block-editor drag-and-drop problem is NOT diagnosed.** I checked the
+candidates and ruled out the obvious ones: the standard WordPress rewrite block
+is present so `/wp-json/` routes, Apache blocks only CONNECT/DEBUG/MOVE/TRACE/
+TRACK so REST writes are allowed, the wp-admin IP restriction covers
+admin-ajax but the operator is reaching wp-admin fine, and the MFA REST gate
+only applies to unenrolled admins past grace. None of those explains it, and
+guessing further would repeat the mistake that cost two cycles on the egress
+issue. What would settle it is the browser console output on that page, or
+`/wp-json/wp/v2/types` fetched from the VM.
+
+---
+
+## 2026.08.12i — Every suggested command now works when pasted
+
+Reported from a live install. The tool printed a diagnostic to run:
+
+    nft list ruleset | grep -A6 'wp-front egress'
+
+Pasted, it returned `Operation not permitted (you must be root)`. Root SSH is
+disabled on this platform by design, so an admin is NEVER root and every
+root-requiring command needs `doas`. A suggestion that fails on paste is a
+small betrayal of trust in every other suggestion the tool makes, and it lands
+at the worst moment — when someone is following instructions precisely because
+something has already gone wrong.
+
+**32 commands across 9 files were missing it**, including the diagnostics
+printed by `update.sh` when a container swap fails, the recovery commands in
+`wp-db-backup.sh`, and the rollback instructions for WordPress, MariaDB and
+CrowdSec.
+
+**The compound case was worse than the simple one.** Five lines read like:
+
+    doas podman rename wordpress-old wordpress && podman start wordpress
+
+That half-works. The rename succeeds, the start fails with a permission error,
+and the operator is left in a state neither they nor the message anticipated —
+mid-rollback, with a renamed container and nothing running. Every segment of a
+chain is now prefixed, not just the first.
+
+**New check: `check-doas-prefix.py`.** It flags any root-requiring binary
+suggested to the operator without `doas`, including after `&&`, `;` and `||`.
+Getting it precise took two rounds of false positives, both worth recording:
+a conditional that RUNS a command (`ask_yn "..." && { apk update; }`) is not a
+suggestion, and neither is a crontab line being written for root. Both are now
+regression fixtures. Verified retroactively — restoring the exact `nft` line
+from the report makes it fail.
+
+---
+
+## 2026.08.12h — Five installer-UX corrections from operator notes
+
+All five written down while sitting through a real install, which is the only
+place most of these are visible.
+
+**A requirements list before the first prompt.** You could get several prompts
+deep before discovering you needed an account you did not have. The banner now
+lists what is required, what is optional with the URL to get it, and the honest
+note that every optional item can be added later but each one skipped is a
+control not running. Plus a time estimate.
+
+**The site-title prompt is gone.** It claimed to save retyping in the browser
+wizard. Nothing ever applied it — WordPress asked again anyway, so it was pure
+duplicate typing. The reported question was "what is the point if I have to
+retype that during WordPress setup?", and there was no good answer.
+
+**The admin-email prompt was mislabeled, not redundant.** It is not the
+WordPress admin email; it is where THE VM sends its own alerts — backup
+failures, malware findings, the heartbeat — and it must work when WordPress is
+down, which is why it is host-side. For an MSP it is usually the operator's
+address, not the client's. Relabeled and explained, since the confusion was
+caused by the wording rather than the prompt existing.
+
+**The two CrowdSec values now cross-reference each other.** The enrolment key
+and the CTI key are ~380 lines apart in the prompt flow, which meant opening
+the same console twice. Moving them risked breaking the flow; instead the first
+prompt now says a second CrowdSec value is coming, names both console paths,
+and says to copy both now. The second confirms it is the one that was
+mentioned.
+
+**The CTI quota figure was wrong, and CrowdSec's own docs are why.** The
+installer said Community = 40/month. The operator's free Community account
+reports 120. Checking: CrowdSec's CTI API Keys page says "Community Plan Free
+Key - 40 / month", while their Premium Upgrade page lists "Community: 120 calls
+/month". Both are CrowdSec's own current documentation and they contradict each
+other. Default changed to 120, and the prompt now says plainly not to trust any
+figure including this installer's — read it from the console, which is
+authoritative for your account. It also explains why the number matters: the
+budget is what stops enrichment burning a month's quota in one busy day.
+
+**Wordfence 'both' — the reason it "kills it" is rate limiting.** Wordfence
+limits by REQUEST, not bytes, so asking for two feeds in one run can get the
+second refused with a 429. That was already mitigated (skip production when
+scanner was refused; 60s gap otherwise), but the prompt sold 'both' as having
+"no blind spot" without mentioning the cost. It now states the rate-limit
+behaviour, recommends staying on scanner, and is numbered rather than requiring
+a typed word.
+
+---
+
+## 2026.08.12g — MFA works on real hardware, and the Squid parse output is clean
+
+**The chain closed.** On the live VM, with CONNECT added to the method
+allowlist:
+
+    Installing Two Factor (0.16.0)
+    Downloading installation package from https://downloads.wordpress.org/...
+    Plugin installed successfully.
+    ✔  Installed two-factor
+    ✔  Activated (verified)
+
+HTTPS through the egress proxy works, the download completes, and the plugin is
+active. `Activated (verified)` is the check added earlier reading the end state
+rather than trusting an exit code — the second run correctly reported
+`ℹ Already installed. ✔ Activated (verified)`, which is the idempotent path
+working too.
+
+That is admin MFA proven on hardware for the first time, after four releases of
+chasing symptoms that all traced back to one missing word in an ACL.
+
+**The parse output is now clean, which matters more than it sounds.** The
+production fail-closed check runs `squid -k parse`, and that output carried two
+warnings and an error on every single run:
+
+- `ERROR: Directive 'dns_v4_first' is obsolete` — Squid 6 removed it. Deleted.
+- `WARNING: empty ACL` for `threat-deny.txt` and `allowlist-maintenance.txt`,
+  both legitimately empty on a fresh install. Seeded with
+  `wasp-placeholder.invalid` (RFC 2606 reserved, can never resolve).
+- `WARNING: HTTP requires the use of Via` — correct, and deliberate. `via off`
+  stops Squid advertising itself to anything probing the egress path. Now
+  documented in the config so nobody "fixes" it.
+
+A config whose normal state is three complaints is a config where the fourth
+one goes unnoticed. The CONNECT bug was found by reading Squid's log; that only
+worked because someone was looking hard.
+
+**Also fixed:** `podman restart squid` ended in SIGKILL every time, because
+Squid's default `shutdown_lifetime` is 30 seconds and podman's stop timeout is
+10. Nothing was corrupted, but SIGKILL can truncate the access log mid-line —
+and the access log is what diagnosed this whole chain. Now
+`shutdown_lifetime 5 seconds`.
+
+**A bug caught before shipping:** seeding the maintenance allowlist would have
+broken maintenance-mode detection, which tests for "any non-comment line" and
+would have seen the placeholder and reported every VM as permanently in a
+maintenance window. The detection, the expiry path and the status display now
+all filter the placeholder explicitly. Both cases tested.
+
+---
+
+## 2026.08.12f — The actual root cause: Squid's method allowlist omitted CONNECT
+
+The DNS fix in the previous release worked, and by working it exposed the real
+problem. Squid's own access log, which the operator surfaced, named it exactly:
+
+    TCP_DENIED/403 api.wordpress.org:443
+
+`TCP_DENIED/403` means Squid RESOLVED the name and then refused it by policy —
+so DNS was fixed, and something in the ACL chain was denying it.
+
+**`acl allowed_methods method GET POST HEAD OPTIONS PUT` did not include
+CONNECT.** Every HTTPS request through a forward proxy is a CONNECT. The
+`http_access deny !allowed_methods` line sits at the top of the chain, so ALL
+TLS traffic was denied there — long before the destination allowlist 60 lines
+below was ever consulted. `.wordpress.org` being allowlisted was irrelevant;
+nothing HTTPS ever got that far.
+
+This single line explains the entire chain of symptoms across four releases:
+
+  * the plugin install failing with "something may be wrong with WordPress.org"
+  * `api.wordpress.org` appearing blocked despite being allowlisted
+  * every deny-probe in the egress self-test "passing" — everything was denied
+  * MFA never activating, because the plugin could never be fetched
+
+CONNECT is not thereby unrestricted: `http_access deny CONNECT !SSL_ports`
+immediately below confines it to port 443, which is the control that actually
+matters — it prevents CONNECT being used to tunnel to arbitrary ports.
+
+**`check-squid-acl.py` now catches this.** It parses method ACLs and their
+`deny !acl` lines and fails if CONNECT is missing, because that configuration
+is always wrong for a forward proxy and always silent. Verified retroactively:
+restoring the original line makes it fail with the exact diagnosis.
+
+**Also fixed, and it is my bug twice over:** the egress probe reported "no
+response" while Squid's log showed a clean 403. PHP's `http://` stream wrapper
+cannot perform a CONNECT tunnel, so probing an `https://` URL through a proxy
+returns nothing regardless of policy. The probe now uses `http://`, which
+traverses the same ACL chain (source, method, destination) — the thing under
+test. That is the third time this probe has misreported, each time for a
+different reason, and each time it sent the investigation somewhere useless.
+
+---
+
 ## 2026.08.12e — MFA root cause: Squid could not resolve anything
 
 Setup had been completed, a theme installed, and `wp-plugins.sh install

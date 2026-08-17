@@ -64,6 +64,9 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Alerts](#alerts)
 - [Choosing a DNS resolver](#choosing-a-dns-resolver)
 - [The operator menu](#the-operator-menu)
+- [File integrity: WordPress checksums](#file-integrity-wordpress-checksums)
+- [PHP process-execution functions](#php-process-execution-functions)
+- [Commercial themes and plugins](#commercial-themes-and-plugins)
 - [Capturing a session for review](#capturing-a-session-for-review)
 - [Testing it from the outside](#testing-it-from-the-outside)
 - [Rotating credentials](#rotating-credentials)
@@ -446,6 +449,147 @@ tells you what is still owed:
 
 Those two are the tests whose failure actually costs a client their site, which
 is why they are called out rather than buried.
+
+## File integrity: WordPress checksums
+
+`wp-plugins.sh verify` compares core and plugin files against the checksums
+WordPress.org publishes. It detects a file that has been **modified since it was
+installed** — the signature of a backdoor injected through a vulnerable plugin,
+which is how most WordPress compromises actually persist.
+
+```sh
+doas wp-plugins.sh verify           # core + all plugins
+doas wp-plugins.sh verify --strict  # also flag readme.txt-level changes
+```
+
+Runs weekly (Monday 04:30 UTC) and is step nine of the commission check.
+
+**It does not trust wp-cli's exit code, and neither should you.** This is
+documented behaviour, not a bug: `wp plugin verify-checksums --all` can report
+*"Verified 2 of 3 plugins (1 skipped)"* and still exit 0. The skip happens
+because a plugin has no checksum published on WordPress.org — true of every
+commercial and every bespoke plugin. A caller trusting the exit code sees
+success while a plugin went unchecked.
+
+So this parses the counts and reports three states, because they mean different
+things:
+
+| State | Meaning |
+|---|---|
+| **VERIFIED** | Files match what WordPress.org published |
+| **MODIFIED** | They do not — investigate. This is the finding |
+| **SKIPPED** | No published checksum exists. Expected for Divi, Elementor Pro, anything bespoke. Not a failure, but those files are outside this control |
+
+It also checks the arithmetic: if `total − verified − skipped` is greater than
+zero, something was checked and failed even when no message matched. Wording
+changes between wp-cli releases; the numbers do not.
+
+### Feeding it to Wazuh
+
+Every outcome goes to syslog tagged `wasp-integrity` in key=value form, so a
+decoder matches fields rather than prose:
+
+```
+wasp_integrity result=FAIL component=core reason=checksum_mismatch
+wasp_integrity result=SKIP component=plugins reason=no_published_checksum count=2
+wasp_integrity result=PASS component=all core=ok plugins_verified=8 plugins_total=8 plugins_skipped=0
+```
+
+`auth.crit` for FAIL, `auth.notice` for SKIP, `auth.info` for PASS. A Wazuh rule
+matching `wasp_integrity` and alerting on `result=FAIL` is the whole
+integration — no agent-side script needed.
+
+**The SKIP line is the one worth wiring up deliberately.** It names the files
+this control cannot cover, which is precisely where a SIEM's own file-integrity
+monitoring should be pointed. Checksums handle what WordPress.org publishes;
+Wazuh FIM handles the rest.
+
+## PHP process-execution functions
+
+`disable_functions` blocks `system()`, `shell_exec()`, `exec()`, `proc_open()`
+and their usual fallbacks. It is the single highest-value line in the PHP
+config, and it is on by default.
+
+Nearly every off-the-shelf PHP webshell — c99, r57, WSO and the hundreds of
+variants dropped through a vulnerable plugin — calls one of these within its
+first few lines. Blocking them does not stop someone writing a bespoke shell,
+but it breaks the commodity ones outright, and commodity is what actually lands
+on a WordPress site.
+
+**WordPress core needs none of them.** What can need them: image-optimisation
+plugins that shell out to `jpegoptim`, some backup plugins that call `mysqldump`
+or `tar` directly, and a few server-status plugins. If one of those fails with
+"call to undefined function", this is why.
+
+```sh
+doas wp-hardening.sh status                # see the current state
+doas wp-hardening.sh disable php-exec      # allow them (reduces hardening)
+doas wp-hardening.sh enable  php-exec      # block them again
+```
+
+Before turning it off, it is worth asking whether the plugin that needs shell
+access is worth the exposure — usually there is an alternative that does the
+same job in PHP.
+
+## Commercial themes and plugins
+
+Two things are needed for a paid theme like Divi or Elementor Pro: getting it
+installed, and letting it reach its licence server so it keeps receiving
+security fixes.
+
+### Installing one
+
+Under `DEPLOYMENT_PROFILE=production`, `DISALLOW_FILE_MODS` is set, which
+removes **Plugins → Add New**, **Appearance → Themes → Add New** and the upload
+form from wp-admin entirely. That is deliberate — a hijacked admin session
+cannot install arbitrary PHP — but you still need a way to install a legitimate
+theme. Two options:
+
+```sh
+# Preferred: install from a file, no hardening change at all
+scp divi.zip admin@your-vm:/var/lib/wasp-import/incoming/
+doas wp-plugins.sh install-file /var/lib/wasp-import/incoming/divi.zip --activate
+
+# Or lift the restriction, upload in wp-admin, then put it back
+doas wp-hardening.sh disable file-mods
+doas wp-hardening.sh enable  file-mods
+```
+
+Both are in `wasp-menu` → Security. The first is preferred because it never
+lowers the hardening: `wp-cli` is explicitly unaffected by `DISALLOW_FILE_MODS`
+(WordPress documents language installs as the sole exception), so the console
+path keeps working while the admin UI stays closed.
+
+`install-file` takes a **local file only** — never a URL. That is not
+awkwardness for its own sake: `wp-plugins.sh install <slug>` exists precisely
+because its source is always the official directory over TLS, and accepting an
+arbitrary URL would collapse that into "download and run anything". Here the
+trust decision is made off-box by a human at `scp` time. Pass `--sha256 <hash>`
+and it verifies before installing; without one it records the hash it saw, so
+what was installed can be compared later against what the vendor shipped.
+
+**Do not commit the .zip to your repository.** It freezes the theme at one
+version while the vendor keeps shipping fixes, adds tens of megabytes to git
+history forever, does not save the licensing step (each site still needs its own
+vendor API key), and redistributes a commercial product under your name — the
+GPL covers the code, not the trademark. Keep it in your own asset store and
+copy it per install.
+
+### Letting it update
+
+A paid theme that cannot reach its licence server installs fine and then never
+updates, which for a page builder means it silently stops receiving security
+fixes. The installer asks which builder you use and allows only that one through
+the egress proxy. To add another later:
+
+```sh
+doas wasp-egress.sh allow .elegantthemes.com    # Divi
+doas wasp-egress.sh allow .elementor.com        # Elementor
+doas wasp-egress.sh discovery                   # what the site actually reaches
+```
+
+Nothing is allowed that you did not ask for. Every entry is a destination a
+compromised WordPress may reach, so a builder you do not run is pure surface.
 
 ## Capturing a session for review
 

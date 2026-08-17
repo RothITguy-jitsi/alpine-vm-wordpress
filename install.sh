@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.12e"
-WASP_VERSION_NOTE="ROOT CAUSE of the MFA failure: Squid had no working resolver, so every outbound request failed and looked like a policy denial; Squid now uses the configured DNS servers explicitly with matching firewall rules"
+WASP_VERSION="2026.08.12n"
+WASP_VERSION_NOTE="wp-plugins.sh verify: core+plugin checksums that do NOT trust wp-cli exit codes, with key=value syslog for Wazuh; SKIP lines name the files a SIEM FIM should cover"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

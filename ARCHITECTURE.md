@@ -423,6 +423,7 @@ graph LR
     P --> P2["vulnerability scan<br/>Wordfence bulk feed, matched locally"]
     P --> P3["opt-in: Patchstack, WPScan, NVD"]
     P --> P4["install &lt;slug&gt; — WordPress.org<br/>directory only, no URLs/ZIPs"]
+    P --> P5["install-file &lt;zip&gt; — local file,<br/>SHA-256 recorded, never a URL,<br/>never staged in the web root"]
 
     T --> M["wp-malware-scan.sh"]
     M --> M1["PHP in uploads — highest signal"]
