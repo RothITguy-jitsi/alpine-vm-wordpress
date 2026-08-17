@@ -55,6 +55,26 @@ SQUID_DNS_RULES="${SQUID_DNS_RULES%$'\n'}"
 # block now expands ${SMTP_RATE_LIMIT} inside itself -- ahead of its own
 # catch-all drop. Defining it afterwards expanded to an empty string and the
 # rule silently vanished, which is exactly the failure this move is fixing.
+# ── SMTP tunables, defined BEFORE anything that expands them ─────────────────
+# These used to sit ~190 lines below the rule that uses them. Shell expands at
+# assignment time, so SMTP_RATE_LIMIT was built with all three EMPTY and the
+# generated rule read:
+#
+#     ip saddr 10.89.10.0/24 ... tcp dport  ct state new limit rate  burst  ...
+#
+# nft rejected it with "syntax error, unexpected ct" and REFUSED THE ENTIRE
+# RULESET. The VM booted with no filter table at all -- no L1 firewall, no
+# egress boundary, nothing. `wasp-egress test` correctly reported "the boundary
+# is NOT holding", which was true in the most literal sense available.
+#
+# This is the same ordering trap as two releases ago, from the other direction:
+# then the consumer ran before the definition, now the consumer was MOVED above
+# its own dependencies. Anything expanded into a config string must have every
+# variable it names already set.
+_SMTP_PORTS="{ 25, 465, 587 }"
+_SMTP_RATE="${SMTP_RATE_LIMIT_RATE:-30/hour}"
+_SMTP_BURST="${SMTP_RATE_LIMIT_BURST:-10}"
+
 # ── Destination restriction for SMTP ─────────────────────────────────────────
 # An external evaluation's top finding, and it was already noted as a known gap
 # in the comment below: rate-limiting submission stops bulk exfiltration but
@@ -287,9 +307,6 @@ fi
 # set up, nothing should be opening submission connections at all, so the
 # rule costs nothing and any hits are worth seeing. Legitimate WordPress
 # mail volume (resets, notifications, receipts) sits far below the default.
-_SMTP_PORTS="{ 25, 465, 587 }"
-_SMTP_RATE="${SMTP_RATE_LIMIT_RATE:-30/hour}"
-_SMTP_BURST="${SMTP_RATE_LIMIT_BURST:-10}"
 
 if [[ "${BLOCK_PVE_MGMT:-1}" == "1" ]]; then
   _PVE_RULE="ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } tcp dport { 8006, 8007, 3128, 5900-5999 } counter log prefix \"nft-drop-pve-mgmt \" level warn limit rate 5/minute drop"

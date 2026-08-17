@@ -6,6 +6,100 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12w — Proving CrowdSec actually blocks, not that it started
+
+Reported from the console: 1 log processor, **0 remediation components**, no
+active remediation visible — while the install had verified "Bouncer connected
+to LAPI". Both statements can be true at once, and neither answers the question
+that matters.
+
+CrowdSec's own docs are clear about the split: the Security Engine detects and
+the Local API issues decisions, but **enforcement is done by the Remediation
+Component pulling those decisions and writing them to the firewall**. The
+console is a dashboard reflecting what the enrolled engine last reported; it
+syncs periodically and can lag. Enforcement is local. A console showing zero
+components and a VM that blocks correctly is a real combination, and so is the
+reverse — CrowdSec publishes a troubleshooting page for a Security Engine with
+registered-but-inactive components precisely because "it appears in the console"
+is not proof either.
+
+So neither source was worth trusting, and the install's own check —
+"cs-firewall-bouncer service running" — proves only that a service started.
+
+**`wp-hardening.sh crowdsec-doctor` walks the whole chain and then tests it for
+real.** Six inspections (engine running, LAPI answering, bouncer registered,
+service running, last_pull recent, the crowdsec nftables set present), then the
+step that actually settles it: it adds a genuine ban for `192.0.2.222`
+— TEST-NET-1, RFC 5737, never routable — waits up to twenty seconds for it to
+appear in `nft list ruleset`, reports how long it took, and removes it again.
+
+If that passes, remediation works whatever the console says, and the tool says
+so in those words. If it fails, the message is the one that matters: detection
+may be working and nothing is being blocked.
+
+It is on the Security menu and is now step ten of the commission check, because
+"are attackers actually being blocked" belongs in the same pass as "does the
+site come up".
+
+The `last_pull` check is included specifically because CrowdSec flags
+registered-but-inactive components after 24 hours — a bouncer that registered
+once and never pulled again looks healthy in a service listing and enforces
+nothing.
+
+---
+
+## 2026.08.12v — The VM had no firewall at all
+
+The most serious defect in this series, and I introduced it two releases ago.
+
+    /etc/nftables.nft:110:70-71: Error: syntax error, unexpected ct
+
+`SMTP_RATE_LIMIT` is built at line 99. `_SMTP_PORTS`, `_SMTP_RATE` and
+`_SMTP_BURST` were not assigned until line 290. Shell expands at assignment
+time, so all three were EMPTY and the generated rule read:
+
+    ip saddr 10.89.10.0/24 ... tcp dport  ct state new limit rate  burst  packets
+
+nft rejected that and, correctly, **refused the entire file**. The VM came up
+with no filter table: no L1 packet filter, no admin-IP restriction, no egress
+boundary, nothing. `wasp-egress test` reported "the boundary is NOT holding",
+which was true in the most literal sense available — there was no boundary.
+
+This is the same ordering trap as two releases ago, from the opposite
+direction. Then the consumer ran before the definition and the rule silently
+vanished, breaking mail. Fixing that, I moved the definition up — above its own
+dependencies. Both times the file passed `bash -n`, because both times the
+shell syntax was perfectly valid and only the generated artifact was wrong.
+
+**Worse than the bug: the install reported success.** The syntax pre-check
+caught the error and printed it, then the install continued and finished with
+"INSTALL COMPLETED". Every fail-closed control here blocks production —
+unverified signatures, a dead Squid, MFA that cannot enrol — except the one
+whose failure means there is no perimeter at all. That was an oversight, not a
+decision. A ruleset that fails to check OR fails to load now writes a
+PRODUCTION-BLOCKER stating plainly that everything else reporting "enabled" is
+describing rules that are not in the kernel.
+
+**New check: `check-expansion-order.py`.** It finds multi-line double-quoted
+assignments — the shape used to build nftables and Apache fragments — collects
+the `${VAR}` references inside them, and fails if any is assigned later in the
+same file. Verified retroactively: restoring the tunables to their old position
+makes it name all three variables and both line numbers.
+
+That check is the real deliverable here. This class has now cost two releases
+and produced, in turn, a site that could not send mail and a site with no
+firewall — and neither was visible to `bash -n`, to the check suite, or to a
+careful read. It was visible in the generated file, which is exactly what the
+check now reads.
+
+**Also in this log, and now correctly diagnosable:** the off-site push fails
+with `S3 HeadObject 403 Forbidden`. That is the credentials or the bucket
+policy, not the platform — and it is visible at all because of the error
+surfacing added in 2026.08.12o. `wasp-offsite-backup.sh doctor` will name which
+of the three causes it is.
+
+---
+
 ## 2026.08.12u — A comment that wasn't a comment
 
 Every install of 2026.08.12t printed, twice:
