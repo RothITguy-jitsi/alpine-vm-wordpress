@@ -185,6 +185,7 @@ menu_security() {
     2) Egress (proxy) status         ${DIM}wasp-egress.sh status${R}
     3) Test egress is enforced       ${DIM}wasp-egress.sh test${R}
     4) CrowdSec whitelist            ${DIM}wp-hardening.sh crowdsec-whitelist list${R}
+   17) Is CrowdSec actually blocking? ${DIM}wp-hardening.sh crowdsec-doctor${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -203,6 +204,7 @@ EOF
       2) _have wasp-egress.sh && run "Egress status" 0 wasp-egress.sh status || _missing wasp-egress.sh ;;
       3) _have wasp-egress.sh && run "Egress enforcement test" 0 wasp-egress.sh test || _missing wasp-egress.sh ;;
       4) _have wp-hardening.sh && run "CrowdSec whitelist" 0 wp-hardening.sh crowdsec-whitelist list || _missing wp-hardening.sh ;;
+      17) _have wp-hardening.sh && run "CrowdSec remediation chain (live test)" 0 wp-hardening.sh crowdsec-doctor || _missing wp-hardening.sh ;;
       5) _have wp-plugins.sh && run "Plugin vulnerabilities" 0 wp-plugins.sh vulns || _missing wp-plugins.sh ;;
       6) _have wp-malware-scan.sh && run "Malware quick scan" 0 wp-malware-scan.sh quick || _missing wp-malware-scan.sh ;;
       7) _have wp-malware-scan.sh && run "Malware full scan" 0 wp-malware-scan.sh full || _missing wp-malware-scan.sh ;;
@@ -424,6 +426,7 @@ EOF
   _step "Mail — can it actually send"         wp-mail.sh doctor
   _step "wp-cli — can it reach the site"      wp-plugins.sh doctor
   _step "File integrity — core + plugins"     wp-plugins.sh verify
+  _step "CrowdSec — is it actually blocking"  wp-hardening.sh crowdsec-doctor
 
   echo ""
   printf '%s┌─ Commission result ────────────────────────────────┐%s\n' "$CYN" "$R"

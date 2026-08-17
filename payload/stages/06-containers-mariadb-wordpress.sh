@@ -17,8 +17,13 @@ if [ -f /etc/nftables.nft ]; then
   # prompt time, but this is defence in depth on the one config whose failure
   # mode is "host firewall is down".
   if nft -c -f /etc/nftables.nft 2>/tmp/nft-check.err; then
-    nft -f /etc/nftables.nft && ok "Rules loaded (syntax pre-checked)" \
-      || warn "Ruleset load failed despite passing syntax check — check /etc/nftables.nft"
+    if nft -f /etc/nftables.nft; then
+      ok "Rules loaded (syntax pre-checked)"
+    else
+      warn "Ruleset load failed despite passing syntax check — check /etc/nftables.nft"
+      [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ] && \
+        block_production "The nftables ruleset passed its syntax check but failed to LOAD, so this VM has no host firewall. Check: doas nft -f /etc/nftables.nft"
+    fi
     rc-service nftables start 2>/dev/null || true
   else
     warn "nftables ruleset FAILED syntax check — NOT loading it (firewall would be left broken):"
@@ -26,6 +31,20 @@ if [ -f /etc/nftables.nft ]; then
     warn "  The generated /etc/nftables.nft has a syntax error. This usually means a"
     warn "  CIDR/IP value contained something unexpected. Inspect it, fix by hand, then:"
     warn "    doas nft -c -f /etc/nftables.nft   (check)   &&   doas nft -f /etc/nftables.nft   (load)"
+
+    # A VM with NO FIREWALL must never be certified. On a real install a
+    # generated rule expanded with an empty variable, nft rejected the whole
+    # file, and the VM came up with no filter table at all -- no L1 packet
+    # filter, no egress boundary, nothing. The install printed this warning and
+    # then reported success, and only `wasp-egress test` two screens later said
+    # "the boundary is NOT holding".
+    #
+    # Every other fail-closed control here blocks production. This -- the one
+    # whose failure means there is no perimeter -- did not, which was an
+    # oversight rather than a decision.
+    if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
+      block_production "The nftables ruleset FAILED to load, so this VM has NO host firewall: no L1 packet filter, no admin-IP restriction, and no egress boundary. Everything else that reports 'enabled' is describing rules that are not in the kernel. Inspect /etc/nftables.nft, fix it, then: doas nft -c -f /etc/nftables.nft && doas nft -f /etc/nftables.nft"
+    fi
   fi
   rm -f /tmp/nft-check.err
 else

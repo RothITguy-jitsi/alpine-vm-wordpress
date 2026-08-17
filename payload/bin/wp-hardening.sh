@@ -231,6 +231,97 @@ case "${1:-status}" in
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;
   restart-wp)  restart_wp ;;
+  crowdsec-doctor|cs-doctor)
+    # PROVE remediation end to end, rather than trusting either the console or
+    # a service that merely started.
+    #
+    # Reported from a live VM: the CrowdSec console showed 1 log processor and
+    # 0 remediation components, while the install had verified "Bouncer
+    # connected to LAPI". Both can be true. The console is a dashboard that
+    # syncs periodically and reflects what the enrolled engine last reported;
+    # enforcement is local, and it is the local chain that decides whether an
+    # attacker is actually blocked.
+    #
+    # So this walks the whole chain and inserts a REAL test decision, because
+    # the only question that matters is "does a decision become a firewall
+    # entry", and nothing short of trying it answers that.
+    echo ""
+    echo "CrowdSec remediation chain"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    _cs_fail=0
+
+    printf "  %-38s " "1. Engine container running"
+    if podman ps --filter 'name=^crowdsec$' --filter status=running --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec; then
+      echo "yes"
+    else
+      echo "NO"; _cs_fail=$((_cs_fail+1))
+      echo "     doas podman logs --tail 30 crowdsec"
+    fi
+
+    printf "  %-38s " "2. LAPI answering"
+    if podman exec crowdsec cscli lapi status >/dev/null 2>&1; then echo "yes"
+    else echo "NO"; _cs_fail=$((_cs_fail+1)); fi
+
+    printf "  %-38s " "3. Bouncer registered with LAPI"
+    _bl=$(podman exec crowdsec cscli bouncers list -o raw 2>/dev/null | tail -n +2)
+    if [ -n "$_bl" ]; then
+      echo "yes"
+      printf '%s\n' "$_bl" | sed 's/^/       /'
+    else
+      echo "NO — nothing registered"; _cs_fail=$((_cs_fail+1))
+      echo "     This is what the console reports as 0 remediation components."
+    fi
+
+    printf "  %-38s " "4. Bouncer service running"
+    if rc-service cs-firewall-bouncer status >/dev/null 2>&1; then echo "yes"
+    else echo "NO"; _cs_fail=$((_cs_fail+1)); echo "     doas rc-service cs-firewall-bouncer restart"; fi
+
+    printf "  %-38s " "5. Bouncer has pulled recently"
+    # A registered bouncer that never pulls is the "registered but inactive"
+    # state the console flags after 24h. last_pull is the field that matters.
+    _lp=$(podman exec crowdsec cscli bouncers list -o json 2>/dev/null | grep -o '"last_pull":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$_lp" ]; then echo "yes (${_lp})"
+    else echo "NO last_pull recorded"; _cs_fail=$((_cs_fail+1))
+         echo "     Registered but never pulled — check the API key in"
+         echo "     /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"; fi
+
+    printf "  %-38s " "6. nftables has the crowdsec set"
+    if nft list ruleset 2>/dev/null | grep -qi "crowdsec"; then echo "yes"
+    else echo "NO"; _cs_fail=$((_cs_fail+1))
+         echo "     The bouncer creates its own set. Absent means it has never"
+         echo "     successfully written a rule."; fi
+
+    # ── The only test that actually proves it ────────────────────────────────
+    echo ""
+    echo "  7. Live test: does a decision become a firewall entry?"
+    _tip="192.0.2.222"   # TEST-NET-1, RFC 5737 — never routable, safe to ban
+    podman exec crowdsec cscli decisions add --ip "$_tip" --duration 2m --reason "wasp crowdsec-doctor test" >/dev/null 2>&1
+    _ok=0
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 2
+      if nft list ruleset 2>/dev/null | grep -q "$_tip"; then _ok=1; break; fi
+    done
+    podman exec crowdsec cscli decisions delete --ip "$_tip" >/dev/null 2>&1 || true
+    if [ "$_ok" = 1 ]; then
+      echo "     PASS — the ban reached nftables in ~$((_i * 2))s."
+      echo "     Remediation is working regardless of what the console shows."
+    else
+      echo "     FAIL — a decision was added and never appeared in nftables"
+      echo "     within 20s. Detection may work, but nothing is being blocked."
+      _cs_fail=$((_cs_fail+1))
+    fi
+
+    echo ""
+    if [ "$_cs_fail" -eq 0 ]; then
+      echo "  Chain is intact. If the console still shows 0 remediation"
+      echo "  components, that is a console sync question, not an enforcement"
+      echo "  one — it reflects what the enrolled engine last reported and can"
+      echo "  lag. Re-check it after the next pull."
+    else
+      echo "  ${_cs_fail} problem(s) above. Attackers may be detected and NOT blocked."
+    fi
+    ;;
+
   crowdsec-whitelist)
     _WL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
     _act="${2:-list}"; _ip="${3:-}"
