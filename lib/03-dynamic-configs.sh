@@ -143,7 +143,7 @@ ${SQUID_DNS_RULES}
         # it was never reached: enabling the egress proxy silently broke
         # WordPress's ability to send mail entirely. Password resets, order
         # confirmations and admin notifications all failed, and the only
-        # symptom was `wp-mail.sh doctor` reporting
+        # symptom was 'wp-mail.sh doctor' reporting
         # \"TCP 587: UNREACHABLE (Connection timed out)\" while every other
         # mail check passed.
         #

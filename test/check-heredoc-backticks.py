@@ -45,11 +45,40 @@ for f in sorted(set(glob.glob('**/*.sh', recursive=True)) | {'install.sh'}):
                     i = j
                     break
         i += 1
+# ── Also: backticks inside a DOUBLE-QUOTED assignment ────────────────────────
+# The heredoc scan above missed a real one. A comment written inside a
+# multi-line VAR="..." block read:
+#     # symptom was `wp-mail.sh doctor` reporting
+# and bash executed it -- on the PROXMOX HOST, where wp-mail.sh does not exist.
+# Every install printed "lib/03-dynamic-configs.sh: line 162: wp-mail.sh:
+# command not found".
+#
+# A `#` inside a quoted string is NOT a comment; the shell never parses it as
+# one. It is just text, and backticks in text still expand. Prose written for a
+# human reader is exactly where this happens, because nobody thinks of a
+# comment as code.
+QASSIGN = re.compile(r'^[ \t]*[A-Za-z_][A-Za-z0-9_]*="(?:[^"\\]|\\.)*"', re.M | re.S)
+for f in sorted(set(glob.glob('**/*.sh', recursive=True)) | {'install.sh'}):
+    try: text = open(f, errors='replace').read()
+    except FileNotFoundError: continue
+    for m in QASSIGN.finditer(text):
+        body = m.group(0)
+        if '`' not in body:
+            continue
+        ln = text[:m.start()].count('\n') + 1
+        for cmd in re.findall(r'`([^`\n]{0,60})`', body):
+            problems.append((f, ln, 'quoted-assignment', cmd))
+
 if problems:
-    print(f"FOUND {len(problems)} backtick(s) inside unquoted heredoc(s):")
+    print(f"FOUND {len(problems)} backtick(s) that the shell will EXECUTE:")
     for f, ln, d, cmd in problems:
-        print(f"  {f}:{ln}  heredoc <<{d} is unquoted, so this EXECUTES: `{cmd}`")
-        print(f"     Fix: quote the delimiter (<<'{d}') if no expansion is needed,")
-        print(f"     or remove the backticks from the text.")
+        if d == 'quoted-assignment':
+            print(f"  {f}:~{ln}  inside a double-quoted assignment, so this EXECUTES: `{cmd}`")
+            print(f"     A # inside a quoted string is not a comment. Use 'single quotes'")
+            print(f"     around the command name in prose, or drop the backticks.")
+        else:
+            print(f"  {f}:{ln}  heredoc <<{d} is unquoted, so this EXECUTES: `{cmd}`")
+            print(f"     Fix: quote the delimiter (<<'{d}') if no expansion is needed,")
+            print(f"     or remove the backticks from the text.")
     sys.exit(1)
 print("Heredoc-backtick check: CLEAN")

@@ -6,6 +6,45 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12u — A comment that wasn't a comment
+
+Every install of 2026.08.12t printed, twice:
+
+    lib/03-dynamic-configs.sh: line 162: wp-mail.sh: command not found
+
+I introduced it in the previous release. Explaining the SMTP fix, I wrote inside
+the multi-line `EGRESS_PROXY_FORWARD="..."` assignment:
+
+    # symptom was `wp-mail.sh doctor` reporting
+
+That is a double-quoted shell string. **A `#` inside one is not a comment** —
+the shell never parses it as such; it is just text. And backticks in text are
+still command substitution, so bash dutifully tried to run `wp-mail.sh` on the
+PROXMOX HOST, where it has never existed.
+
+Harmless in effect: the substitution produced an empty string and the ruleset
+was built correctly. The SMTP destination pinning from that release worked, and
+the log confirms it — `SMTP egress pinned to mail.ironveil.systems
+(65.108.150.44)`. But an error on every single install is not something to
+tolerate, and it was one small change away from being genuinely damaging: a
+backtick around something that DOES exist on the host would have executed it as
+root, mid-install, with no one intending it.
+
+**The existing check should have caught this and did not.**
+`check-heredoc-backticks.py` was written after this exact class bit before, but
+it only inspected heredoc bodies. Quoted assignments were outside its scope, so
+prose inside one was unexamined. It now scans both, reports which context it
+found the backtick in, and gives the right fix for each. Verified retroactively:
+restoring the line makes it fail naming the file, the line and the command.
+
+The lesson generalises past shell. **Prose written for a human reader is exactly
+where this lands**, because nobody proofreads a comment as if it were code — and
+inside a quoted string, that is precisely what it is. The habit worth keeping is
+to use 'single quotes' around a command name in explanatory text and reserve
+backticks for markdown, where they are inert.
+
+---
+
 ## 2026.08.12t — Deferring the boot race honestly, and writing for strangers
 
 The boot-ordering race stays deferred at the operator's call, which is the right

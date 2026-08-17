@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.12t"
-WASP_VERSION_NOTE="Public-distribution honesty: README states who this is for and what is unproven; first-reboot DB error now expected rather than alarming; boot race deferred with the reason recorded"
+WASP_VERSION="2026.08.12u"
+WASP_VERSION_NOTE="A backtick in prose inside a quoted assignment made the host try to run wp-mail.sh; fixed and the backtick check now covers quoted assignments not just heredocs"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
