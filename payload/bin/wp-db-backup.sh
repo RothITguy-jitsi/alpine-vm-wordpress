@@ -149,19 +149,48 @@ logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -
 # sending, and a push failure must not prevent a good local backup from being
 # kept. A failure here is reported and does not fail the local backup.
 if [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
+  # NOTE the path. This block used to write to "$_OFFLOG" and then read from a
+  # hardcoded /tmp/.offsite.log -- two different files. So on a real VM the
+  # push failed, the error was captured, and the line meant to report it read
+  # an empty path and logged nothing. The operator saw "Newest backup is NOT
+  # present off-VM" with no reason anywhere.
+  _LAST_OFF_ERR=/etc/wp-install/offsite-last-error
   if /usr/local/bin/wasp-offsite-backup.sh push "${BACKUP_FILE}" >"$_OFFLOG" 2>&1; then
     logger -t wp-db-backup "off-VM copy sent and size-verified"
+    rm -f "$_LAST_OFF_ERR"
   else
     logger -t wp-db-backup "OFF-VM COPY FAILED — the local backup is fine, the remote copy is not"
-    sed 's/^/  /' /tmp/.offsite.log 2>/dev/null | logger -t wp-db-backup
+    sed 's/^/  /' "$_OFFLOG" 2>/dev/null | logger -t wp-db-backup
+
+    # PERSIST the reason. "The backup is not off-VM" is a symptom; the operator
+    # needs the cause, and syslog rotates. Everything that reports offsite
+    # health reads this file, so the answer is in the same place as the
+    # complaint.
+    mkdir -p /etc/wp-install 2>/dev/null || true
+    {
+      printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'file=%s\n' "$(basename "${BACKUP_FILE}")"
+      echo '--- push output ---'
+      tail -30 "$_OFFLOG" 2>/dev/null
+    } > "$_LAST_OFF_ERR" 2>/dev/null || true
+    chmod 600 "$_LAST_OFF_ERR" 2>/dev/null || true
+
+    # And say it on the terminal, for anyone who ran this by hand.
+    {
+      echo ""
+      echo "⚠  The local backup is fine. The OFF-VM copy failed:"
+      tail -12 "$_OFFLOG" 2>/dev/null | sed 's/^/     /'
+      echo "   Full reason kept at ${_LAST_OFF_ERR}"
+      echo "   Check the destination and credentials:  doas wasp-offsite-backup.sh status"
+    } >&2
+
     if [ -x /usr/local/bin/wp-notify.sh ]; then
       # No cooldown: an offsite copy that has been quietly failing is the same
       # class of problem as a backup that has been quietly failing.
       NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-offsite \
-        "Off-VM backup copy FAILED" /tmp/.offsite.log
+        "Off-VM backup copy FAILED" "$_OFFLOG"
     fi
   fi
-  rm -f /tmp/.offsite.log
 fi
 
 # Step 4: rotate ONLY after a new backup passed all three verification

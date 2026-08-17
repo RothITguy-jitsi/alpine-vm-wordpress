@@ -232,6 +232,19 @@ that is not the site.
 
 ---
 
+## Key custody
+
+Fill in [docs/KEY-CUSTODY.md](docs/KEY-CUSTODY.md) per client and store it
+somewhere that survives you being unavailable.
+
+One item on it is not like the others. Losing the object-storage credentials
+means you cannot *reach* the backups — a support ticket. Losing the **age key**
+means you cannot *read* them, and there is no remedy at all. It is deliberately
+not kept on the VM, so it exists only where you put it.
+
+`wasp-offsite-backup.sh remote-restore-drill` is what proves you still have a
+working copy. A key you have never tested is a key you do not have.
+
 ## Decommissioning
 
 Order matters — the last step destroys the evidence for the others.

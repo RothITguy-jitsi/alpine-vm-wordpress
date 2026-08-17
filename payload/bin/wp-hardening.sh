@@ -202,6 +202,31 @@ B
 }
 
 case "${1:-status}" in
+  smtp-repin)
+    # Re-resolve the relay and rewrite the SMTP destination rule. Needed when a
+    # hosted relay changes IP, which silently breaks mail until re-run -- the
+    # known cost of pinning the destination rather than allowing any host on
+    # port 587.
+    _h=$(sed -n 's/^SMTP_HOST=//p' /etc/wp-install/vars.sh 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+    [ -n "$_h" ] || { echo "No SMTP relay configured." >&2; exit 1; }
+    _ips=$(getent ahostsv4 "$_h" 2>/dev/null | awk '{print $1}' | sort -u | head -8 | tr '\n' ',' | sed 's/,$//')
+    [ -n "$_ips" ] || { echo "✗  Could not resolve ${_h}. Check DNS before re-pinning." >&2; exit 1; }
+    echo "  ${_h} now resolves to: ${_ips}"
+    if nft -c -f /etc/nftables.nft 2>/dev/null; then
+      sed -i "s|ip daddr { [0-9.,]* } tcp dport|ip daddr { ${_ips} } tcp dport|" /etc/nftables.nft
+      if nft -c -f /etc/nftables.nft 2>/dev/null && nft -f /etc/nftables.nft 2>/dev/null; then
+        echo "  ✔  SMTP destination re-pinned and the ruleset reloaded."
+        echo "     Verify:  doas wp-mail.sh doctor"
+      else
+        echo "✗  The edited ruleset did not validate — nothing was loaded." >&2
+        echo "   Inspect /etc/nftables.nft before retrying." >&2
+        exit 1
+      fi
+    else
+      echo "✗  The current ruleset does not validate; refusing to edit it." >&2
+      exit 1
+    fi ;;
+
   status)      show_status ;;
   enable)      [ -n "$2" ] && enable_feature "$2"  || echo "Usage: wp-hardening.sh enable <feature>" ;;
   disable)     [ -n "$2" ] && disable_feature "$2" || echo "Usage: wp-hardening.sh disable <feature>" ;;

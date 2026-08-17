@@ -478,6 +478,23 @@ do_restore() {
 
 case "${1:-status}" in
   status)
+    # Surface the last push failure FIRST. Someone running `status` after a
+    # complaint about the offsite copy wants the cause, and it was already
+    # captured -- there is no reason to make them find it.
+    if [ -r /etc/wp-install/offsite-last-error ]; then
+      _bad "The last push FAILED."
+      sed -n 's/^at=/  when: /p;s/^file=/  file: /p' /etc/wp-install/offsite-last-error
+      _note "  What it said:"
+      sed -n '/--- push output ---/,$p' /etc/wp-install/offsite-last-error \
+        | tail -14 | sed 's/^/    /'
+      _note "  Most common causes, in order:"
+      _note "    the secret access key was mistyped or is empty"
+      _note "    the bucket does not exist, or the name has a typo"
+      _note "    the token is not scoped to write to that bucket"
+      _note "  Re-run the configuration:  doas wasp-offsite-backup.sh init"
+      _note "  Then force a push:         doas wp-db-backup.sh"
+      echo ""
+    fi
     echo ""
     echo "Off-VM backup"
     echo "━━━━━━━━━━━━━"
@@ -548,6 +565,60 @@ case "${1:-status}" in
     else
       _bad "Remote ${_b} is ${_rsz} bytes, local is ${_sz}"; exit 1
     fi ;;
+  doctor)
+    # Answers "why is nothing off-VM" in one command, in the order the
+    # questions actually arise. Added because an operator reasonably suspected
+    # Squid, and nothing on the box could confirm or rule that out.
+    _configured || { _bad "Off-VM backup is not configured. Run: doas wasp-offsite-backup.sh init"; exit 1; }
+    _hdr "Off-VM backup diagnosis"
+
+    _note "1. Does the egress proxy apply to this at all?"
+    _note "   No. rclone/scp run on the HOST, so they use the nftables OUTPUT"
+    _note "   chain. Squid's rule matches ip saddr 10.89.10.0/24 -- the"
+    _note "   CONTAINER subnet -- in the FORWARD chain. The destination does"
+    _note "   NOT need to be in the Squid allowlist."
+    if [ -f /etc/wp-install/vars.sh ] && grep -q '^RESTRICT_EGRESS="1"' /etc/wp-install/vars.sh 2>/dev/null; then
+      _note "   Host port filtering IS on; 443 is in the permitted set, so"
+      _note "   HTTPS to object storage is allowed."
+    fi
+    echo ""
+
+    _note "2. Can this VM resolve and reach the destination?"
+    case "$OFFSITE_METHOD" in
+      s3|rclone)
+        if rclone --config "$RCLONE_CONF" lsd "${OFFSITE_DEST%%/*}:" >/dev/null 2>&1; then
+          _ok "  rclone can reach the remote and list buckets"
+        else
+          _bad "  rclone CANNOT reach the remote. Its own words:"
+          rclone --config "$RCLONE_CONF" lsd "${OFFSITE_DEST%%/*}:" 2>&1 | tail -8 | sed 's/^/      /'
+          _note "  Read that message literally -- it distinguishes the three"
+          _note "  causes that look identical from outside:"
+          _note "    403 / SignatureDoesNotMatch -> the secret key is wrong or empty"
+          _note "    404 / NoSuchBucket          -> the bucket name is wrong"
+          _note "    dial tcp / timeout          -> genuinely a network problem"
+        fi ;;
+      scp|rsync)
+        if ssh $(_ssh_opts) -o BatchMode=yes "${OFFSITE_DEST%%:*}" true 2>/dev/null; then
+          _ok "  SSH to the destination works"
+        else
+          _bad "  SSH to the destination FAILED:"
+          ssh $(_ssh_opts) -o BatchMode=yes "${OFFSITE_DEST%%:*}" true 2>&1 | tail -6 | sed 's/^/      /'
+        fi ;;
+    esac
+    echo ""
+
+    _note "3. What did the last push actually say?"
+    if [ -r /etc/wp-install/offsite-last-error ]; then
+      sed -n '/--- push output ---/,$p' /etc/wp-install/offsite-last-error | tail -14 | sed 's/^/      /'
+    else
+      _note "   Nothing recorded -- so either every push succeeded, or none has"
+      _note "   run yet. Force one:  doas wp-db-backup.sh"
+    fi
+    echo ""
+    _note "4. What is actually stored remotely right now?"
+    list_remote 2>/dev/null | sed 's/^/      /' | head -10 || _note "      (nothing, or unreadable)"
+    ;;
+
 
   list)   _configured || { _bad "Not configured"; exit 1; }
           echo ""; echo "Remote backups:"; list_remote | sed 's/^/  /' ;;

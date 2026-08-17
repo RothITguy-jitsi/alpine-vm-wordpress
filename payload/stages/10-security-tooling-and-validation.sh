@@ -314,6 +314,21 @@ MFADEFER
     block_production "MFA was requested but the Two Factor plugin cannot be installed until WordPress setup is completed (STEP 1 in the banner below). A deferred installer will install and activate it automatically within 10 minutes of you finishing setup, and will clear this blocker itself. Verify with: wp-plugins.sh status"
   fi
 fi
+# Set the expectation about the first reboot BEFORE it happens. MariaDB takes
+# 20-60s to accept connections after a cold start and wp-container only waits
+# for it to have STARTED, so the first page load after a reboot can show
+# "Error establishing a database connection". Harmless and self-clearing --
+# but for anyone who found this project on GitHub, that message on a site they
+# just built reads as "this is broken", and that is the entire first
+# impression. Saying so costs nothing; the race itself is a TODO.
+echo ""
+echo "  Note for after your first reboot:"
+echo "    \"Error establishing a database connection\" for the first ~30 seconds"
+echo "    is EXPECTED. MariaDB is still starting; WordPress reconnects on the"
+echo "    next request. Wait a minute and reload. Only investigate if it is"
+echo "    still there after five."
+echo ""
+
 
 ts "Running post-install validation"
 

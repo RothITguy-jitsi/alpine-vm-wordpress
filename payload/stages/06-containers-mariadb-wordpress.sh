@@ -517,6 +517,36 @@ done
 [ "$WP_READY" = "0" ] && warn "WordPress did not pass full health validation after 24 attempts — check: podman logs wordpress"
 ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>/dev/null)"
 
+# ── Re-assert the mu-plugins now that WordPress has finished unpacking ───────
+# These were written BEFORE the container's first start, which is too early.
+# The official image's entrypoint extracts WordPress core into the docroot when
+# index.php is absent -- precisely the state at that moment -- and that
+# extraction brings its own wp-content, which can displace what we just put
+# there. On a real VM the result was `wp-mail.sh doctor` reporting
+# "mu-plugin: MISSING" while validate-wordpress.sh reported it installed: the
+# two ran either side of validate-wordpress silently reinstalling it.
+#
+# Relying on a later tool to repair this is not a design, it is a coincidence
+# that happened to work. Re-install here, idempotently, at the first moment the
+# docroot is settled.
+for _mu in 01-wpvm-smtp.php 03-wpvm-mfa-enforce.php; do
+  [ -f "${PAYLOAD_DIR}/mu-plugins/${_mu}" ] || continue
+  if [ ! -f "${SMTP_MU_DIR}/${_mu}" ]; then
+    install -m 0644 "${PAYLOAD_DIR}/mu-plugins/${_mu}" "${SMTP_MU_DIR}/${_mu}"
+    # The MFA one carries placeholders that must be substituted again.
+    if [ "$_mu" = "03-wpvm-mfa-enforce.php" ]; then
+      sed -i \
+        -e "s|WPVM_MFA_ENFORCE_PLACEHOLDER|${MFA_ENFORCE:-0}|g" \
+        -e "s|WPVM_MFA_GRACE_PLACEHOLDER|${MFA_GRACE_DAYS:-7}|g" \
+        "${SMTP_MU_DIR}/${_mu}"
+    fi
+    chown 33:33 "${SMTP_MU_DIR}/${_mu}" 2>/dev/null || true
+    warn "  Re-installed ${_mu} — the container's first-run extraction had removed it"
+  fi
+done
+mkdir -p "${SMTP_MU_DIR}" 2>/dev/null || true
+chown 33:33 "${SMTP_MU_DIR}" 2>/dev/null || true
+
 # Now that a WordPress container exists, it can parse the mu-plugin. This was
 # attempted far too early in an earlier version and always failed.
 _verify_mfa_mu_plugin

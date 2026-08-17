@@ -34,6 +34,11 @@ changing. Your job here is to check three things and report clearly.
    ad-blocker, not the site. Nothing to report.
 2. **Wait two minutes and reload once.** A site briefly restarting looks down
    for under a minute. If it comes back, note the time and move on.
+3. **If you see "Error establishing a database connection" just after a reboot,
+   that is expected and clears itself.** The database takes 20–60 seconds to
+   accept connections after the VM starts, and WordPress reconnects on the next
+   request. Wait a minute and reload. It is only worth reporting if it is still
+   showing after five minutes, which means something else.
 3. **If it is still down after two minutes**, report it with these exact details,
    which are what a technician needs and cannot get after the fact:
    - The **web address** you tried

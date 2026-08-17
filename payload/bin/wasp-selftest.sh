@@ -256,6 +256,18 @@ restore_test() {
     else
       _f "Newest backup is NOT present off-VM" \
          "The local backup restores correctly and the offsite copy is missing or wrong — which looks healthy until the VM is gone. wasp-offsite-backup.sh verify"
+  # Show the recorded cause. "It is not off-VM" is a symptom; the push failure
+  # that produced it was captured by wp-db-backup.sh, and reporting the symptom
+  # without the cause is how an operator ends up guessing at credentials.
+  if [ -r /etc/wp-install/offsite-last-error ]; then
+    _i "  The last push failed. What it said:"
+    sed -n '/--- push output ---/,$p' /etc/wp-install/offsite-last-error \
+      | tail -12 | sed 's/^/       /'
+  else
+    _i "  No push failure was recorded, so a push may never have run."
+    _i "  Full diagnosis:  doas wasp-offsite-backup.sh doctor"
+    _i "  Force one now:  doas wp-db-backup.sh"
+  fi
     fi
   else
     _i "Off-VM backup not configured — this backup dies with the VM"

@@ -6,6 +6,302 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.12t — Deferring the boot race honestly, and writing for strangers
+
+The boot-ordering race stays deferred at the operator's call, which is the right
+decision: `wp-container` waits for MariaDB to have STARTED rather than to be
+READY, and for someone running a dozen installs by hand that is a recognisable
+twenty-second wait, not a fault.
+
+**But the calculus changes now that this is public.** For a stranger who found it
+on GitHub or Gitea, their first reboot shows "Error establishing a database
+connection" on a site they just built, and the reasonable conclusion is that the
+project is broken. That is the whole first impression, spent on a race that
+resolves itself. A public project is judged by its worst thirty seconds.
+
+So the cost of not fixing it is adoption rather than downtime — and the honest
+mitigation until it IS fixed is to say so plainly, in the two places someone
+would meet it:
+
+- The completion banner now sets the expectation BEFORE the first reboot: the
+  message is expected for ~30 seconds, MariaDB is still starting, reload after a
+  minute, only investigate past five.
+- SUPPORT-RUNBOOK's Tier 0 "website looks down" section now names that exact
+  string, so nobody escalates a self-clearing condition.
+
+Cheap, no risk to boot ordering, and it removes the "looks broken" failure
+without pretending the race is gone. The TODO entry records that reasoning
+rather than just the symptom.
+
+**A "Before you use this" section in the README**, because a project serving a
+dozen client sites while being publicly installable owes strangers the context
+its author already has:
+
+- Who it is built for — one MSP operator who knows the stack, which is the
+  assumption behind every prompt and every default.
+- What is proven on hardware versus what has a tool and a documented drill but
+  needs running yourself. Off-site restore is named specifically.
+- What you are taking on: this says no to things. Production disables plugin
+  installs from wp-admin, blocks PHP shell functions, restricts egress, and
+  refuses an unverified install. Each has a toggle and a stated reason. If you
+  want a platform that gets out of your way, this is the wrong one.
+- That `TODO.md` is worth reading before deciding, and that a stale entry
+  claiming a closed gap is treated as a defect.
+- No support commitment. MIT and public because it may be useful, not because
+  there is a contract behind it.
+
+Writing that down is not modesty. An operator who installs this expecting
+something it is not will find the difference at the worst moment, and the
+CHANGELOG is already a record of how much of this was learned the hard way.
+
+---
+
+## 2026.08.12s — Key custody written down, and a stale TODO closed
+
+Two of the easiest remaining items, picked deliberately over the harder ones
+because value-per-effort matters more than difficulty when a deadline is close.
+
+**`docs/KEY-CUSTODY.md`.** Every secret this platform creates: where it lives,
+what breaks if it is lost, and blanks to fill in per client. Pure documentation,
+no code, no risk — and the highest-value item left on the list.
+
+The reason it earns that: every other risk here is recoverable. A broken VM
+rebuilds, a compromised site restores, a bad firewall re-runs. **The age backup
+key is the only failure with no remedy** — lose it and every encrypted backup is
+permanently unreadable, not difficult but impossible. And it is a filing problem
+rather than a technical one: the private half is deliberately NOT stored on the
+VM, because an attacker who reached the VM could otherwise decrypt the backups it
+had just made. That design decision is precisely what makes it a custody
+question.
+
+The document draws the distinction that matters and is easy to blur: losing the
+object-storage credentials means you cannot REACH the backups (a support
+ticket); losing the age key means you cannot READ them (unrecoverable). It also
+ends with the question worth asking out loud — if you were unavailable for a
+month, could a colleague restore a client's site? If the answer depends on
+something only you know, the document is not finished.
+
+**A stale TODO closed: the heartbeat was already built.** `wp-notify.sh
+--heartbeat` and `--heartbeat-url` are implemented, documented and on the cron
+schedule, while TODO.md still listed external reachability as an open gap.
+
+Worth recording as its own small lesson, because it cost marks in an external
+evaluation: **a stale TODO claiming a gap you have already closed is worse than
+one naming a real gap.** A reviewer reads it and marks you down for work that is
+done. Verify before writing "not addressed" — the same discipline this project
+applies to code claims applies to its own roadmap.
+
+Deliberately NOT started, and worth naming so the choice is visible: TLS expiry
+monitoring needs an off-box vantage point, the single slug-rewrite generator is a
+refactor through the login path, and candidate DB isolation from the latest
+evaluation is real design work. None of those is a good idea at this hour.
+
+---
+
+## 2026.08.12r — WordPress 7.0.4 (Author+ RCE), and SMTP is destination-pinned
+
+Two independent evaluations of 2026.08.12q. Both led with the same thing, and
+both were right.
+
+**SECURITY — the default image was one release behind, again.** WordPress 7.0.4
+shipped 2026-08-12, six days after 7.0.3, fixing **CVE-2026-65640** (CVSS 8.8):
+an authenticated Author+ remote code execution via malicious file upload where
+ImageMagick delegates to Ghostscript. ImageMagick identifies a file by its
+CONTENT, not its extension; WordPress trusted the extension, so a
+`holiday.png` that is really PostScript became code execution. Affects 4.7.0
+through 7.0.3.
+
+Exposure is conditional — it needs both Imagick and Ghostscript present, and an
+account with `upload_files`, meaning Author or above. Neither condition makes it
+skippable: WordPress backported the fix to the 4.7 branch and states that only
+the most recent release is supported. Updated everywhere.
+
+Worth drawing out, because it cuts against this platform's emphasis: **this CVE
+is about the Author role, not the administrator.** Nearly everything here — the
+login slug, the IP restriction, MFA, DISALLOW_FILE_MODS — protects the admin. A
+client's guest contributors with upload rights are a surface this platform does
+almost nothing about, and that is now noted in the code.
+
+**SMTP egress is destination-restricted, not just rate-limited.** The top MAJOR
+in both evaluations, and a gap I had written into the config myself one release
+earlier while fixing the rule ordering: thirty connections an hour stops bulk
+exfiltration but does nothing to stop a compromised WordPress talking to the
+ATTACKER's mail server on 587. The relay is now resolved at install and the rule
+pinned to its addresses.
+
+The limits are stated rather than glossed: it resolves once, so a hosted relay
+that changes IP will stop delivering until re-pinned — hence the new
+`wp-hardening.sh smtp-repin`, which re-resolves and reloads with a
+validate-before-load guard. And it degrades to the old port-only rule with a
+WARNING when the relay cannot be resolved, because silently breaking a client's
+password resets to close a theoretical channel is the wrong trade to make on
+their behalf. A relay on shared infrastructure resolves to shared addresses, so
+pinning buys less there — it still removes "any host on the internet".
+
+**README advertised a WordPress version three security releases stale.** It said
+`6.9.4-php8.3-apache` while the installer pinned 7.0.3 — across a login-page XSS
+and an Author+ RCE. The version had been corrected in code each time and the
+documentation had not. That is worse than an old number: a reader judging whether
+this platform is current reads the README, not `install-wordpress.sh`.
+
+**New check: `check-version-claims.py`** reads the tag the installer actually
+pins and fails if any document states a different one, with the changelog
+exempt as append-only history. It immediately found a second instance in
+ARCHITECTURE.md that I would have missed by hand, which is the whole argument
+for the check existing rather than a promise to be careful.
+
+---
+
+## 2026.08.12q — The egress proxy silently broke all outbound mail
+
+Two findings from one line of diagnostic output the operator pointed at. The
+first is the most serious functional defect in this series.
+
+**`TCP 587: UNREACHABLE (Connection timed out)` — enabling the egress proxy
+disabled email entirely.** The operator's instinct that this was egress-related
+was right; it was mail rather than backups.
+
+nftables is first-match-wins. The egress-proxy block ends with:
+
+    ip saddr 10.89.10.0/24 counter drop
+
+and the SMTP allow rule was expanded SIX LINES LATER in the same chain. It was
+therefore never reached. Every outbound connection from the WordPress container
+that was not to Squid or the resolver was dropped, including submission on 587.
+Password resets, order confirmations, admin notifications, malware alerts — all
+of it, silently, on every install with `EGRESS_PROXY=1`. Every other mail check
+passed: config present, mu-plugin loaded, DNS resolving, credentials correct.
+Only the one line that actually tried to open the socket disagreed.
+
+Fixed by moving the SMTP rules INSIDE the egress block, ahead of its own drop.
+That required moving the definition above its use as well — expanded where it
+was, `${SMTP_RATE_LIMIT}` resolved to an empty string and the rule vanished,
+which is the same failure wearing a different hat. Verified rendered in both
+proxy-on and proxy-off states, appearing exactly once in each: expanding it
+twice would duplicate the rules and halve the effective rate limit.
+
+The honest framing is now in the config: mail cannot go through Squid, because
+Squid is an HTTP proxy and speaks nothing else. Submission needs its own hole,
+so the egress boundary has one outbound TCP path that is not
+destination-filtered. The rate limit — 30 new connections/hour, burst 10 — is
+what keeps that from being a bulk exfiltration channel: ample for a WordPress
+site, useless for moving a database.
+
+**`mu-plugin: MISSING` while another tool reported it installed.** Both check
+the identical path, so they could not legitimately disagree — and the
+explanation was that `validate-wordpress.sh` silently REINSTALLS it. The
+WordPress image's entrypoint extracts core into the docroot when index.php is
+absent, which is exactly the state when stage 06 writes these files moments
+before the container's first start, and that extraction brings its own
+wp-content which displaces them.
+
+So mail worked on installs where validate happened to run first, and not
+otherwise. Relying on a later tool to repair this is not a design, it is a
+coincidence that happened to hold. The mu-plugins are now re-asserted
+idempotently at the first moment the docroot is settled — after WordPress is
+confirmed healthy — with MFA placeholder substitution repeated, and a warning
+when a re-install was actually needed so the condition is visible rather than
+papered over.
+
+---
+
+## 2026.08.12p — Squid is not the offsite problem, and now the VM can say so
+
+The operator asked whether Squid could be blocking the off-VM backup, and
+whether that path bypasses it. A fair question that nothing on the box could
+answer, which is itself the defect.
+
+**It does not go through Squid.** The egress-proxy rule matches
+`ip saddr 10.89.10.0/24` in the FORWARD chain — the CONTAINER subnet. `rclone`
+and `msmtp` run on the HOST as root, so they traverse the OUTPUT chain instead
+and never meet that rule. The destination does not need to be in the Squid
+allowlist, which is why `.r2.cloudflarestorage.com` is absent and does not need
+adding. The host port filter IS enabled on this install, but 443 and 587 are
+both in the permitted set, so neither is blocked there either.
+
+So the offsite failure is a genuine rclone-level problem: credentials, bucket
+name, or reachability. "It worked previously" is consistent with that — this is
+a fresh VM with a freshly entered secret key, not the same configuration that
+worked before, so it is a new typo rather than a regression.
+
+**New: `wasp-offsite-backup.sh doctor`.** Answers the question in one command,
+in the order it actually arises: does the proxy apply (no, with the reason), can
+rclone reach and list the remote, what did the last push say, and what is
+actually stored there now. When rclone fails it prints rclone's own words and
+explains how to read them, because the three causes are indistinguishable from
+outside and completely different to fix:
+
+    403 / SignatureDoesNotMatch  -> the secret key is wrong or empty
+    404 / NoSuchBucket           -> the bucket name is wrong
+    dial tcp / timeout           -> genuinely a network problem
+
+On the menu under Backup, and both the self-test failure and `status` now point
+at it. An operator should not have to reason about which nftables chain applies
+to work out why a backup is missing.
+
+**A cosmetic SMTP bug that undermined confidence in a correct config.** The
+install summary printed
+`SMTP: contact@rothitguy.pro@mail.ironveil.systems:587` — a double `@`, because
+the line joined `${SMTP_USER}@${SMTP_HOST}` and the username is itself an email
+address. The msmtp config was correct throughout (user and host are separate
+keys, and `wp-mail.sh doctor` passes every check). But a summary that looks
+malformed makes an operator distrust the thing it is summarising, which is how a
+working relay gets "fixed". Now reads `contact@rothitguy.pro via
+mail.ironveil.systems:587`.
+
+---
+
+## 2026.08.12o — Local restore PROVEN on hardware; offsite push failure was being swallowed
+
+The best run so far, and it produced the single result this project has been
+working toward for weeks.
+
+**The local restore drill passed end to end, on real hardware, with real data:**
+
+    [PASS] Archive passes gzip integrity
+    [PASS] Scratch database is running
+    [PASS] Archive restored without error
+    [PASS] Restored database has 12 tables
+    [PASS] siteurl present in restored data: https://test.rothitguy.pro
+    [PASS] Restored users table has 1 user(s)
+    [PASS] Restored row counts are consistent with production (6 vs 6)
+    [PASS] Scratch instance destroyed
+
+That is a backup taken from a live site, restored into a throwaway database, and
+verified to contain the actual content — 12 tables, the real siteurl, the real
+user, six posts matching production. Not "the archive is valid gzip". Recovery,
+demonstrated. Every previous run failed somewhere in that chain.
+
+The MFA blocker is now the EXPECTED one: it states that the plugin cannot install
+until WordPress setup is complete, that a deferred installer will handle it
+within ten minutes, and that it will clear itself. Working as designed.
+
+**The one failure was offsite, and the reason had been swallowed by a bug.**
+`wp-db-backup.sh` pushes to the remote immediately after each backup. That push
+failed. The block meant to report it captured the output to `"$_OFFLOG"` — a
+`mktemp` path — and then read from a hardcoded `/tmp/.offsite.log`. Two
+different files. So the error was captured and then read from an empty path,
+logging nothing. The operator saw "Newest backup is NOT present off-VM" and
+"No remote backup object found to drill" with the cause nowhere at all.
+
+Fixed, and the reason is now persisted rather than only logged:
+
+- The push error is written to `/etc/wp-install/offsite-last-error` (0600), so
+  it survives syslog rotation and is in the same place as the complaint.
+- `wasp-offsite-backup.sh status` leads with it, and lists the three usual
+  causes in order of likelihood: a mistyped or empty secret access key, a
+  bucket name typo, a token not scoped to write.
+- `wasp-selftest.sh` prints it under the FAIL instead of only the symptom, and
+  says so explicitly when no failure was recorded — because that means no push
+  ever ran, which needs a different action.
+- `wp-db-backup.sh` now says it on stderr too, for anyone running it by hand.
+
+This is the fourth instance in this series of a failure being captured and then
+discarded before anyone could read it. The pattern is always the same shape: the
+code knows what went wrong and throws it away one line later.
+
+---
+
 ## 2026.08.12n — File integrity: checksums here, FIM to Wazuh
 
 Closes the last open finding from the external evaluation, and splits the work

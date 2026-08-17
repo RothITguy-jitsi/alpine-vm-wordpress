@@ -390,7 +390,38 @@ visible symptom is a brief "Error establishing a database connection" after a
 reboot. Worth fixing with a readiness wait in `wp-container`'s start, using
 the existing `mariadb-health-check.sh`.
 
-### Nothing knows whether the site is reachable
+**Deferred deliberately, with the reason recorded.** For the author running
+installs by hand across a dozen client VMs, this is recognisable and harmless:
+you know what a cold MariaDB looks like, you wait twenty seconds, you reload.
+
+It is NOT harmless for a stranger who found this on GitHub or Gitea. Their
+first reboot shows "Error establishing a database connection" on a site they
+just built, and the reasonable conclusion is that the project is broken. That
+is the whole first impression, spent on a race condition that resolves itself.
+A public project is judged by its worst thirty seconds.
+
+So the cost of not fixing it is not downtime, it is adoption — and until it IS
+fixed, the honest mitigation is to SAY SO: the completion banner and the Tier 0
+support section now tell the reader that a brief database error after a reboot
+is expected and self-clearing. Cheap, no risk to boot ordering, and it removes
+the "looks broken" failure without pretending the race is gone.
+
+### Nothing knows whether the site is reachable — CLOSED
+
+`wp-notify.sh --heartbeat` and `--heartbeat-url` are implemented and documented,
+and the heartbeat is on the cron schedule. Absence of a ping is the signal,
+which is exactly what an on-box check cannot produce for itself.
+
+This entry stayed open after the work was done. Worth noting as its own small
+lesson: a stale TODO claiming a gap you have already closed is worse than one
+naming a real gap, because an external reviewer reads it and marks you down for
+something that works. Verify before writing "not addressed".
+
+Still true, and the reason the item existed: the heartbeat only helps if the
+URL is actually configured. `validate-wordpress.sh --check` reports when it is
+not.
+
+### (former text) Nothing knows whether the site is reachable
 
 Every check here runs *on* the VM. If it is off, unreachable, or the
 hypervisor is down, nothing reports it — the VM cannot tell you it is gone.
@@ -419,7 +450,24 @@ indication is a browser warning seen by a visitor. A check against the public
 endpoint would be cheap; a check from inside the VM cannot see the
 certificate at all, since TLS terminates at the proxy.
 
-### Bus factor
+### Bus factor — ADDRESSED (docs/KEY-CUSTODY.md)
+
+Written up as `docs/KEY-CUSTODY.md`: every secret, where it lives, what breaks
+if it is lost, and blanks to fill in per client.
+
+The point the document makes, and the reason it is worth having at all: every
+other risk on this platform is recoverable. A broken VM rebuilds, a compromised
+site restores, a bad firewall re-runs. **A lost age key is the only failure with
+no remedy** — every encrypted backup becomes permanently unreadable — and it is
+a filing problem, not a technical one. The private key is deliberately not stored
+on the VM (an attacker who reached the VM could otherwise decrypt the backups it
+just made), which is exactly what makes it a custody question.
+
+It ends with the question worth asking out loud: if you were unavailable for a
+month, could a colleague restore a client's site? If the answer depends on
+something only you know, the document is not finished.
+
+### (former) Bus factor
 
 Several things exist only in one place: the minisign secret key, the age
 backup private key, the CTI and Wordfence tokens. Losing the age key makes

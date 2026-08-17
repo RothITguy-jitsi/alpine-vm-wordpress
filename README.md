@@ -22,7 +22,7 @@ A note on how to read that sentence, and this README generally: "integrity-check
 | **Host** | Proxmox VE (anything with `qm`, `pvesm`, `pvesh`) |
 | **Guest OS** | Alpine Linux — auto-detects the newest available release (3.24 → 3.21), BIOS cloud image |
 | **Container runtime** | Podman, **rootful only** |
-| **Stack** | WordPress `6.9.4-php8.3-apache` · MariaDB `11.4` · CrowdSec `v1.7.8` |
+| **Stack** | WordPress `7.0.4-php8.4-apache` · MariaDB `11.4` · CrowdSec `v1.7.8` |
 | **Default sizing** | 2 vCPU · 4096 MB RAM · 20G disk (edit `CORES`/`RAM`/`DISK` in `lib/00-preflight.sh` to change) |
 | **Networking** | Two segmented Podman networks — `wp-front` (egress + published port) and `wp-db` (`--internal`, no egress) |
 | **Deployment profile** | `standard` (warn, don't abort, on a failed verification) or `production` (abort) — chosen at install time |
@@ -58,6 +58,7 @@ It's also honest about where it stops. Every control here states its own limits 
 ## Table of Contents
 
 - [Why I built this](#why-i-built-this)
+- [Before you use this](#before-you-use-this)
 - [What This Is](#what-this-is)
 - [Egress control (Squid)](#egress-control-squid)
 - [Checking the whole VM](#checking-the-whole-vm-at-once)
@@ -115,6 +116,39 @@ It's also honest about where it stops. Every control here states its own limits 
 - [License](#license)
 
 ---
+
+## Before you use this
+
+This runs in production, but it is worth being honest about what that means.
+
+**Who it is built for.** An MSP running a small number of client WordPress sites
+on Proxmox, where one person does the installs and knows the stack. That is the
+context every design decision was made in: prompts assume you understand the
+trade being offered, and the tooling assumes an operator rather than an
+automated pipeline.
+
+**Current state.** In use across roughly a dozen client sites. Admin MFA,
+egress filtering, checksum verification, core updates and local restore are all
+proven on real hardware. Off-site restore has a tool and a documented drill; run
+it yourself before depending on it. The `CHANGELOG.md` is deliberately a
+post-mortem log rather than a feature list — if you want to know how much of
+this was learned the hard way, read it.
+
+**What you are taking on.** This is a security-first provisioner, which means it
+says no to things. Under `DEPLOYMENT_PROFILE=production` it disables plugin
+installs from wp-admin, blocks PHP shell functions, restricts egress to an
+allowlist, and refuses to complete an install whose signature does not verify.
+Every one of those has a documented toggle and a stated reason. If you want a
+platform that gets out of your way, this is the wrong one.
+
+**Read `TODO.md` before deciding.** It lists what is not done, including things
+that will be visible to you — a brief database error on the first reboot, for
+one. Nothing there is hidden, and a stale entry claiming a gap that is actually
+closed is treated as a defect in its own right.
+
+**No support commitment.** It is MIT-licensed and public because it may be
+useful, not because there is a support contract behind it. Issues and patches
+are welcome; a response is not guaranteed.
 
 ## What This Is
 
@@ -1803,7 +1837,7 @@ In order, the script asks about:
 
 | Container | Image | Network(s) | Published port | Notable flags |
 |---|---|---|---|---|
-| `wordpress` | `wordpress:6.9.4-php8.3-apache` (or a locally-built `wordpress-geoip:*` layer if GeoIP is enabled) | `wp-front` (primary) + `wp-db` | `80:80` | `--cap-drop ALL --cap-add NET_BIND_SERVICE,SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER`, 768 MB memory cap, 200 PID limit |
+| `wordpress` | `wordpress:7.0.4-php8.4-apache` (or a locally-built `wordpress-geoip:*` layer if GeoIP is enabled) | `wp-front` (primary) + `wp-db` | `80:80` | `--cap-drop ALL --cap-add NET_BIND_SERVICE,SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER`, 768 MB memory cap, 200 PID limit |
 | `mariadb` | `mariadb:11.4` | `wp-db` only | none | `--cap-drop ALL --cap-add SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER`, 512 MB memory cap, InnoDB buffer pool capped at 256M, explicit `--network-alias mariadb` |
 | `crowdsec` | `crowdsecurity/crowdsec:v1.7.8` | host network | LAPI locked to `127.0.0.1:8080` | `--read-only --cap-drop ALL --cap-add DAC_OVERRIDE,SETUID,SETGID,CHOWN`, 512 MB memory cap |
 

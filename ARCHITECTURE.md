@@ -280,7 +280,7 @@ destroyed until the new one has proven itself — it *is* the rollback artifact.
 
 ```mermaid
 flowchart TD
-    START(["update.sh wp 6.9.4-php8.4-apache"]) --> CHK{"tag exists?<br/>Skopeo"}
+    START(["update.sh wp 7.0.4-php8.4-apache"]) --> CHK{"tag exists?<br/>Skopeo"}
     CHK -->|"no"| STOP1["stop — nothing pulled"]
     CHK --> SCAN{"Trivy scan<br/>HIGH/CRITICAL"}
     SCAN -->|"scan incomplete<br/>+ profile=production"| STOP2["refuse<br/>unknown security state"]

@@ -81,7 +81,7 @@ set -e
 # exist yet, or is missing an entry for a component (fresh VM never
 # updated through this script, or the file was lost). Once pinned.env has
 # a value for a component, THAT value is authoritative, not this constant.
-PINNED_WP_VER="7.0.3-php8.4-apache"
+PINNED_WP_VER="7.0.4-php8.4-apache"
 PINNED_DB_VER="11.4"
 PINNED_CS_VER="v1.7.8"
 WP_REGISTRY="docker.io/wordpress"
@@ -367,7 +367,7 @@ require_clean_container_state() {
 }
 
 # ── Skopeo: remote digest lookup, no image pull ────────────────────────────
-# $1 = full tag reference, e.g. docker.io/wordpress:7.0.3-php8.4-apache
+# $1 = full tag reference, e.g. docker.io/wordpress:7.0.4-php8.4-apache
 # stdout: sha256:<64 hex> on success. Returns 1 on any failure (Skopeo
 # missing, network error, unparseable output) — every caller treats that as
 # "fall back to the old method", never as fatal.
@@ -2089,7 +2089,7 @@ show_check_summary() {
   echo "     jump to a new version on their own, so an unattended update can't swap in"
   echo "     a new major WordPress or a new MariaDB line."
   echo "   • 'versions' / 'upgrade' find and move to newer RELEASES (e.g. WordPress"
-  echo "     7.0.3 -> 7.0.4 for a CVE fix). Run 'update.sh versions' to see what's out,"
+  echo "     7.0.4 -> 7.0.5 for a CVE fix). Run 'update.sh versions' to see what's out,"
   echo "     then 'update.sh upgrade' (guided, with candidate-test + rollback) or name"
   echo "     one directly: update.sh wp <version>."
   show_status
@@ -2100,7 +2100,7 @@ show_check_summary() {
 # ═══════════════════════════════════════════════════════════════════════════
 # digest-check answers "has the tag I'm on been rebuilt?" (same version, new
 # digest). This answers a different question: "has a newer VERSION been
-# published?" — e.g. you're pinned to WordPress 7.0.3 and 7.0.4 is out with a
+# published?" — e.g. you're pinned to WordPress 7.0.4 and 7.0.5 is out with a
 # security fix. It lists available tags from the registry (Skopeo list-tags),
 # filters to the real release tags for each image, and compares versions so
 # you can SEE a newer release and choose to move the pin to it. `upgrade` then

@@ -60,7 +60,26 @@ block_production() {
 # values is only to be a safe, current-enough baseline at first boot.
 #
 # Verified against upstream (Aug 2026):
-#   - WordPress 7.0.3 (2026-08-06) is a SECURITY release fixing 12 issues,
+#   - WordPress 7.0.4 (2026-08-12) fixes CVE-2026-65640, CVSS 8.8: an
+#     authenticated Author+ REMOTE CODE EXECUTION via malicious file upload,
+#     on sites where ImageMagick delegates to Ghostscript. ImageMagick
+#     identifies a file by its CONTENT, not its extension; WordPress trusted
+#     the extension. A file called holiday.png that is really PostScript became
+#     code execution.
+#
+#     Exposure here is conditional -- it needs BOTH Imagick and Ghostscript on
+#     the server -- and it needs an account with upload_files, which means
+#     Author or above (Contributors cannot upload). Neither condition makes it
+#     safe to skip: 7.0.4 shipped SIX DAYS after 7.0.3, WordPress backported
+#     the fix to the 4.7 branch, and their own guidance is that only the most
+#     recent release is actively supported.
+#
+#     It is also a reminder about the Author role specifically. This platform
+#     spends most of its effort on the administrator, and this CVE turns
+#     "permission to upload media" into code execution -- so a client's guest
+#     contributors are worth reviewing, not just their admins.
+#
+#   - The previous release, 7.0.3 (2026-08-06), fixed 12 issues including
 #     including CVE-2026-64638 -- a pre-authentication reflected XSS on the
 #     LOGIN PAGE, CVSS 8.9, which can lead to PHP code execution via the
 #     plugin/theme editor if an administrator is phished into clicking a
@@ -91,7 +110,7 @@ block_production() {
 #   - mariadb:11.4 is LTS, supported to May 2029 -- the longest runway of any
 #     current release. The bare "11.4" branch tag tracks patch releases
 #     (11.4.12 latest); "11.4-lts" is NOT a real tag and must not be used.
-WP_IMAGE="docker.io/wordpress:7.0.3-php8.4-apache"
+WP_IMAGE="docker.io/wordpress:7.0.4-php8.4-apache"
 DB_IMAGE="docker.io/mariadb:11.4"
 # BUG FIX (v7-5): v1.7.6 → v1.7.8. v1.7.8 (2026-05-11) is a security release
 # patching CVE-2026-44982 (a HIGH-impact partial WAF bypass in the AppSec
