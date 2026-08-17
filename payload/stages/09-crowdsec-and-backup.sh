@@ -27,6 +27,25 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
   else
     ok "  Squid resolvers: ${_sq_dns}"
   fi
+  # Append the page-builder domains the operator selected. Nothing is added
+  # unless it was asked for, so a site running Divi does not carry Elementor's
+  # licence server as a reachable destination.
+  if [ -n "${PAGE_BUILDER_DOMAINS:-}" ]; then
+    {
+      echo ""
+      echo "# Selected at install time (page builders / commercial themes)."
+      echo "# Remove one with:  doas wasp-egress.sh deny <domain>"
+      for _pbd in ${PAGE_BUILDER_DOMAINS}; do
+        # Only ever a domain, never a path or a scheme -- this file feeds a
+        # dstdomain ACL and a malformed entry makes Squid refuse the whole list.
+        case "$_pbd" in
+          *[!a-zA-Z0-9.-]*|'') warn "  Skipping malformed builder domain: ${_pbd}" ;;
+          *) echo "$_pbd" ;;
+        esac
+      done
+    } >> /opt/squid/config/allowlist-runtime.txt
+    ok "  Builder domains allowed: ${PAGE_BUILDER_DOMAINS}"
+  fi
   touch /opt/squid/config/allowlist-maintenance.txt
   chmod 0644 /opt/squid/config/*.txt
   # The log directory must be writable by the user squid runs as INSIDE the

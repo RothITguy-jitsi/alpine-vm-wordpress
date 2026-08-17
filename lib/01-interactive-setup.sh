@@ -85,6 +85,41 @@ echo -e "  ${BLD}  \"~91% of WordPress vulnerabilities live in plugins —${CL}"
 echo -e "  ${BLD}   where most hardening never looks. This one does.\"${CL}"
 echo -e "  ${YW}     figure: Patchstack, State of WordPress Security 2026${CL}"
 echo ""
+# ── ITEM 1: what you need BEFORE you start ───────────────────────────────────
+# Requested after a real install: an operator got several prompts deep before
+# discovering they needed an account they did not have, and had to abandon the
+# run. Everything optional is marked as such, but knowing which tab or
+# password-manager entry to open first is the difference between one sitting
+# and three.
+echo ""
+echo -e "  ${BLD}Before you start — what you will be asked for${CL}"
+echo ""
+echo -e "  ${BLD}Required${CL}"
+echo -e "    • An SSH public key ${YW}(or the installer will show you how to make one)${CL}"
+echo -e "    • A VM ID, hostname, and the IP/gateway if you want a static address"
+echo -e "    • The CIDR or addresses allowed to reach wp-admin"
+echo -e "      ${YW}your own public IP:  curl -s ifconfig.me${CL}"
+echo ""
+echo -e "  ${BLD}Optional — have these open if you want them${CL}"
+echo -e "    • ${BLD}SMTP relay${CL}  host, port, username, password"
+echo -e "      ${YW}without it there are no alert emails at all${CL}"
+echo -e "    • ${BLD}CrowdSec Console${CL}  https://app.crowdsec.net"
+echo -e "      ${YW}enrolment key (Security Engines → Enroll) and, separately,${CL}"
+echo -e "      ${YW}a CTI API key + its quota (Settings → CTI API Keys)${CL}"
+echo -e "    • ${BLD}Wordfence Intelligence${CL}  https://www.wordfence.com/threat-intel/"
+echo -e "      ${YW}free API token for plugin CVE data${CL}"
+echo -e "    • ${BLD}MaxMind${CL}  https://www.maxmind.com/en/geolite2/signup"
+echo -e "      ${YW}free account ID + licence key, only if you want GeoIP filtering${CL}"
+echo -e "    • ${BLD}Which page builder you use${CL}  Elementor, Divi, Kadence…"
+echo -e "      ${YW}so its licence server can be allowed through the egress proxy${CL}"
+echo -e "    • ${BLD}Off-site backup${CL}  an S3/R2 bucket, or an SSH target"
+echo -e "      ${YW}Cloudflare R2 and Backblaze B2 both have usable free tiers${CL}"
+echo ""
+echo -e "  ${YW}  Every optional item can be added later; none of them blocks the${CL}"
+echo -e "  ${YW}  install. But each one you skip is a control that is not running.${CL}"
+echo ""
+echo -e "  ${YW}  Budget 15-20 minutes of prompts, then ~15 minutes unattended.${CL}"
+echo ""
 echo -e "  ${YW}  Press Enter to begin.${CL}"
 read -r _INTRO_ACK
 unset _INTRO_ACK
@@ -964,17 +999,30 @@ if [[ -n "$WP_DOMAIN" ]]; then
   fi
 fi
 
-# Site title and admin email are cosmetic-but-annoying-to-change-later
-# details that the browser wizard would otherwise ask for. Collected here
-# only when a domain was given, since an IP-addressed lab VM is usually
-# throwaway and doesn't benefit from the extra prompts.
-WP_SITE_TITLE=""
+# The SITE TITLE prompt used to be here and has been removed. It claimed to
+# save you retyping it in the browser wizard, but nothing ever applied it --
+# WordPress asked again anyway, so it was pure duplicate typing. (Reported
+# from a real install: "what is the point if I have to retype that during
+# WordPress setup?" -- a fair question with no good answer.) The From-name
+# for outbound mail now defaults from the domain instead.
+WP_SITE_TITLE="${WP_DOMAIN:-WordPress}"
 WP_ADMIN_EMAIL=""
 if [[ -n "$WP_DOMAIN" ]]; then
-  read -rp "  Site title [${WP_DOMAIN}] : " WP_SITE_TITLE
-  WP_SITE_TITLE="${WP_SITE_TITLE:-$WP_DOMAIN}"
+  # NOT the WordPress admin email. This one is genuinely different and is not
+  # duplicate typing: it is where THE VM ITSELF sends operational alerts --
+  # backup failures, malware findings, vulnerability reports, the heartbeat.
+  # For an MSP that is usually your address, not the client's, and it must
+  # keep working even when WordPress is down, which is why it is host-side
+  # and separate from anything configured inside WordPress.
+  echo ""
+  echo -e "  ${BLD}Where should this VM send its own alerts?${CL}"
+  echo -e "  ${YW}This is NOT the WordPress admin email you will set in the setup${CL}"
+  echo -e "  ${YW}wizard. It is the operator address for backup failures, malware${CL}"
+  echo -e "  ${YW}findings and the heartbeat -- alerts that must arrive even when${CL}"
+  echo -e "  ${YW}WordPress itself is broken. For an MSP this is usually you, not${CL}"
+  echo -e "  ${YW}the client.${CL}"
   while :; do
-    read -rp "  Admin email for WordPress (recovery/notifications, blank = skip) : " WP_ADMIN_EMAIL
+    read -rp "  Operator alert email (blank = syslog only) : " WP_ADMIN_EMAIL
     [ -z "$WP_ADMIN_EMAIL" ] && break
     # Deliberately permissive: enough to catch a typo like a missing @ or a
     # stray space, without pretending to implement RFC 5322.
@@ -1065,6 +1113,12 @@ echo -e "  ${YW}  decision rather than a default you did not notice.${CL}"
 echo -e "  ${YW}  Skipping loses only the console and the shared blocklist. Local${CL}"
 echo -e "  ${YW}  detection and the firewall bouncer work exactly the same either way.${CL}"
 _sec_note
+echo -e "  ${YW}  You will be asked for a SECOND CrowdSec value later in this run --${CL}"
+echo -e "  ${YW}  a CTI API key, for enriching bans with reputation data. Both come${CL}"
+echo -e "  ${YW}  from the same console, so copy both now and you will not have to${CL}"
+echo -e "  ${YW}  go back to it:${CL}"
+echo -e "  ${YW}    enrolment key : Security Engines → Enroll${CL}"
+echo -e "  ${YW}    CTI API key   : Settings → CTI API Keys  (note its quota too)${CL}"
 read -rsp "  CrowdSec enrolment key (blank = skip, enrol manually later) : " CROWDSEC_ENROLL_KEY; echo
 
 # ── ClamAV (optional malware signature layer) ────────────────────────────────
@@ -1379,6 +1433,63 @@ case "${_EP}" in
 esac
 unset _EP
 
+# ── Page builders / commercial themes ────────────────────────────────────────
+# Only asked when the egress proxy is on, because without it the allowlist is
+# not enforcing anything and this question has no consequence.
+#
+# These used to be baked into the shipped allowlist -- all nine of them. That
+# was backwards: the allowlist is the set of destinations a COMPROMISED
+# WordPress may still reach, so shipping Elementor's licence server to a site
+# that runs Divi is pure surface for no benefit. Now nothing is allowed unless
+# it is asked for.
+PAGE_BUILDER_DOMAINS=""
+if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
+  echo ""
+  echo -e "  ${BLD}Commercial themes or page builders?${CL}"
+  echo -e "  ${YW}A paid theme that cannot reach its licence server installs fine${CL}"
+  echo -e "  ${YW}and then never updates -- which for a page builder means it${CL}"
+  echo -e "  ${YW}silently stops receiving security fixes. If you use one, allow${CL}"
+  echo -e "  ${YW}it here.${CL}"
+  echo ""
+  echo -e "  ${YW}Pick ONLY what this site will actually run. Each one you add is a${CL}"
+  echo -e "  ${YW}destination a compromised WordPress may reach; you can add more${CL}"
+  echo -e "  ${YW}later with:  doas wasp-egress.sh allow <domain>${CL}"
+  echo ""
+  echo "    1) Elementor            .elementor.com"
+  echo "    2) Divi / Elegant Themes .elegantthemes.com"
+  echo "    3) WPBakery             .wpbakery.com"
+  echo "    4) Beaver Builder       .beaverbuilder.com"
+  echo "    5) Kadence              .kadencewp.com"
+  echo "    6) Astra                .wpastra.com"
+  echo "    7) GeneratePress        .generatepress.com"
+  echo "    8) OceanWP              .oceanwp.org"
+  echo "    9) ThemeIsle            .themeisle.com"
+  echo ""
+  read -rp "  Numbers, comma or space separated (blank = none) : " _PB
+  for _n in $(printf '%s' "${_PB}" | tr ',;' '  '); do
+    case "$_n" in
+      1) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .elementor.com" ;;
+      2) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .elegantthemes.com" ;;
+      3) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .wpbakery.com" ;;
+      4) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .beaverbuilder.com" ;;
+      5) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .kadencewp.com" ;;
+      6) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .wpastra.com" ;;
+      7) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .generatepress.com" ;;
+      8) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .oceanwp.org" ;;
+      9) PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS} .themeisle.com" ;;
+      '') : ;;
+      *) msg_warn "  Ignoring '${_n}' — not one of the listed numbers." ;;
+    esac
+  done
+  PAGE_BUILDER_DOMAINS="${PAGE_BUILDER_DOMAINS# }"
+  if [[ -n "$PAGE_BUILDER_DOMAINS" ]]; then
+    msg_ok "Builder domains allowed: ${PAGE_BUILDER_DOMAINS}"
+  else
+    msg_ok "No builder domains allowed — add later with: doas wasp-egress.sh allow <domain>"
+  fi
+  unset _PB _n
+fi
+
 # ── Multi-factor authentication for admins ───────────────────────────────────
 echo ""
 echo -e "  ${BLD}Require two-factor authentication for administrators?${CL}"
@@ -1444,7 +1555,8 @@ echo -e "  ${YW}  an incident.${CL}"
 echo -e "  ${YW}  Get a free key in the CrowdSec Console under Settings →${CL}"
 echo -e "  ${YW}  CTI API Keys. Skipping costs nothing else.${CL}"
 _sec_note
-CTI_API_KEY=""; CTI_MONTHLY_BUDGET="40"; CTI_ENRICH_BANS="0"
+CTI_API_KEY=""; CTI_MONTHLY_BUDGET="120"; CTI_ENRICH_BANS="0"
+echo -e "  ${YW}  This is the second CrowdSec value (Settings → CTI API Keys).${CL}"
 read -rsp "  CrowdSec CTI key (blank = skip) : " CTI_API_KEY; echo
 if [[ -n "$CTI_API_KEY" ]]; then
   msg_ok "CTI key captured (${#CTI_API_KEY} chars)"
@@ -1454,12 +1566,20 @@ if [[ -n "$CTI_API_KEY" ]]; then
   # Both are "the free key" depending on who you ask. The budget matters
   # because exhausting it mid-month silently stops enrichment.
   echo ""
-  echo -e "  ${YW}  Free-key quotas (CrowdSec Console → Settings → CTI API Keys):${CL}"
-  echo -e "  ${YW}    Community plan  →  40 lookups/month${CL}"
-  echo -e "  ${YW}    Premium plan    →  120 lookups/month (included free key)${CL}"
-  echo -e "  ${YW}  Paid keys start at 5,000/month. Unused quota does NOT roll over.${CL}"
-  read -rp "  Monthly lookup budget [40] : " _CTB
-  case "${_CTB}" in ''|*[!0-9]*) CTI_MONTHLY_BUDGET=40 ;; *) CTI_MONTHLY_BUDGET="$_CTB" ;; esac
+  echo -e "  ${YW}  READ YOUR OWN QUOTA — do not trust a number from anywhere else,${CL}"
+  echo -e "  ${YW}  including this installer. CrowdSec's own documentation${CL}"
+  echo -e "  ${YW}  contradicts itself: the CTI API Keys page says a Community free${CL}"
+  echo -e "  ${YW}  key is 40/month, while the Premium Upgrade page lists Community${CL}"
+  echo -e "  ${YW}  as 120 calls/month. A free Community account has been observed${CL}"
+  echo -e "  ${YW}  reporting 120, so that is the default here.${CL}"
+  echo -e "  ${YW}${CL}"
+  echo -e "  ${YW}  Your console shows the real figure:${CL}"
+  echo -e "  ${YW}    Settings → CTI API Keys  (next to the key itself)${CL}"
+  echo -e "  ${YW}  Unused quota does NOT roll over. Paid keys start at 5,000/month.${CL}"
+  echo -e "  ${YW}  Setting this too HIGH is the risk: the budget is what stops${CL}"
+  echo -e "  ${YW}  enrichment burning the month's quota in a single busy day.${CL}"
+  read -rp "  Monthly lookup budget [120] : " _CTB
+  case "${_CTB}" in ''|*[!0-9]*) CTI_MONTHLY_BUDGET=120 ;; *) CTI_MONTHLY_BUDGET="$_CTB" ;; esac
   echo ""
   echo -e "  ${BLD}Automatically enrich login brute-force bans?${CL}"
   echo -e "  ${YW}Only bans from the login-guard scenario — an address that${CL}"
@@ -1548,15 +1668,27 @@ if [[ -n "$WORDFENCE_API_KEY" ]]; then
   echo -e "  ${YW}  reason before a resource one: using it ALONE narrows what you${CL}"
   echo -e "  ${YW}  detect. Richer records about issues you already know of are${CL}"
   echo -e "  ${YW}  worth less than knowing about the issue that landed today.${CL}"
-  echo -e "  ${YW}  Choose 'both' if you want the detail without giving up the${CL}"
-  echo -e "  ${YW}  early warning; that is the only combination with no blind${CL}"
-  echo -e "  ${YW}  spot, and it costs disk and parse time rather than accuracy.${CL}"
+  echo -e "  ${YW}  'both' has no coverage blind spot, but it is NOT free: Wordfence${CL}"
+  echo -e "  ${YW}  rate-limits by REQUEST, not by bytes, so asking for two feeds in${CL}"
+  echo -e "  ${YW}  one run can get the second refused with a 429. Observed in the${CL}"
+  echo -e "  ${YW}  field: two refusals and two pointless 20-second waits back to${CL}"
+  echo -e "  ${YW}  back. The tool now skips the production feed when the scanner${CL}"
+  echo -e "  ${YW}  request was refused, and waits 60s between them when it was not,${CL}"
+  echo -e "  ${YW}  so 'both' works -- it is just slower and more fragile.${CL}"
+  echo ""
+  echo -e "  ${YW}  Recommendation: stay on 'scanner' unless you have a specific${CL}"
+  echo -e "  ${YW}  reason. It carries the vulnerabilities still under research,${CL}"
+  echo -e "  ${YW}  which is the half that matters for early warning, and it is one${CL}"
+  echo -e "  ${YW}  small request rather than one small and one 100 MB.${CL}"
   _sec_note
-  read -rp "  Feed? [scanner/production/both] (default: scanner) : " _WFF
-  case "${_WFF:-scanner}" in
-    production|prod) WORDFENCE_FEED="production" ;;
-    both|all)        WORDFENCE_FEED="both" ;;
-    *)               WORDFENCE_FEED="scanner" ;;
+  echo "    1) scanner     — early warning, small request (recommended)"
+  echo "    2) production  — richer records, no early warning"
+  echo "    3) both        — no blind spot, but rate-limit prone"
+  read -rp "  Feed? [1] : " _WFF
+  case "${_WFF:-1}" in
+    2|production|prod) WORDFENCE_FEED="production" ;;
+    3|both|all)        WORDFENCE_FEED="both" ;;
+    *)                 WORDFENCE_FEED="scanner" ;;
   esac
   unset _WFF
   msg_ok "Wordfence feed: ${WORDFENCE_FEED}"

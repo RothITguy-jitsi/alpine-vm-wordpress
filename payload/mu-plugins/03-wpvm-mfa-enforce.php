@@ -1,10 +1,9 @@
 <?php
 /**
- * Plugin Name: WPVM MFA Enforcement
- * Description: Requires two-factor authentication for administrators, using the
- *              WordPress.org "Two Factor" plugin. Installed by the WASP
- *              provisioner — do not edit by hand.
- *
+ * Plugin Name: WASP — MFA Enforcement
+ * Description: Requires administrators to hold a configured second factor via the Two Factor plugin, and closes the REST and application-password routes that would otherwise let an admin skip it. Built around recovery: a grace window before blocking, backup codes count, and a console reset if every factor is lost. Deleting this file disables the requirement — it does not lock anyone out.
+ * Author: RothITguy
+ * Version: 1.0
  * WHY THIS EXISTS AS A SEPARATE PIECE
  *
  * The Two Factor plugin (maintained by the WordPress core contributors) provides

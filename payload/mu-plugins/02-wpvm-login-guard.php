@@ -1,10 +1,9 @@
 <?php
 /**
- * Plugin Name: WPVM Login Guard
- * Description: Rate-limits failed logins with a progressive lockout, removes
- *              WordPress's username-enumeration leak in its login errors, and
- *              logs failures in a form CrowdSec can act on.
+ * Plugin Name: WASP — Login Guard
+ * Description: Rate-limits failed logins with a progressive lockout, and removes the message that tells an attacker which usernames are real. Feeds every outcome to CrowdSec so a persistent source gets banned at the firewall rather than merely slowed down here.
  * Author: RothITguy
+ * Version: 1.0
  *
  * WHY THIS EXISTS RATHER THAN A PLUGIN
  *

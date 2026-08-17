@@ -54,7 +54,11 @@ _note() { printf '     %s\n' "$1"; }
 _hdr()  { printf '\n\033[1m%s\033[0m\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' "$1"; }
 
 _mode() {
-  if [ -s "$MAINT" ] && grep -qv '^#' "$MAINT" 2>/dev/null; then echo MAINTENANCE
+  # The placeholder entry exists only to stop Squid warning about an empty ACL
+  # (see the header of allowlist-maintenance.txt). It is NOT a maintenance
+  # window, and treating it as one would have left every VM permanently
+  # reporting MAINTENANCE.
+  if [ -s "$MAINT" ] && grep -vE '^\s*(#|$)|^wasp-placeholder\.invalid$' "$MAINT" 2>/dev/null | grep -q .; then echo MAINTENANCE
   else echo STRICT; fi
 }
 
@@ -66,7 +70,9 @@ _expire_maint() {
   _until=$(sed -n 's/^until=//p' "$MAINT_META" 2>/dev/null)
   [ -n "$_until" ] || return 0
   if [ "$(date -u +%s)" -ge "$_until" ]; then
-    : > "$MAINT"
+    # Restore the placeholder rather than truncating to nothing, or Squid
+    # starts warning about an empty ACL again the moment a window expires.
+    printf 'wasp-placeholder.invalid\n' > "$MAINT"
     _why=$(sed -n 's/^reason=//p' "$MAINT_META" 2>/dev/null)
     rm -f "$MAINT_META"
     podman exec squid squid -k reconfigure 2>/dev/null || podman restart squid >/dev/null 2>&1
@@ -91,7 +97,7 @@ status)
     _bad "Squid is NOT running"
     _note "WordPress web egress is therefore failing — which is the intended"
     _note "behaviour, not a secondary fault. The boundary fails closed."
-    _note "  podman logs --tail 30 squid"
+    _note "  doas podman logs --tail 30 squid"
   fi
 
   echo ""
@@ -103,7 +109,7 @@ status)
     echo ""
     _warn "MAINTENANCE window open:"
     sed 's/^/    /' "$MAINT_META" 2>/dev/null
-    grep -vE '^\s*(#|$)' "$MAINT" 2>/dev/null | sed 's/^/    + /'
+    grep -vE '^\s*(#|$)|^wasp-placeholder\.invalid$' "$MAINT" 2>/dev/null | sed 's/^/    + /'
   fi
 
   echo ""
@@ -218,8 +224,15 @@ test)
   # The core version-check endpoint, which returns 200 and is what WordPress
   # itself calls. The bare root of api.wordpress.org does not return 200, so
   # probing it made a working proxy look broken.
+  # NOTE the http:// scheme, deliberately. PHP's stream wrapper cannot perform
+  # a CONNECT tunnel, so an https:// URL through a proxy returns nothing at all
+  # and the probe reports "no response" for a proxy that is answering fine --
+  # which happened on a live VM while Squid's own log showed a clean
+  # TCP_DENIED/403. A plain http:// request goes through the same ACL chain
+  # (source, method, destination allowlist), which is what this test is for.
+  # Real HTTPS reachability is proven separately by the plugin install itself.
   _tc allow "api.wordpress.org via proxy" \
-     "https://api.wordpress.org/core/version-check/1.7/"
+     "http://api.wordpress.org/core/version-check/1.7/"
 
   echo ""
   echo "  Through the proxy — everything else should be refused:"
@@ -259,7 +272,7 @@ test)
     _note "A failure on a 'no proxy' line means the firewall is not enforcing"
     _note "the restriction and only WordPress's own settings are. Any plugin"
     _note "that opens its own socket walks straight past it."
-    _note "  nft list ruleset | grep -A6 'wp-front egress'"
+    _note "  doas nft list ruleset | grep -A6 'wp-front egress'"
     exit 1
   fi
   _ok "WordPress can reach approved destinations only, and cannot go round the proxy."

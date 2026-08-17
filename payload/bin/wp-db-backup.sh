@@ -111,8 +111,8 @@ if [ "${BACKUP_OK}" != "1" ]; then
     fi
     printf '   Common causes, in the order worth checking:\n'
     printf '     df -h /                          # a full disk is the most common\n'
-    printf '     podman ps --filter name=mariadb  # is the database running?\n'
-    printf '     podman logs --tail 30 mariadb\n'
+    printf '     doas podman ps --filter name=mariadb  # is the database running?\n'
+    printf '     doas podman logs --tail 30 mariadb\n'
   } >&2
   # Email on failure. A backup that has been failing silently for months is
   # the single most common way people discover they have no backups -- at the
@@ -126,7 +126,7 @@ if [ "${BACKUP_OK}" != "1" ]; then
       printf 'Check:\n'
       printf '  wp-db-backup.sh            # run one now\n'
       printf '  validate-wordpress.sh --section backups\n'
-      printf '  podman logs --tail 30 mariadb\n'
+      printf '  doas podman logs --tail 30 mariadb\n'
       printf '  df -h /                    # a full disk is a common cause\n'
     } > "$_bb"
     # Deliberately NOT deduplicated by content: a repeated failure is the

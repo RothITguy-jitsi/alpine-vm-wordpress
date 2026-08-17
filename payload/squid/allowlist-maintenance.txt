@@ -1,0 +1,11 @@
+# Seeded with a placeholder that can never match a real request.
+#
+# Squid warns "WARNING: empty ACL" for a dstdomain list with no entries, on
+# every parse. The maintenance list is legitimately empty on a fresh install, so
+# that warning fired forever and became background noise -- and the production
+# fail-closed check reads this parse output. A config whose normal state is
+# "two warnings" is a config where the third one goes unnoticed.
+#
+# .invalid is reserved by RFC 2606 and can never resolve, so this entry is
+# inert. Delete it once you add real entries, or leave it; it costs nothing.
+wasp-placeholder.invalid

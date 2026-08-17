@@ -48,3 +48,15 @@ ghcr.io
 # exfiltration path, and a site that visibly breaks without one is a site
 # whose dependency you have just discovered. Add them if a client's site
 # genuinely needs them, after discovery has shown it does.
+
+# ── Commercial themes and page builders ──────────────────────────────────────
+# DELIBERATELY EMPTY. Builder licence domains are chosen at install time and
+# appended below, so a site that does not run Elementor never carries
+# elementor.com as a reachable destination.
+#
+# An earlier version shipped nine of them baked in, which was backwards: this
+# file is the list of places a COMPROMISED WordPress may still reach, so every
+# unused entry is pure surface for no benefit.
+#
+# Add one later:   doas wasp-egress.sh allow .elementor.com
+# See what a site actually needs:  doas wasp-egress.sh discovery

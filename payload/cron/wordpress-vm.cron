@@ -75,3 +75,9 @@
 # healthy certificate and be ignored within a week. At 14, automatic renewal
 # has had time to run and has not.
 0 9 * * * /usr/local/bin/wp-hardening.sh tls-check >/dev/null 2>&1
+
+# Weekly file-integrity check: core and plugin files vs WordPress.org
+# checksums. Detects a backdoor injected into an existing plugin, which is how
+# most WordPress compromises persist. Output goes to syslog tagged
+# wasp-integrity in key=value form for a SIEM to decode; a FAIL is auth.crit.
+30 4 * * 1 /usr/local/bin/wp-plugins.sh verify >/dev/null 2>&1

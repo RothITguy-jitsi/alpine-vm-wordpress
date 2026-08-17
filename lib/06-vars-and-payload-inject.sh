@@ -84,6 +84,7 @@ OFFSITE_RETAIN=$(_vars_q "${OFFSITE_RETAIN:-14}")
 OFFSITE_APPEND_ONLY=$(_vars_q "${OFFSITE_APPEND_ONLY:-unknown}")
 GOVERNANCE_EMAIL=$(_vars_q "${GOVERNANCE_EMAIL:-}")
 EGRESS_PROXY=$(_vars_q "${EGRESS_PROXY:-0}")
+PAGE_BUILDER_DOMAINS=$(_vars_q "${PAGE_BUILDER_DOMAINS:-}")
 MFA_ENFORCE=$(_vars_q "${MFA_ENFORCE:-0}")
 MFA_GRACE_DAYS=$(_vars_q "${MFA_GRACE_DAYS:-7}")
 CTI_ENRICH_BANS=$(_vars_q "${CTI_ENRICH_BANS:-0}")
@@ -163,7 +164,7 @@ fi
 if [[ -n "${CTI_API_KEY:-}" ]]; then
   {
     printf 'CTI_API_KEY=%s\n'         "$CTI_API_KEY"
-    printf 'CTI_MONTHLY_BUDGET=%s\n'  "${CTI_MONTHLY_BUDGET:-40}"
+    printf 'CTI_MONTHLY_BUDGET=%s\n'  "${CTI_MONTHLY_BUDGET:-120}"
     printf 'CTI_ENRICH_BANS=%s\n'     "${CTI_ENRICH_BANS:-0}"
   } > "$MNT/etc/wp-install/cti.conf"
   chmod 600 "$MNT/etc/wp-install/cti.conf"

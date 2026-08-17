@@ -25,7 +25,7 @@ if [ -f /etc/nftables.nft ]; then
     sed 's/^/       /' /tmp/nft-check.err | head -5
     warn "  The generated /etc/nftables.nft has a syntax error. This usually means a"
     warn "  CIDR/IP value contained something unexpected. Inspect it, fix by hand, then:"
-    warn "    nft -c -f /etc/nftables.nft   (check)   &&   nft -f /etc/nftables.nft   (load)"
+    warn "    doas nft -c -f /etc/nftables.nft   (check)   &&   doas nft -f /etc/nftables.nft   (load)"
   fi
   rm -f /tmp/nft-check.err
 else
@@ -408,7 +408,7 @@ _verify_mfa_mu_plugin() {
     fi
   else
     warn "MFA mu-plugin failed php -l — NOT enforcing. Inspect:"
-    warn "  podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php"
+    warn "  doas podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php"
   fi
 }
 

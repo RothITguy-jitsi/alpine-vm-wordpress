@@ -257,7 +257,7 @@ _wp() {
   if ! podman ps --filter 'name=^wordpress$' --filter status=running --format '{{.Names}}' \
        | grep -qx wordpress; then
     echo "✗  The 'wordpress' container is not running — start it first:" >&2
-    echo "     rc-service wp-container start" >&2
+    echo "     doas rc-service wp-container start" >&2
     exit 1
   fi
   # The official WordPress image's wp-config.php reads DB_NAME/DB_USER/
@@ -298,6 +298,7 @@ _wp() {
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     ${_wpcli_proxy} \
+    ${WPCLI_MOUNT:-} \
     -v "${WP_HTML_DIR}:/var/www/html" \
     "$WPCLI_IMAGE" wp --path=/var/www/html "$@"
 }
@@ -464,6 +465,279 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
   echo "  sourced from MITRE remain (c) MITRE Corporation."
 }
 
+# ── Verify core and plugin files against WordPress.org checksums ─────────────
+# Detects a plugin or core file that has been MODIFIED since it was installed:
+# the signature of a backdoor injected through a vulnerable plugin, which is how
+# most WordPress compromises actually persist.
+#
+# WHY THE EXIT CODE IS NOT TRUSTED
+#
+# wp-cli's own exit status is not a safe pass/fail here, and this is documented
+# behaviour rather than a bug. `wp plugin verify-checksums --all` reports e.g.
+# "Verified 2 of 3 plugins (1 skipped)" and STILL EXITS 0 -- the skip happens
+# because a plugin has no checksum published on WordPress.org, which is true of
+# every commercial plugin and every bespoke one. A caller that trusts the exit
+# code sees success while a plugin went unchecked.
+#
+# So this parses the counts, compares verified against total, and reports the
+# three states separately, because they mean completely different things:
+#
+#   VERIFIED  the files match what WordPress.org published
+#   MODIFIED  they do NOT match -- investigate, this is the finding
+#   SKIPPED   no published checksum exists -- EXPECTED for Divi, Elementor Pro
+#             and anything bespoke, and NOT a problem, but it does mean those
+#             files are outside this control and need integrity cover elsewhere
+#
+# Exits nonzero only on MODIFIED. Skipped items are reported, never counted as
+# failures, and never hidden.
+# SIEM CONTRACT (Wazuh and friends)
+# Every outcome is written to syslog with tag `wasp-integrity` in key=value
+# form, so a rule can match on fields rather than parsing prose that will
+# change. The shape is stable; treat it as an interface:
+#
+#   wasp_integrity result=PASS|FAIL|SKIP component=core|plugins|all reason=...
+#
+#   auth.crit    result=FAIL  -> alert. A modified core or plugin file.
+#   auth.notice  result=SKIP  -> informational. Commercial/bespoke plugins have
+#                                no published checksum; expected, but it means
+#                                those files need FIM cover from the SIEM side.
+#   auth.info    result=PASS  -> healthy run, useful for proving the check ran.
+#
+# A Wazuh decoder matching `wasp_integrity` and alerting on `result=FAIL` is
+# the whole integration. Nothing here needs an agent-side script.
+do_verify() {
+  _strict=0; _json=0
+  for _a in "$@"; do
+    case "$_a" in
+      --strict) _strict=1 ;;
+      --json)   _json=1 ;;
+    esac
+  done
+
+  _findings=0
+  echo ""
+  echo "File integrity — core and plugins vs WordPress.org checksums"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # ── Core ──────────────────────────────────────────────────────────────────
+  _core_rc=0
+  _core_out=$(_wp core verify-checksums 2>&1) || _core_rc=$?
+  if printf '%s' "$_core_out" | grep -q "Success:"; then
+    echo "  [PASS] WordPress core matches published checksums"
+  else
+    echo "  [FAIL] WordPress core does NOT match published checksums"
+    printf '%s\n' "$_core_out" | grep -iE "doesn't verify|warning" | head -20 | sed 's/^/         /'
+    echo "         A modified core file is either a bad update or a backdoor."
+    echo "         Compare before assuming the worst:  doas wp-malware-scan.sh core"
+    _findings=$((_findings+1))
+    logger -t wasp-integrity -p auth.crit "wasp_integrity result=FAIL component=core reason=checksum_mismatch" 2>/dev/null || true
+  fi
+
+  # ── Plugins ───────────────────────────────────────────────────────────────
+  _pl_rc=0
+  _pl_args="--all"
+  [ "$_strict" = 1 ] && _pl_args="--all --strict"
+  # shellcheck disable=SC2086
+  _pl_out=$(_wp plugin verify-checksums $_pl_args 2>&1) || _pl_rc=$?
+
+  # "Verified 2 of 3 plugins (1 skipped)" -- parse, do not trust the status.
+  _ver=$(printf '%s' "$_pl_out" | sed -n 's/.*Verified \([0-9]*\) of \([0-9]*\) plugin.*/\1/p' | head -1)
+  _tot=$(printf '%s' "$_pl_out" | sed -n 's/.*Verified \([0-9]*\) of \([0-9]*\) plugin.*/\2/p' | head -1)
+  _skip=$(printf '%s' "$_pl_out" | sed -n 's/.*(\([0-9]*\) skipped).*/\1/p' | head -1)
+  : "${_ver:=0}" ; : "${_tot:=0}" ; : "${_skip:=0}"
+
+  _mismatch=$(printf '%s' "$_pl_out" | grep -icE "doesn't verify|does not verify|checksum.*(mismatch|error)" || true)
+
+  # ARITHMETIC, not phrasing. total - verified - skipped is the number of
+  # plugins that were checked and FAILED. This does not depend on wp-cli's
+  # wording, which can change between releases and has; grepping for
+  # "doesn't verify" is a good hint but a bad primary test. If the numbers say
+  # something failed, treat it as failed even when no message matched.
+  _unaccounted=0
+  if [ "${_tot:-0}" -gt 0 ]; then
+    _unaccounted=$(( _tot - _ver - _skip ))
+    [ "$_unaccounted" -lt 0 ] && _unaccounted=0
+  fi
+  if [ "$_unaccounted" -gt 0 ] && [ "${_mismatch:-0}" -eq 0 ]; then
+    echo "  [FAIL] ${_unaccounted} plugin(s) neither verified nor skipped."
+    echo "         wp-cli printed no matching message, but the counts do not"
+    echo "         add up: ${_ver} verified + ${_skip} skipped is less than"
+    echo "         ${_tot} total. Treating that as a failure rather than"
+    echo "         assuming the silence is benign."
+    _findings=$((_findings+1))
+    logger -t wasp-integrity -p auth.crit "wasp_integrity result=FAIL component=plugins reason=unaccounted count=${_unaccounted} total=${_tot}" 2>/dev/null || true
+  fi
+
+  if [ "${_mismatch:-0}" -gt 0 ]; then
+    echo "  [FAIL] ${_mismatch} plugin file(s) do NOT match published checksums"
+    printf '%s\n' "$_pl_out" | grep -iE "doesn't verify|does not verify" | head -20 | sed 's/^/         /'
+    _findings=$((_findings+1))
+    logger -t wasp-integrity -p auth.crit "wasp_integrity result=FAIL component=plugins reason=checksum_mismatch files=${_mismatch}" 2>/dev/null || true
+  else
+    echo "  [PASS] ${_ver} of ${_tot} plugin(s) match published checksums"
+  fi
+
+  if [ "${_skip:-0}" -gt 0 ]; then
+    echo "  [SKIP] ${_skip} plugin(s) have no published checksum to compare against."
+    echo "         Expected for commercial or bespoke plugins -- WordPress.org"
+    echo "         only publishes checksums for what it distributes. NOT a"
+    echo "         failure, but those files are outside this control:"
+    printf '%s\n' "$_pl_out" | grep -iE "skipp|no checksum|not found" | head -10 | sed 's/^/           /'
+    logger -t wasp-integrity -p auth.notice "wasp_integrity result=SKIP component=plugins reason=no_published_checksum count=${_skip}" 2>/dev/null || true
+  fi
+
+  echo ""
+  if [ "$_findings" -gt 0 ]; then
+    echo "  RESULT: ${_findings} integrity finding(s). This is worth acting on."
+    echo "    doas wp-malware-scan.sh full"
+    echo "    doas wp-forensics.sh timeline"
+    return 1
+  fi
+  echo "  RESULT: no modified files detected."
+  [ "${_skip:-0}" -gt 0 ] && echo "  (with ${_skip} plugin(s) unverifiable — see SKIP above)"
+  logger -t wasp-integrity -p auth.info "wasp_integrity result=PASS component=all core=ok plugins_verified=${_ver} plugins_total=${_tot} plugins_skipped=${_skip}" 2>/dev/null || true
+  return 0
+}
+
+# ── Install a theme or plugin from a LOCAL zip ───────────────────────────────
+# For commercial products -- Divi, Elementor Pro, a client's bespoke plugin --
+# that are not in the WordPress.org directory and never will be.
+#
+# WHY THIS IS SEPARATE FROM `install`, AND WHY IT DOES NOT TAKE A URL
+#
+# `install <slug>` deliberately refuses URLs and ZIPs: its whole guarantee is
+# that the code came from the official directory over TLS and nowhere else.
+# Weakening that to accept an arbitrary URL would turn one auditable path into
+# "download and run anything", which is the supply-chain shape this platform
+# refuses everywhere else.
+#
+# So this takes a LOCAL FILE that the operator deliberately placed on the VM.
+# The trust decision is made off-box, by a human, at scp time -- not by this
+# script at runtime. It records a SHA-256 either way, so what was installed can
+# be compared later against what the vendor shipped.
+#
+# WHY THE ZIP SHOULD NOT LIVE IN YOUR GIT REPOSITORY
+#
+# Tempting, and wrong for four reasons. It freezes the theme at one version
+# while the vendor keeps shipping security fixes. It puts ~30 MB in git history
+# forever. It does not save the licensing step, since each site still needs its
+# own vendor API key to activate and receive updates. And the GPL covers the
+# code, not the trademark -- redistributing a commercial product under your own
+# name is a poor look for an MSP even where it is lawful. Keep the zip in your
+# own asset store, scp it per install, and let the vendor's updater take over
+# once the licence is activated.
+do_install_file() {
+  _zip=""; _activate=0; _want_sha=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --activate) _activate=1 ;;
+      --sha256)   _want_sha="${2:-}"; shift ;;
+      http*://*)
+        echo "✗  Refusing a URL. Download it yourself, check it, copy it here:" >&2
+        echo "     scp theme.zip admin@<vm>:/var/lib/wasp-import/incoming/" >&2
+        echo "   Then:  doas wp-plugins.sh install-file /var/lib/wasp-import/incoming/theme.zip" >&2
+        return 1 ;;
+      -*) : ;;
+      *) [ -z "$_zip" ] && _zip="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$_zip" ] || { echo "Usage: wp-plugins.sh install-file <file.zip> [--activate] [--sha256 <hash>]" >&2; return 1; }
+  [ -f "$_zip" ] || { echo "✗  No such file: ${_zip}" >&2; return 1; }
+  case "$_zip" in *.zip) : ;; *) echo "✗  Not a .zip: ${_zip}" >&2; return 1 ;; esac
+  # The path becomes part of a `-v host:container:ro` argument that is expanded
+  # UNQUOTED (podman needs the flag and value as separate words). A filename
+  # containing a space or a semicolon would therefore word-split into garbage
+  # arguments -- not a shell injection, since nothing re-evaluates the value,
+  # but a broken mount and a baffling error at the worst moment. Constrain the
+  # charset instead of trying to quote around it.
+  case "$_zip" in
+    *[!A-Za-z0-9._/-]*)
+      echo "✗  Refusing that path: it contains characters that would break the" >&2
+      echo "   container mount argument (spaces, quotes, semicolons and the" >&2
+      echo "   like). Rename it to letters, digits, dot, dash, underscore:" >&2
+      echo "     mv \"${_zip}\" ./divi.zip" >&2
+      return 1 ;;
+  esac
+
+  # Integrity. If the operator supplied a hash, it must match -- that is the
+  # only point at which a corrupted or swapped download gets caught.
+  _got_sha=$(sha256sum "$_zip" 2>/dev/null | awk '{print $1}')
+  if [ -n "$_want_sha" ]; then
+    if [ "$_got_sha" != "$_want_sha" ]; then
+      echo "✗  SHA-256 MISMATCH — refusing to install." >&2
+      echo "     expected: ${_want_sha}" >&2
+      echo "     actual  : ${_got_sha}" >&2
+      return 1
+    fi
+    echo "  ✔  SHA-256 verified"
+  else
+    echo "  ℹ  No --sha256 given. Recording what was installed:"
+    echo "       ${_got_sha}"
+    echo "     Pass it next time so a swapped file is caught."
+  fi
+
+  # wp-cli needs the file inside its container -- but NOT inside the web root.
+  #
+  # An earlier version copied it to wp-content/upgrade/, which is served by
+  # Apache. Only wp-content/uploads is protected here, and the .zip extension
+  # is blocked by the 8G ruleset -- which is a TOGGLE (`wp-hardening.sh disable
+  # 8g`). So on a VM with 8G off, a commercial theme or a client's bespoke
+  # plugin was downloadable by anyone who guessed the filename during the
+  # install window. Small window, real disclosure, and the kind of thing a
+  # security review finds immediately.
+  #
+  # Mounting the file read-only at /tmp inside the wp-cli container removes the
+  # web root from the path entirely. Nothing is ever written under the docroot.
+  _base=$(basename "$_zip")
+  _abs=$(cd "$(dirname "$_zip")" 2>/dev/null && pwd)/"$_base"
+  [ -f "$_abs" ] || { echo "✗  Could not resolve ${_zip}" >&2; return 1; }
+  WPCLI_MOUNT="-v ${_abs}:/tmp/${_base}:ro"
+  export WPCLI_MOUNT
+
+  # Theme or plugin? A theme zip has style.css at the top of its directory.
+  _kind=plugin
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -l "$_zip" 2>/dev/null | grep -qE '^[^/]*[[:space:]]+[^ ]+/style\.css$' && _kind=theme
+  fi
+  echo "  → Installing as a ${_kind} from ${_base}…"
+
+  _rc=0
+  _out=$(_wp "$_kind" install "/tmp/${_base}" --force 2>&1) || _rc=$?
+  printf '%s\n' "$_out" | sed 's/^/  /'
+  unset WPCLI_MOUNT
+
+  if [ "$_rc" -ne 0 ]; then
+    echo "✗  Install failed." >&2
+    echo "   If wp-admin uploads are blocked this does NOT affect wp-cli, so the" >&2
+    echo "   cause is elsewhere — check the output above." >&2
+    return 1
+  fi
+  echo "  ✔  Installed ${_base} as a ${_kind}"
+
+  if [ "$_activate" = 1 ]; then
+    _slug_guess=$(printf '%s' "$_out" | sed -n "s/.*'\([a-z0-9-]*\)'.*/\1/p" | head -1)
+    [ -n "$_slug_guess" ] || _slug_guess="${_base%.zip}"
+    _wp "$_kind" activate "$_slug_guess" >/dev/null 2>&1 || true
+    if _wp "$_kind" list --status=active --field=name 2>/dev/null | grep -q .; then
+      echo "  ✔  Activated (verified)"
+    else
+      echo "  ⚠  Could not confirm activation — activate from wp-admin." >&2
+    fi
+  fi
+
+  mkdir -p /etc/wp-install 2>/dev/null || true
+  printf '%s\t%s\t%s\tsha256=%s\tactivate=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_kind" "$_base" "$_got_sha" "$_activate" \
+    >> /etc/wp-install/installed-plugins.log 2>/dev/null || true
+
+  echo ""
+  echo "  Licence + updates: enter the vendor API key in wp-admin so the theme"
+  echo "  receives security fixes. Without it, it is frozen at this version."
+  echo "  Its licence domain must also be reachable through the egress proxy:"
+  echo "    doas wasp-egress.sh allow .elegantthemes.com     # Divi, for example"
+}
+
 # ── Install a plugin from the WordPress.org directory ────────────────────────
 # WASP does not bundle a plugin store, and for good reason: fetching arbitrary
 # code at runtime is the thing this project spends most of its effort avoiding.
@@ -529,7 +803,7 @@ do_install() {
     echo "✗  wp-cli cannot reach the WordPress install." >&2
     printf '%s\n' "$_probe" | sed 's/^/     /' >&2
     echo "   Nothing was installed. Check the container is running and healthy:" >&2
-    echo "     podman ps --filter name=wordpress ; wp-plugins.sh doctor" >&2
+    echo "     doas podman ps --filter name=wordpress ; wp-plugins.sh doctor" >&2
     return 1
   fi
   if _wp plugin is-installed "$_slug" >/dev/null 2>&1; then
@@ -577,6 +851,8 @@ do_install() {
 case "${1:-status}" in
   status) show_status ;;
   install|add) shift; do_install "$@" ;;
+  install-file|add-file) shift; do_install_file "$@" ;;
+  verify|verify-checksums|checksums) shift; do_verify "$@" ;;
   # Cheap yes/no used by the deferred MFA installer: has the WordPress setup
   # wizard actually been completed? Silent by design -- it is called from cron
   # every 10 minutes and must not fill a log with noise while waiting.

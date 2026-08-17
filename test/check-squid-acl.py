@@ -35,6 +35,7 @@ security regression. Both are worth catching before an install, not during one.
 import glob
 import ipaddress
 import os
+import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +106,41 @@ def ip_overlaps(items):
     return problems
 
 
+def check_conf(conf_path):
+    """A method allowlist that omits CONNECT silently blocks ALL HTTPS.
+
+    Found on a live VM: `acl allowed_methods method GET POST HEAD OPTIONS PUT`
+    followed by `http_access deny !allowed_methods` denied every TLS request
+    before the destination allowlist was ever reached. Squid logged
+    TCP_DENIED/403, the plugin install blamed WordPress.org, and the egress
+    self-test reported every deny-probe passing -- because everything was
+    denied.
+    """
+    problems = []
+    if not os.path.exists(conf_path):
+        return problems
+    text = open(conf_path, encoding="utf-8", errors="replace").read()
+    lines = [l.strip() for l in text.splitlines() if not l.strip().startswith("#")]
+
+    method_acls = {}
+    for l in lines:
+        m = re.match(r"acl\s+(\S+)\s+method\s+(.+)$", l)
+        if m:
+            method_acls[m.group(1)] = m.group(2).split()
+
+    for l in lines:
+        m = re.match(r"http_access\s+deny\s+!(\S+)$", l)
+        if m and m.group(1) in method_acls:
+            methods = method_acls[m.group(1)]
+            if "CONNECT" not in methods:
+                problems.append(
+                    f"squid.conf: `deny !{m.group(1)}` will block ALL HTTPS — "
+                    f"CONNECT is missing from `acl {m.group(1)} method "
+                    f"{' '.join(methods)}`"
+                )
+    return problems
+
+
 def scan_dir(directory):
     found = []
     for path in sorted(glob.glob(os.path.join(directory, "*.txt"))):
@@ -140,6 +176,15 @@ def self_test():
             "self-test: the IP overlap was not detected"
 
     with tempfile.TemporaryDirectory() as d:
+        conf = os.path.join(d, "squid.conf")
+        with open(conf, "w") as f:
+            f.write("acl m method GET POST\nhttp_access deny !m\n")
+        assert check_conf(conf), "self-test: missing CONNECT not detected"
+        with open(conf, "w") as f:
+            f.write("acl m method GET POST CONNECT\nhttp_access deny !m\n")
+        assert not check_conf(conf), "self-test: CONNECT present but flagged"
+
+    with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "allowlist-runtime.txt"), "w") as f:
             f.write(".docker.io\n.wordpress.org\nghcr.io\n")
         with open(os.path.join(d, "hard-deny.txt"), "w") as f:
@@ -156,6 +201,12 @@ def main():
         return 0
 
     found = scan_dir(SQUID_DIR)
+    conf_problems = check_conf(os.path.join(SQUID_DIR, "squid.conf"))
+    if conf_problems:
+        print(f"FOUND {len(conf_problems)} squid.conf problem(s):")
+        for p in conf_problems:
+            print(f"  {p}")
+        return 1
     if found:
         print(f"FOUND {len(found)} overlapping ACL entr(ies):")
         for name, problem in found:

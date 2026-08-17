@@ -187,6 +187,11 @@ menu_security() {
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
     8) Verify tooling integrity      ${DIM}wasp-verify-integrity.sh${R}
+   10) Theme/plugin uploads: ALLOW  ${DIM}wp-hardening.sh disable file-mods${R}
+   11) Theme/plugin uploads: BLOCK  ${DIM}wp-hardening.sh enable file-mods${R}
+   12) Install a theme/plugin ZIP   ${DIM}wp-plugins.sh install-file <path>${R}
+   13) PHP shell functions: BLOCK   ${DIM}wp-hardening.sh enable php-exec${R}
+   14) PHP shell functions: ALLOW   ${DIM}wp-hardening.sh disable php-exec${R}
     9) ${RED}[!]${R} Rotate a secret              ${DIM}wp-rotate-secrets.sh ...${R}
     b) back
 EOF
@@ -200,6 +205,18 @@ EOF
       6) _have wp-malware-scan.sh && run "Malware quick scan" 0 wp-malware-scan.sh quick || _missing wp-malware-scan.sh ;;
       7) _have wp-malware-scan.sh && run "Malware full scan" 0 wp-malware-scan.sh full || _missing wp-malware-scan.sh ;;
       8) _have wasp-verify-integrity.sh && run "Integrity check" 0 wasp-verify-integrity.sh || _missing wasp-verify-integrity.sh ;;
+      10) _have wp-hardening.sh && run "Allow theme/plugin uploads (reduces hardening)" 1 wp-hardening.sh disable file-mods || _missing wp-hardening.sh ;;
+      11) _have wp-hardening.sh && run "Block theme/plugin uploads (restore hardening)" 0 wp-hardening.sh enable file-mods || _missing wp-hardening.sh ;;
+      12) if _have wp-plugins.sh; then
+            echo ""
+            echo "  Copy the zip to the VM first, e.g.:"
+            echo "    scp divi.zip admin@$(hostname):/var/lib/wasp-import/incoming/"
+            if ask "Path to the .zip" _z; then
+              run "Install from file" 1 wp-plugins.sh install-file "$_z" --activate
+            fi
+          else _missing wp-plugins.sh; fi ;;
+      13) _have wp-hardening.sh && run "Block PHP shell functions (restore hardening)" 0 wp-hardening.sh enable php-exec || _missing wp-hardening.sh ;;
+      14) _have wp-hardening.sh && run "Allow PHP shell functions (reduces hardening)" 1 wp-hardening.sh disable php-exec || _missing wp-hardening.sh ;;
       9) menu_rotate ;;
       b|B) return ;;
     esac
@@ -301,6 +318,7 @@ menu_testing() {
     6) Self-test: candidate isolated ${DIM}wasp-selftest.sh candidate-isolation${R}
     7) Egress is really enforced     ${DIM}wasp-egress.sh test${R}
     8) Tooling integrity vs manifest ${DIM}wasp-verify-integrity.sh${R}
+   16) WordPress file integrity      ${DIM}wp-plugins.sh verify${R}
     9) Updates available (no change) ${DIM}update.sh check${R}
    10) Image CVE scan (no change)    ${DIM}update.sh trivy${R}
    11) Mail path works               ${DIM}wp-mail.sh doctor${R}
@@ -326,6 +344,7 @@ EOF
       12) _have wp-plugins.sh && run "wp-cli doctor" 0 wp-plugins.sh doctor || _missing wp-plugins.sh ;;
       14) _have wp-plugins.sh && run "Plugin / MFA status" 0 wp-plugins.sh status || _missing wp-plugins.sh ;;
       15) _have wp-plugins.sh && run "WordPress core version (files vs image)" 0 wp-plugins.sh core-version || _missing wp-plugins.sh ;;
+      16) _have wp-plugins.sh && run "WordPress file integrity (checksums)" 0 wp-plugins.sh verify || _missing wp-plugins.sh ;;
       13) _have wasp-offsite-backup.sh && run "Remote restore drill" 1 wasp-offsite-backup.sh remote-restore-drill || _missing wasp-offsite-backup.sh ;;
       b|B) return ;;
     esac
@@ -402,6 +421,7 @@ EOF
   _step "Updates — anything outstanding"      update.sh check
   _step "Mail — can it actually send"         wp-mail.sh doctor
   _step "wp-cli — can it reach the site"      wp-plugins.sh doctor
+  _step "File integrity — core + plugins"     wp-plugins.sh verify
 
   echo ""
   printf '%s┌─ Commission result ────────────────────────────────┐%s\n' "$CYN" "$R"

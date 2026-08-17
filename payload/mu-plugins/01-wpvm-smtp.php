@@ -1,14 +1,9 @@
 <?php
 /**
- * Plugin Name: WPVM SMTP Transport
- * Description: Routes wp_mail() through an authenticated SMTP relay. Without
- *              this, WordPress falls back to PHP mail(), which needs a local
- *              sendmail binary that does not exist in the official WordPress
- *              container -- so every password reset, admin notice, comment
- *              notification, and WooCommerce receipt fails SILENTLY. Nothing
- *              is logged by default and the UI reports success, which is the
- *              worst possible failure mode for mail.
- * Author: alpine-vm-wordpress
+ * Plugin Name: WASP — SMTP Transport
+ * Description: Sends all wp_mail() through your authenticated SMTP relay, with the credentials held in a file outside the web root rather than in the database. Without it WordPress hands mail to a local sendmail that does not exist, and password resets, order confirmations and admin alerts fail silently.
+ * Author: RothITguy
+ * Version: 1.0
  *
  * WHY THE CREDENTIALS LIVE OUTSIDE THE DOCROOT
  *

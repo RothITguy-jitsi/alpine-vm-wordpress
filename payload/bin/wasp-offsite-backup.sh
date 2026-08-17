@@ -96,7 +96,7 @@ _encrypt_for_upload() {
   [ -n "$AGE_RECIPIENT" ] || { printf '%s' "$_src"; return 0; }
   if ! command -v age >/dev/null 2>&1; then
     _bad "Encryption is configured but 'age' is not installed — refusing to upload in plaintext"
-    _note "  apk add age"
+    _note "  doas apk add age"
     return 1
   fi
   _enc="/tmp/$(basename "$_src").age"

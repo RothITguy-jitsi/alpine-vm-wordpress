@@ -1,6 +1,6 @@
 #!/bin/sh
 # WordPress VM Security Feature Toggle
-# Usage: wp-hardening.sh [status|enable <f>|disable <f>|restart-wp]
+# Usage: wp-hardening.sh [status|enable <f>|disable <f>|restart-wp]   f: 8g xmlrpc uploads-php debug file-mods
 # From Proxmox: qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status
 # Features: 8g  xmlrpc  uploads-php  author-enum  debug
 set -e
@@ -56,6 +56,8 @@ feature_state() {
                    "$APACHE_CONF" 2>/dev/null | grep -q BLOCKED && echo BLOCKED || echo OPEN ;;
     uploads-php) grep -q 'wp-content/uploads' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
     debug)       PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo UNKNOWN ;;
+    file-mods)   PRUN exec wordpress php -r 'echo (defined("DISALLOW_FILE_MODS") && DISALLOW_FILE_MODS)?"BLOCKED":"ALLOWED";' 2>/dev/null || echo UNKNOWN ;;
+    php-exec)    PRUN exec wordpress php -r 'echo function_exists("system")?"ALLOWED":"BLOCKED";' 2>/dev/null || echo UNKNOWN ;;
   esac
 }
 
@@ -102,6 +104,26 @@ enable_feature() {
       date +%s > "$UPLOADS_PHP_MARKER"
       echo "✔ PHP in uploads unblocked  ⚠ security risk — auto re-blocks in $((UPLOADS_PHP_MAX_OPEN_SECS/60)) min (or run: wp-hardening.sh disable uploads-php)"
       restart_wp ;;
+    php-exec)
+      # Edit the HOST file. The in-container copy is a READ-ONLY bind mount
+      # (/usr/local/etc/php/conf.d/wp-security.ini), so sed inside the
+      # container fails silently -- which would have made this toggle report
+      # success while changing nothing.
+      sed -i 's|^;*disable_functions.*|disable_functions = exec,passthru,shell_exec,system,proc_open,popen,proc_nice,proc_terminate,proc_get_status,proc_close,pcntl_exec,dl|' \
+        /home/wpuser/wp/php-conf/security.ini 2>/dev/null || true
+      echo "  ✔  Process-execution functions BLOCKED. Restarting WordPress…"
+      restart_wp ;;
+    file-mods)
+      # "enable file-mods" means ENABLE THE RESTRICTION, i.e. block installs.
+      PRUN exec wordpress sh -c \
+        "grep -q 'DISALLOW_FILE_MODS' /var/www/html/wp-config.php || \
+         sed -i \"s|/\\* That's all, stop editing|define('DISALLOW_FILE_MODS',true);\\n/* That's all, stop editing|\" /var/www/html/wp-config.php" 2>/dev/null || true
+      PRUN exec wordpress sh -c \
+        "sed -i \"s|define('DISALLOW_FILE_MODS',false)|define('DISALLOW_FILE_MODS',true)|;s|define(\\\"DISALLOW_FILE_MODS\\\",false)|define(\\\"DISALLOW_FILE_MODS\\\",true)|\" /var/www/html/wp-config.php" 2>/dev/null || true
+      echo "  ✔  Plugin/theme installs and updates are BLOCKED in wp-admin."
+      echo "     Install from the console instead, which is logged:"
+      echo "       doas wp-plugins.sh install <slug> --activate"
+      ;;
     debug)
       PRUN exec wordpress sh -c \
         "sed -i 's/define(\"WP_DEBUG\",false)/define(\"WP_DEBUG\",true)/' /var/www/html/wp-config.php" 2>/dev/null || true
@@ -137,7 +159,45 @@ B
       PRUN exec wordpress sh -c \
         "sed -i 's/define(\"WP_DEBUG\",true)/define(\"WP_DEBUG\",false)/' /var/www/html/wp-config.php" 2>/dev/null || true
       echo "✔ WP_DEBUG OFF" ;;
-    *) echo "Unknown: $1. Valid: 8g xmlrpc uploads-php debug" ;;
+    php-exec)
+      sed -i 's|^disable_functions.*|;disable_functions = (disabled by wp-hardening.sh)|' \
+        /home/wpuser/wp/php-conf/security.ini 2>/dev/null || true
+      echo "✔ PHP can call system(), shell_exec() and exec() again."
+      echo ""
+      echo "  ⚠  This is the control that breaks commodity PHP webshells. Nearly"
+      echo "     every one dropped through a vulnerable plugin calls system() or"
+      echo "     shell_exec() in its first few lines. With this off, they work."
+      echo ""
+      echo "  Only leave it off if a plugin genuinely needs to shell out, and"
+      echo "  consider whether that plugin is worth the exposure. Restore with:"
+      echo "     doas wp-hardening.sh enable php-exec"
+      restart_wp ;;
+    file-mods)
+      # "disable file-mods" means DISABLE THE RESTRICTION, i.e. allow installs.
+      #
+      # Why this toggle exists: DISALLOW_FILE_MODS is set automatically under
+      # DEPLOYMENT_PROFILE=production, and it removes Plugins → Add New,
+      # Appearance → Themes → Add New, and the theme/plugin UPLOAD form
+      # entirely. That is the intent -- a hijacked admin session cannot install
+      # arbitrary PHP -- but it also means an operator cannot upload a
+      # commercial theme like Divi or Elementor, which is a normal, legitimate
+      # thing to need to do. Reported from a real install: "I do not see the
+      # theme upload section".
+      #
+      # The honest trade: turn it off, upload what you need, turn it back on.
+      # Leaving it off is a real reduction in hardening, not a cosmetic one.
+      PRUN exec wordpress sh -c \
+        "sed -i \"s|define('DISALLOW_FILE_MODS',true)|define('DISALLOW_FILE_MODS',false)|;s|define(\\\"DISALLOW_FILE_MODS\\\",true)|define(\\\"DISALLOW_FILE_MODS\\\",false)|\" /var/www/html/wp-config.php" 2>/dev/null || true
+      echo "✔ Plugin/theme installs and uploads are ALLOWED in wp-admin again."
+      echo ""
+      echo "  ⚠  This is a real reduction in hardening while it is off: anyone"
+      echo "     with an admin session -- including one that has been stolen --"
+      echo "     can now install arbitrary PHP through the upload form."
+      echo ""
+      echo "  Turn it back on the moment you are finished:"
+      echo "     doas wp-hardening.sh enable file-mods"
+      ;;
+    *) echo "Unknown: $1. Valid: 8g xmlrpc uploads-php debug file-mods php-exec" ;;
   esac
 }
 
@@ -589,7 +649,7 @@ SNIPPET2
     echo "  Reclaimable:"
     _dang=$(podman images -f dangling=true -q 2>/dev/null | grep -c .) || _dang=0
     printf '    %-28s %s image(s)\n' "unreferenced container images" "$_dang"
-    [ "${_dang:-0}" -gt 0 ] && printf '      podman image prune -f --filter dangling=true\n'
+    [ "${_dang:-0}" -gt 0 ] && printf '      doas podman image prune -f --filter dangling=true\n'
     _oldq=$(find /var/lib/wp-quarantine -maxdepth 1 -type f -mtime +30 2>/dev/null | grep -c .) || _oldq=0
     [ "${_oldq:-0}" -gt 0 ] && printf '    %-28s %s file(s)  →  wp-malware-scan.sh purge\n' "quarantine over 30 days" "$_oldq"
     echo ""
@@ -619,7 +679,7 @@ SNIPPET2
         [ -d "$_d" ] && printf '  %-28s %s\n' "$_d" "$(du -sh "$_d" 2>/dev/null | cut -f1)"
       done
       printf '\nUsually reclaimable:\n'
-      printf '  podman image prune -f --filter dangling=true   # old images after updates\n'
+      printf '  doas podman image prune -f --filter dangling=true   # old images after updates\n'
       printf '  wp-malware-scan.sh purge                       # quarantined samples\n'
       printf '  wp-hardening.sh disk                           # full breakdown\n\n'
       printf 'Acting at 80%% rather than 95%% matters: MariaDB refuses writes before\n'
@@ -675,7 +735,7 @@ SNIPPET2
     CTI_CONF=/etc/wp-install/cti.conf
     CTI_CACHE=/var/cache/wp-cti
     [ -r "$CTI_CONF" ] && . "$CTI_CONF"
-    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-40}"
+    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-120}"
     [ -n "${CTI_API_KEY:-}" ] || exit 2
     command -v jq >/dev/null 2>&1 || exit 2
     printf '%s' "$_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || exit 2
@@ -786,7 +846,7 @@ SNIPPET2
     CTI_CONF=/etc/wp-install/cti.conf
     CTI_CACHE=/var/cache/wp-cti
     [ -r "$CTI_CONF" ] && . "$CTI_CONF"
-    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-40}"
+    CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-120}"
     mkdir -p "$CTI_CACHE" 2>/dev/null || true
     chmod 700 "$CTI_CACHE" 2>/dev/null || true
 
@@ -1044,7 +1104,7 @@ SNIPPET2
         echo "    substituting the client address and your proxy sits inside the"
         echo "    admin range, everyone is allowed. Use it to isolate a 503, not"
         echo "    as a resting state."
-        echo "  podman restart wordpress" ;;
+        echo "  doas podman restart wordpress" ;;
 
       strict)
         grep -q "Require not ip" "$_conf" && { echo "Already strict."; exit 0; }
@@ -1066,8 +1126,8 @@ SNIPPET2
           { print }
         ' "$_conf" > "${_conf}.new" && mv -f "${_conf}.new" "$_conf"
         echo "✔ Switched to STRICT. Backup kept alongside the original."
-        echo "  podman exec wordpress apache2ctl configtest   # check BEFORE restarting"
-        echo "  podman restart wordpress" ;;
+        echo "  doas podman exec wordpress apache2ctl configtest   # check BEFORE restarting"
+        echo "  doas podman restart wordpress" ;;
 
       *) echo "Usage: wp-hardening.sh admin-rule [show|strict|simple]" >&2; exit 1 ;;
     esac ;;

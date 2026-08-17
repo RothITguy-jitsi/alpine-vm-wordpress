@@ -301,7 +301,7 @@ if [ -s "${PRODUCTION_BLOCKERS:-/etc/wp-install/PRODUCTION-BLOCKERS}" ]; then
   echo ""
   echo "  Every tool is installed, so you can diagnose from here:"
   echo "    wasp-menu                     # 7) Testing -> 1) Commission check"
-  echo "    podman logs squid             # if the blocker was the egress proxy"
+  echo "    doas podman logs squid             # if the blocker was the egress proxy"
   echo "    validate-wordpress.sh         # full validation"
   echo ""
   echo "  This marker persists at ${PRODUCTION_BLOCKERS:-/etc/wp-install/PRODUCTION-BLOCKERS}"
