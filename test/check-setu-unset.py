@@ -69,10 +69,18 @@ def sources_config(text: str):
 
 
 def scan_text(text: str):
-    if not uses_set_u(text):
-        return set()
-    # Strip comments and heredoc bodies -- neither executes.
+    # STRIP HEREDOCS FIRST, then decide whether this file uses set -u.
+    #
+    # A generated script written from a heredoc carries its own `set -u`,
+    # which applies to THAT script and not to the file emitting it. Testing
+    # before stripping made a host script inherit the strictness of something
+    # it merely writes, and every variable in the outer file was then reported
+    # unassigned -- three false positives on wp-geoip-setup.sh, which does not
+    # set -u at all.
     body = re.sub(r"<<-?\s*'?([A-Z_]+)'?.*?^\1", " ", text, flags=re.S | re.M)
+    if not uses_set_u(body):
+        return set()
+    # Strip comments -- they do not execute.
     body = re.sub(r'^\s*#.*$', ' ', body, flags=re.M)
     # Blank SINGLE-QUOTED strings. The host shell does not expand anything
     # inside them, so `podman exec mariadb sh -c 'mariadb -p"$MARIADB_ROOT_PASSWORD"'`

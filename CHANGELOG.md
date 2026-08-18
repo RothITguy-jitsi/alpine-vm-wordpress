@@ -6,6 +6,244 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13a — Completing the verification pass: a CWE-377 in a root cron job
+
+Finishing the parts of the sweep left incomplete: component currency, the full
+documentation pass, and the bug classes not covered by an existing check.
+
+**Component versions verified.** WordPress 7.0.4 is current (no 7.0.5; 7.1 due
+around 19 August). CrowdSec `v1.7.8` remains the release that fixed
+CVE-2026-44982 (WAF bypass) and CVE-2026-44981 (LAPI denial of service).
+MariaDB `11.4` is LTS to May 2029 and its branch tag tracks patches. Two
+apparently-unpinned tags were checked and are benign: `wordpress:latest` is only
+read by `skopeo inspect` for a currency comparison and never run, and
+`wordpress:cli` is a fallback used only when pinned.env lacks the digest.
+
+**Documentation pass clean.** Spelling checked across every document and every
+script; the single hit (`skipp`) is a deliberate partial match for
+skipped/skipping. Every numeric claim matches reality — 20 tools documented, 68
+menu entries, 21 MFA cases, 20 static checks.
+
+**A real finding: the weekly GeoIP refresh.** It ran as root from a single
+enormous cron line with two defects that matter for something scheduled:
+
+  * It wrote to PREDICTABLE `/tmp` paths and untarred into one of them. A local
+    user can pre-create either as a symlink and redirect a root-owned write —
+    CWE-377, the class already fixed everywhere else in this codebase and
+    missed here because it lived inside a cron string rather than a script.
+  * The `curl` had no `--max-time`, so a hung MaxMind connection left a root
+    cron job running until the next reboot.
+
+Now a real script: `mktemp -d` with a trap, a 180-second bound, a size check on
+the extracted database, and an atomic replace so a crash mid-copy cannot leave
+Apache loading a half-written file. It also keeps the existing database on any
+failure rather than replacing a working one with nothing.
+
+**Two of my own mistakes, caught by the checks, in the course of fixing it.**
+First, the helper was inserted INSIDE the cron heredoc — it would have been
+written as literal text into `/etc/crontabs/root` rather than executed,
+corrupting the root crontab. Second, once fixed, `check-setu-unset.py` reported
+three false positives, and the reason was a genuine flaw in the check: it tested
+for `set -u` BEFORE stripping heredocs, so a file that merely *emits* a strict
+script inherited that strictness and every variable in the outer file was
+reported unassigned. Heredocs are now stripped first, with a regression fixture.
+
+Both were found because the suite ran, not because I re-read the diff. That is
+the argument for the checks in one sentence.
+
+Other classes swept and clean: no unbounded network calls remaining, no
+infinite loops (the menu's `while :;` all break or return), no other predictable
+temp paths, no insecure TLS flags, no secrets to world-readable locations.
+
+---
+
+## 2026.08.13 — Verification pass, and triage for a fleet already in production
+
+Twelve client VMs are running builds from the 2026.08.12 series, and several of
+those releases shipped defects that leave a VM running and looking healthy while
+a control is silently absent. That changes what is useful: the code being clean
+now does nothing for a VM deployed last week.
+
+**Verification first. All 19 checks clean**, across doas prefixes, doc coverage,
+doc links, embedded quotes, expansion order, function order, grep counts, health
+probes, heredoc backticks, install conditionals, line continuations, menu
+entries, parameter expansion, `set -e` captures, `set -u` variables, slug
+rewrites, Squid ACLs, undefined helpers and version claims — plus `bash -n` on
+48 files, `sh -n` across the payload, `php -l` on every mu-plugin, and the
+21-case MFA harness.
+
+A separate hunt for classes with no check found nothing: no insecure TLS flags
+(earlier apparent hits were `-s`, not `-k`), no secrets written to world-
+readable paths, no dangerous `rm -rf` on an unbounded variable, no scripts still
+hiding in heredocs.
+
+**WordPress 7.0.4 confirmed current.** No 7.0.5 exists; 7.1 is expected around
+19 August. Worth passing to clients alongside the update cadence: Patchstack's
+analysis of the 7.0.2 chain observed that automated research took a vulnerability
+"from zero to working RCE in ten hours", and concluded that "we'll patch it
+during a maintenance window" is a plan built for a threat landscape that has
+already gone. That is the argument for `update.sh check` weekly rather than
+quarterly, and it is a better one than any I would have written.
+
+**New: `wasp-triage.sh`, for the VMs already out there.** "Redeploy everything"
+is a week of client downtime for problems that mostly patch in place. This
+checks the specific known-bad states on a RUNNING system — reading actual state
+rather than the version string, because a VM may have been partly patched by
+hand and the version alone will not tell you:
+
+  1. Is there a firewall at all (nftables has tables)
+  2. Can WordPress send mail (an SMTP allow rule is live)
+  3. Can anything alert (wp-notify runs rather than crashing)
+  4. Is the core being SERVED the one that is pinned
+  5. Was MFA requested but never installed
+  6. Is anything actually reaching off-site
+  7. Is CrowdSec enforcing, or only detecting
+
+Each finding names the release it came from, what it means for that client, and
+the command that repairs it. Exit 2 for live exposure, 1 for something promised
+but not working, 0 for clear — so it can be driven from a loop across the fleet.
+
+MSP-RUNBOOK gains a triage section with the order to work in, worst first: no
+firewall, then no mail, then no alerting, then core version. And the note that
+matters on a fleet — record the output per client in the ticket, because "I
+think I fixed that one" is not a record.
+
+---
+
+## 2026.08.12z — The deferred MFA installer could not be run, watched, or checked
+
+Reported: MFA never installed automatically, twenty minutes of waiting produced
+nothing, and there was no command to run it by hand — the install line had to be
+dug out of an old log.
+
+The install log shows the hook WAS arranged: script written, cron entry added.
+So it either never fired or fired and said nothing. Three separate failures made
+that impossible to tell apart, and all three are the same underlying mistake.
+
+**It exited silently while waiting.** The hook checked whether the setup wizard
+was finished and, if not, `exit 0` with no output. So an empty log meant
+"waiting", "broken", or "cron never ran" — indistinguishable. It now logs every
+run including the waiting ones, and records what wp-cli actually said. A
+heartbeat costs one line and answers the question in one look.
+
+**There was no way to force it.** Added `--now`: ignores the completion stamp,
+prints to the terminal as well as the log, and reports what it found. And
+`--status`: shows the schedule line, whether crond is running, whether the
+completion stamp exists, and the last dozen log entries. Those are the three
+states that look identical from outside, so the tool distinguishes them
+explicitly. Both are on the Testing menu, which is the gap the operator named.
+
+**The install assumed its own scheduling worked.** It appended to
+`/etc/crontabs/root` and moved on. It now verifies the line is present, checks
+that crond is actually running — a perfect crontab entry does nothing without
+it, and that combination is completely silent — and prints both the forced-run
+and status commands.
+
+**And the script was invisible to every check in this repository.** It lived in
+a heredoc inside stage 10, which meant no `sh -n`, no undefined-helper check, no
+doas-prefix check, no menu verification. Seventy-five lines of shell that ran on
+every client VM and had never been linted once. Extracted to
+`payload/bin/wasp-mfa-deferred.sh` and installed like every other tool.
+
+The extraction paid for itself immediately: the menu-entry check failed the
+moment the new menu items were added (the target did not exist as a file), and
+the doc-coverage check then failed because the tool was undocumented — twice,
+first for being mentioned only inside a code fence. Both were real gaps that a
+heredoc had been hiding. No other embedded scripts remain.
+
+---
+
+## 2026.08.12y — The R2 403 is a READ permission, not a wrong bucket
+
+The operator sent a screenshot of the bucket, and it disproved the previous
+release's advice cleanly. The path `test / wasp / ctrl` matches the configured
+destination exactly, and an object had genuinely been written there —
+`wp-db-20260811-233512.sql.gz.age`, since deleted by hand. So the bucket name,
+the prefix and the upload mechanism were all fine, and sending the operator to
+check the bucket name character by character was wrong.
+
+**The failure is on `HeadObject`, which is a READ.** rclone HEADs an object
+before uploading, to decide skip versus overwrite, and this tool HEADs after, to
+verify the size landed. A token with **Object Write but not Object Read**
+produces exactly what was observed: PutObject would succeed, HeadObject returns
+403, and the transfer aborts either side of the bytes moving — with credentials
+that are entirely correct. That also explains why it worked on 11 August under a
+different token.
+
+Three changes:
+
+- `doctor` now tests **listing buckets** and **reading inside the configured
+  path** as separate steps. On R2 those are different permissions, and testing
+  them separately isolates a write-only token in one command instead of leaving
+  the operator to guess between "wrong path" and "wrong key".
+- The 403 guidance is reordered: token permission first, then bucket scope, then
+  the name. The name check stays, because R2 returns 403 rather than 404 for a
+  bucket a token cannot see and a typo really is indistinguishable from bad keys
+  — but it is no longer presented as the likely answer.
+- The setup prompt already said "Object Read & Write" and it was buried
+  mid-paragraph inside advice about denying delete. It is now its own
+  highlighted block stating that **Object Write alone looks sufficient and is
+  not**, with the symptom named: uploads succeed, verification fails, and the
+  report reads "the backup is not off-VM" while every credential is correct.
+
+Worth recording as a diagnostic lesson rather than just a fix: the previous
+advice was reasoned from the error code alone. One screenshot of the actual
+bucket eliminated two of three hypotheses in a second. When a remote service is
+involved, looking at the remote beats reasoning about it.
+
+---
+
+## 2026.08.12x — A comment expanded a variable and destroyed the ruleset
+
+The expansion-order fix worked — the "unexpected ct" error is gone. A different
+one replaced it, from the same root misunderstanding, and nft printed the
+evidence directly:
+
+    ip saddr 10.89.10.0/24 tcp dport { 25, 465, 587 } ct state new counter drop, six lines later in the chain), so
+
+That is a firewall rule with the tail of one of my own comments welded to it. I
+had written, inside the multi-line `EGRESS_PROXY_FORWARD="..."` assignment:
+
+    # this block (as ${SMTP_RATE_LIMIT}, six lines later in the chain), so
+
+**A `#` inside a double-quoted string is not a comment.** The shell never parses
+it as one, so `${SMTP_RATE_LIMIT}` expanded — pasting an entire rule block into
+the middle of explanatory prose. Two such comments existed; both did it. nft
+rejected the file and the VM booted with no firewall again.
+
+This is the THIRD time this exact class has struck: first a backtick running
+`wp-mail.sh` on the Proxmox host, then this twice. Each time the mechanism is
+identical and the surface looks different, because prose is not where anyone
+looks for code.
+
+**The good news, and it is real: the production blocker worked.** Last release
+this same failure reported "INSTALL COMPLETED". This time it refused to certify
+the VM and said plainly that everything reporting "enabled" was describing
+rules not in the kernel. The fix from 2026.08.12v did its job on its first
+outing.
+
+**The check now covers variable expansion, not just backticks.** The earlier
+extension scanned for backticks using a block regex, which missed these
+entirely: the assignments contain escaped quotes and run to a hundred lines, so
+the regex never matched them. It now tracks quote state line by line — slower
+and correct — and flags `${VAR}`, `$VAR` and backticks in any comment inside a
+quoted string. Verified retroactively against the exact line.
+
+**The R2 403 diagnosis was wrong, and the operator's note is why.** They wrote
+"I am copy/pasting the exact credentials that has worked before", and the
+previous guidance sent them straight to the credentials. Cloudflare R2 returns
+**403, not 404, for a bucket the token cannot see** — it will not confirm
+whether a bucket exists to an unauthorised caller. So correct keys plus a
+mistyped bucket name produce the identical error to bad keys.
+
+`wasp-offsite-backup.sh doctor` now says so, in order: check the bucket name
+character by character first, then the token's bucket scope, then Read vs
+Read+Write. It also notes that a 403 on **HeadObject** specifically means the
+upload may have succeeded and only the size verification was refused — so the
+dashboard is worth checking before assuming nothing was written.
+
+---
+
 ## 2026.08.12w — Proving CrowdSec actually blocks, not that it started
 
 Reported from the console: 1 log processor, **0 remediation components**, no

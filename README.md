@@ -1030,6 +1030,31 @@ It is built so that **enabling it cannot lock anyone out**, because enforcement 
 
 **It closes the side doors, not just the front one.** A second factor on the browser login is meaningless if an admin can authenticate through an API that skips it. XML-RPC is already blocked; the mu-plugin additionally refuses REST-API and application-password authentication for an unenrolled admin past grace, so the enforcement can't be walked around a different channel.
 
+### If MFA does not install by itself
+
+The Two Factor plugin cannot be installed during provisioning: WordPress core
+has no database tables until you finish the setup wizard, so there is nothing
+to install into. A scheduled hook watches for that and installs it within ten
+minutes of setup completing, then clears its own production blocker.
+
+When it does not, these answer why and fix it:
+
+```sh
+doas wasp-mfa-deferred.sh --status   # is it scheduled? is crond up? what has it logged?
+doas wasp-mfa-deferred.sh --now      # force it, printing what it finds
+```
+
+Both are on the Testing menu. `wasp-mfa-deferred.sh --status` exists because the
+failure mode is silence: a hook that is not scheduled, a crond that is not running, and a hook
+that is simply still waiting all look identical from outside. It reports the
+schedule line, whether crond is running, and the last dozen log entries, so the
+three are distinguishable in one command.
+
+`wasp-mfa-deferred.sh` now logs every run, including the waiting ones, to
+`/var/log/wasp-mfa-deferred.log`. An empty log
+used to be indistinguishable from cron never firing at all — which is precisely
+the situation that made this necessary.
+
 **How it composes with the rest of this section:** the slug decides *where* the login lives, the guard throttles the *password* attempt on the `authenticate` filter, and 2FA runs *after* a correct password on the login-completion flow. They are sequential stages of one login, not competitors for one hook — verified with a logic-test harness (`test/test-mfa-enforcement.php`, 21 cases) that runs in the check suite, because this exact kind of interaction is where the subtle lockout bugs live.
 
 ```sh

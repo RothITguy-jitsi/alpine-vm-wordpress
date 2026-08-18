@@ -232,6 +232,38 @@ that is not the site.
 
 ---
 
+## Triaging an already-deployed fleet
+
+Several releases in the 2026.08.12 series shipped defects that leave a VM
+running and looking healthy while a control is silently absent — no firewall,
+no outbound mail, no alerting. "Redeploy everything" is not a plan for a fleet
+already in production; most of these patch in place.
+
+Run this on each VM before deciding anything:
+
+```sh
+doas wasp-triage.sh
+```
+
+`wasp-triage.sh` reads the RUNNING state rather than the version string,
+because a VM may have been partly patched by hand and the version alone will
+not tell you. It reports each known-bad condition, what it means for that
+client, and whether it can be repaired without a redeploy. Exit code 2 means
+live exposure, 1 means something promised is not working, 0 means clear.
+
+Work the fleet in this order, worst first:
+
+1. **No firewall** — the VM is exposed exactly as if none of the hardening were
+   configured. Nothing else matters until this is fixed.
+2. **No outbound mail** — password resets and every alert fail silently.
+3. **Notifier crashing** — backup failures and the heartbeat cannot report, and
+   silence is indistinguishable from healthy.
+4. **WordPress below 7.0.4** — a pre-auth login XSS and an Author+ RCE.
+5. The rest.
+
+Record the triage output per client in the ticket. On a fleet, "I think I fixed
+that one" is not a record.
+
 ## Key custody
 
 Fill in [docs/KEY-CUSTODY.md](docs/KEY-CUSTODY.md) per client and store it

@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.12w"
-WASP_VERSION_NOTE="crowdsec-doctor proves the remediation chain with a real test ban rather than trusting the console or a service that merely started"
+WASP_VERSION="2026.08.13a"
+WASP_VERSION_NOTE="GeoIP weekly cron ran as root against predictable /tmp paths with no timeout - now a bounded mktemp script; component versions verified current"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

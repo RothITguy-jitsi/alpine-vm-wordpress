@@ -159,7 +159,7 @@ ${SQUID_DNS_RULES}
         # ── SMTP, and it MUST be here rather than further down the chain ──────
         # nftables is first-match-wins, and the drop immediately below matches
         # the whole container subnet. The SMTP allow rule used to live AFTER
-        # this block (as ${SMTP_RATE_LIMIT}, six lines later in the chain), so
+        # this block (as SMTP_RATE_LIMIT, six lines later in the chain), so
         # it was never reached: enabling the egress proxy silently broke
         # WordPress's ability to send mail entirely. Password resets, order
         # confirmations and admin notifications all failed, and the only
@@ -397,7 +397,7 @@ ${EGRESS_PROXY_FORWARD}
         # wp-db (10.89.20.0/24) is --internal: netavark never routes it to
         # the internet, so this permits only the container-to-container path.
         ip saddr 10.89.20.0/24 accept
-        # NOTE: ${SMTP_RATE_LIMIT} used to be expanded here. It is now inside
+        # NOTE: SMTP_RATE_LIMIT used to be expanded here. It is now inside
         # the egress-proxy block above, because the drop at the end of that
         # block made this position unreachable. When the proxy is OFF, the
         # block below still needs it -- see EGRESS_SMTP_FALLBACK.
