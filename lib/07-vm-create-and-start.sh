@@ -49,6 +49,17 @@ msg_info "Creating VM ${VMID} (${HN})…"
 # delimiter makes the whole block inert, and the values are substituted
 # afterwards where nothing can be interpreted.
 _wasp_vm_notes() {
+  # ── Proxmox VM notes ────────────────────────────────────────────────────────
+  # Rendered in a NARROW side panel, so this is written for roughly 46 columns
+  # and stacked vertically rather than laid out in wide rows. Proxmox scrolls
+  # the panel down happily; it does not wrap long lines gracefully, and a table
+  # wider than the panel is simply cut off.
+  #
+  # PURE ASCII, deliberately. The previous version used em-dashes, middots and
+  # arrows, and the panel rendered them as replacement characters -- the title
+  # read "WASP ??? WordPress Alpine Sec". Whatever encoding Proxmox applies
+  # between `qm set --description` and the web UI is not worth fighting, so
+  # nothing here is above codepoint 127.
   local _login
   if [[ -n "${WP_ADMIN_SLUG:-}" ]]; then _login="/${WP_ADMIN_SLUG}"; else _login="/wp-login.php"; fi
 
@@ -56,86 +67,97 @@ _wasp_vm_notes() {
     -e "s|@@LOGIN@@|${WP_SCHEME:-https}://${WP_DOMAIN:-<vm-ip>}${_login}|g" \
     -e "s|@@VMID@@|${VMID}|g" \
     -e "s|@@BUILD@@|${WASP_VERSION:-unknown}|g" \
-    -e "s|@@NOTE@@|${WASP_VERSION_NOTE:-}|g" \
     -e "s|@@ALPINE@@|${ALPINE_VER}|g" \
     -e "s|@@DATE@@|$(date '+%Y-%m-%d')|g" \
     -e "s|@@ADMINIP@@|${ADMIN_CIDR:-any} ${ALLOWED_ADMIN_IP:-}|g" \
-    -e "s|@@PROXY@@|${PROXY_IP:-not configured}|g"
-<div align="center">
-  <a href="https://github.com/RothITguy-jitsi/alpine-vm-wordpress" target="_blank">
-    <img src="https://raw.githubusercontent.com/RothITguy-jitsi/alpine-vm-wordpress/main/docs/wasp-logo.png" width="220"/>
-  </a>
-</div>
+    -e "s|@@PROXY@@|${PROXY_IP:-none}|g" \
+    -e "s|@@ADMIN@@|${ADMIN_USER:-admin}|g" \
+    -e "s|@@IP@@|${VM_IP:-dhcp}|g"
+### WASP
 
-# WASP — WordPress Alpine Security Platform
+WordPress Alpine Security Platform
 
-**build @@BUILD@@** · Alpine @@ALPINE@@ · installed @@DATE@@
-_@@NOTE@@_
-
-WordPress + MariaDB (internal network, no host port) + CrowdSec
-rootful Podman · nftables · hardened Apache
+**Build** @@BUILD@@
+**Alpine** @@ALPINE@@
+**Installed** @@DATE@@
 
 ---
 
-## Access
+**Admin login**
+@@LOGIN@@
+
+**SSH**
+`ssh @@ADMIN@@@@@IP@@`
+
+**Console**
+`qm terminal @@VMID@@`
+
+---
+
+#### Access
 
 | | |
-|---|---|
-| **Login URL** | @@LOGIN@@ |
-| wp-admin allowed from | @@ADMINIP@@ |
-| Reverse proxy | @@PROXY@@ |
-| Console (always works) | `qm terminal @@VMID@@` |
+|-|-|
+|wp-admin from|@@ADMINIP@@|
+|Proxy|@@PROXY@@|
 
-`/wp-login.php` returns **403** by design. The Login URL above is the way in.
+Anything else gets 403. Root SSH is off.
 
 ---
 
-## Do these five things first
+#### First steps
 
-1. **Finish WordPress setup** — open the Login URL above and complete the installer.
-2. **Verify the VM** — `doas validate-wordpress.sh`
-3. **Prove backups restore** — `doas wasp-selftest.sh all` (~3 min, starts a throwaway DB)
-4. **Send a test alert** — `doas wp-notify.sh --test`, so you know failures will reach you
-5. **Snapshot** — `qm snapshot @@VMID@@ post-install`, before adding plugins
-
----
-
-## Cheat sheet
-
-| Command | What it does |
-|---|---|
-| `validate-wordpress.sh` | ~50 checks, each with the command to fix it |
-| `wasp-testreport.sh` | One full report to read or send on |
-| `update.sh versions` | What image tags are available |
-| `update.sh wp <tag>` | Candidate → CVE scan → health check → cutover, auto-rollback |
-| `wp-plugins.sh vulns` | Installed plugins vs known vulnerabilities |
-| `wp-malware-scan.sh full` | Uploads, core integrity, YARA, database |
-| `wp-hardening.sh status` | Feature toggles and their state |
-| `wp-hardening.sh proxy-check` | What Apache thinks the client IP is |
-| `wp-hardening.sh nginx-snippet` | Proxy config, filled in for this VM |
-| `wp-db-backup.sh` | Verified dump now |
-| `wasp-offsite-backup.sh status` | Off-VM copies: where, encrypted, append-only |
-| `wp-mail.sh test <addr>` | Prove outbound mail works |
-| `wasp-verify-integrity.sh` | Has the tooling changed since install |
+1. Finish WordPress setup at the
+   login URL above.
+2. Enable 2FA in your profile.
+   **Print the backup codes.**
+3. Run the commission check:
+   `wasp-menu` then 7 then 1
 
 ---
 
-## If you are locked out
+#### Day to day
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| **403** on admin | Your IP is not allowed, or mod_remoteip is not substituting it | `wp-hardening.sh proxy-check` |
-| **503** on admin | nginx `limit_req` — its default status is 503 | Remove `limit_req` from the NPM Advanced tab |
-| **502** | Proxy cannot reach the VM, or a redirect loop | `podman logs --tail 40 wordpress` |
-| SSH refused | CrowdSec banned you | `podman exec crowdsec cscli decisions delete --ip <ip>` |
+`wasp-menu` for everything.
 
-Console via `qm terminal @@VMID@@` always works — root SSH is disabled, the console is not.
+| | |
+|-|-|
+|Health|`validate-wordpress.sh --check`|
+|Updates|`update.sh check`|
+|Backups|`wasp-offsite-backup.sh status`|
+|Triage|`wasp-triage.sh`|
+
+Prefix with `doas` when logged in
+as the admin user.
 
 ---
 
-<div align="center">
-  <a href="https://github.com/RothITguy-jitsi/alpine-vm-wordpress">Documentation &amp; issues</a> · by RothITguy
-</div>
+#### If something looks wrong
+
+`doas wasp-triage.sh` checks for
+known defects and says what to do.
+
+`doas wasp-capture.sh report` bundles
+diagnostics, redacted, to send on.
+
+---
+
+#### Recovery
+
+Backups: `/root/wp-db-backups/`
+
+Off-site copies are encrypted with
+the age key. **Without that key they
+cannot be read.** Store it somewhere
+that survives you being unavailable.
+
+See docs/KEY-CUSTODY.md
+
+---
+
+*Notes are generated at install and
+not updated afterwards. The VM is the
+source of truth.*
 NOTES
 }
 

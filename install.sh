@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.13a"
-WASP_VERSION_NOTE="GeoIP weekly cron ran as root against predictable /tmp paths with no timeout - now a bounded mktemp script; component versions verified current"
+WASP_VERSION="2026.08.13c"
+WASP_VERSION_NOTE="An expired R2 token failed silently for a week: off-site staleness is now detected by AGE of the last success, not just by push errors"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

@@ -6,6 +6,92 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13c — The off-site failure was an expired token, and nothing noticed for a week
+
+The operator sent the R2 token screen. It reads:
+
+    orange-butterfly-04dd | test | Object Read & Write | Aug 3, 2026 | Inactive since Aug 11, 2026
+
+Correct permission, correct bucket, and **inactive**. The last successful upload
+was `wp-db-20260811-233512.sql.gz.age`, written on 11 August. The token lapsed
+the same day, and every push since returned 403.
+
+Nothing in any WASP release caused it. The operator's reasonable suspicion --
+"we added Squid or something happened a few revisions ago" -- was wrong, and so
+was my own diagnosis two messages earlier: I had them checking read permissions
+on a token whose permissions were never the problem. Cloudflare R2 tokens can be
+created with a TTL, and an expired one returns 403 **while still displaying the
+correct permissions and bucket**. There is nothing to see on the VM.
+
+**The real defect is that it took a week to find out.** Off-site backups had
+been failing since 11 August. The push error was recorded, but a recorded error
+that never changes reads as one failure rather than every failure since a date,
+and nothing anywhere asked the question that would have caught it: *when did
+this last actually work?*
+
+Four changes, in order of how much they matter:
+
+- **`validate-wordpress.sh --check` now reports off-site STALENESS by age.**
+  `wp-db-backup.sh` records a timestamp on each successful copy; anything older
+  than two days is a warning, seven days is CRITICAL. On a daily schedule, two
+  days means the last two runs failed, whatever the reason. Age is the only
+  signal that survives a silent, unchanging failure -- which is precisely the
+  shape an expired credential has.
+- **`wasp-triage.sh` checks it too**, and checks it BEFORE the error file, so
+  the twelve VMs already deployed can be swept for this in one pass.
+- **`wasp-offsite-backup.sh doctor` now names the expired-token case first**,
+  with the instruction to read the Status column rather than the permissions.
+  If a token is inactive, no amount of checking the VM will help.
+- **The setup prompt says to set the TTL to Forever**, at the moment the token
+  is created, with the reason: a token with an expiry stops working on a date
+  nobody has written down.
+
+The wider lesson is one this log keeps recording from different angles. Every
+control here was working. The backup ran, the error was captured, the tooling
+reported honestly. What was missing was anything that asked how long a thing had
+been broken -- and a failure that looks identical every day is invisible to
+everything except a clock.
+
+---
+
+## 2026.08.13b — Proxmox notes: readable in the panel they actually appear in
+
+Reported with a screenshot: the VM notes panel showed
+"WASP ??? WordPress Alpine Sec" with the title cut off mid-word, and
+"build 2026.08.12w ??" underneath.
+
+**Two problems, both from writing for a terminal instead of a web panel.**
+
+The replacement characters were em-dashes, middots and arrows. Whatever
+encoding Proxmox applies between `qm set --description` and the web UI does not
+survive them, and that is not worth fighting -- the notes are now pure ASCII,
+nothing above codepoint 127.
+
+The truncation was layout. The old notes ran to 122 characters on their longest
+line, written as wide tables for a full-width terminal. The panel is narrow and
+does not wrap gracefully; anything wider is simply cut. Rewritten for roughly 46
+columns and stacked vertically, because Proxmox scrolls the panel down happily
+and only struggles sideways. Longest line is now 34 characters.
+
+The content was reorganised while it was being rewritten, into the order someone
+actually reads it: what this is, how to get in, who is allowed in, the three
+first steps, day-to-day commands, what to do when something looks wrong, and
+recovery. The recovery section states plainly that off-site backups cannot be
+read without the age key and points at KEY-CUSTODY.md, because the VM notes are
+the one document that is guaranteed to still exist when someone is trying to
+recover this machine.
+
+It also now ends by saying the notes are generated at install and not updated
+afterwards, so nobody trusts a stale line in six months' time.
+
+**From the same run's log:** the firewall now loads cleanly -- no syntax error,
+no production blocker -- which confirms the expansion-order and expanding-comment
+fixes on hardware. The two remaining failures are the R2 token and the deferred
+MFA install, both already diagnosable with `wasp-offsite-backup.sh doctor` and
+`wasp-mfa-deferred.sh --status`.
+
+---
+
 ## 2026.08.13a — Completing the verification pass: a CWE-377 in a root cron job
 
 Finishing the parts of the sweep left incomplete: component currency, the full
