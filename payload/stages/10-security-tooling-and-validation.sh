@@ -257,51 +257,39 @@ ok "  Commands: enable|disable [8g|xmlrpc|uploads-php|debug]  |  trivy-scan  |  
 if [ "${MFA_ENFORCE:-0}" = "1" ]; then
   ts "Arranging Two Factor plugin install (deferred until WordPress setup completes)"
 
-  cat > /usr/local/bin/wasp-mfa-deferred.sh << 'MFADEFER'
-#!/bin/sh
-# Installs the Two Factor plugin once WordPress core setup has been completed.
-# Runs from cron; removes its own schedule after a successful install.
-set -u
-LOG=/var/log/wasp-mfa-deferred.log
-STAMP=/etc/wp-install/.mfa-plugin-installed
-[ -f "$STAMP" ] && exit 0
-
-_log() { printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
-
-# Is the site actually installed yet? `wp core is-installed` is the exact
-# question, and it is cheap.
-if ! /usr/local/bin/wp-plugins.sh is-site-installed >/dev/null 2>&1; then
-  exit 0   # setup wizard not finished yet; try again next run, quietly
-fi
-
-_log "WordPress setup detected — installing Two Factor"
-if /usr/local/bin/wp-plugins.sh install two-factor --activate >> "$LOG" 2>&1; then
-  _log "Two Factor installed and activated"
-  : > "$STAMP"
-  # Clear the production blocker this was responsible for, if it is the only one.
-  if [ -f /etc/wp-install/PRODUCTION-BLOCKERS ]; then
-    grep -v 'Two Factor plugin is not active' /etc/wp-install/PRODUCTION-BLOCKERS \
-      > /etc/wp-install/PRODUCTION-BLOCKERS.tmp 2>/dev/null || true
-    if [ -s /etc/wp-install/PRODUCTION-BLOCKERS.tmp ]; then
-      mv -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
-      _log "MFA blocker cleared; other blockers remain"
-    else
-      rm -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
-      _log "MFA blocker cleared; no blockers remain"
-    fi
-  fi
-  logger -t wasp-mfa "Two Factor plugin installed and activated after WordPress setup"
-else
-  _log "Install attempt FAILED — will retry"
-fi
-MFADEFER
-  chmod 0755 /usr/local/bin/wasp-mfa-deferred.sh
+    # Installed as a real file rather than written from a heredoc here.
+  #
+  # It used to be embedded, and that meant it bypassed EVERY check in this
+  # repository: no `sh -n`, no undefined-helper check, no doas-prefix check, no
+  # menu-entry verification. Sixty lines of shell that ran on every client VM
+  # and had never been linted once. A script that matters enough to schedule is
+  # a script that should live in payload/bin/ like the others.
+  install -m 0755 "${PAYLOAD_DIR}/bin/wasp-mfa-deferred.sh" /usr/local/bin/wasp-mfa-deferred.sh
 
   # Every 10 minutes until it succeeds. Cheap: the first check is a single
   # wp-cli call that exits immediately when the site is not yet installed.
   if ! grep -q wasp-mfa-deferred /etc/crontabs/root 2>/dev/null; then
     echo "*/10 * * * * /usr/local/bin/wasp-mfa-deferred.sh >/dev/null 2>&1" >> /etc/crontabs/root
   fi
+  # VERIFY the schedule exists rather than assuming the append worked. An
+  # operator waited twenty minutes for a hook that may never have been
+  # scheduled, and nothing on the box could tell them which. Also make sure
+  # crond is actually running -- a perfect crontab entry does nothing without
+  # it, and that combination is silent.
+  if grep -q wasp-mfa-deferred /etc/crontabs/root 2>/dev/null; then
+    ok "  Scheduled: $(grep wasp-mfa-deferred /etc/crontabs/root | head -1)"
+  else
+    warn "  Could NOT schedule the deferred installer. Run it by hand after setup:"
+    warn "    doas wasp-mfa-deferred.sh --now"
+  fi
+  if rc-service crond status >/dev/null 2>&1; then
+    ok "  crond is running, so the schedule will fire"
+  else
+    warn "  crond is NOT running — the schedule will never fire. Start it:"
+    warn "    doas rc-service crond start && doas rc-update add crond default"
+  fi
+  ok "  Force it any time:  doas wasp-mfa-deferred.sh --now"
+  ok "  Check on it:        doas wasp-mfa-deferred.sh --status"
 
   ok "Two Factor will be installed automatically once you finish WordPress setup"
   ok "  Checked every 10 minutes; progress in /var/log/wasp-mfa-deferred.log"

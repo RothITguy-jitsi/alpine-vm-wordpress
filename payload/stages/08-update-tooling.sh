@@ -142,6 +142,7 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.s
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-capture.sh" /usr/local/bin/wasp-capture.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-menu.sh" /usr/local/bin/wasp-menu.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-triage.sh" /usr/local/bin/wasp-triage.sh
 
 # A login hint so operators discover the menu. Written to /etc/motd (shown on
 # interactive login over SSH and on the console) rather than a shell rc, so it

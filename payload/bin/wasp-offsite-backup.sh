@@ -588,14 +588,52 @@ case "${1:-status}" in
       s3|rclone)
         if rclone --config "$RCLONE_CONF" lsd "${OFFSITE_DEST%%/*}:" >/dev/null 2>&1; then
           _ok "  rclone can reach the remote and list buckets"
+          # Listing a bucket and READING inside it are separate permissions on
+          # R2. Testing both separately isolates a write-only token in one step
+          # instead of leaving the operator to guess between them.
+          if rclone --config "$RCLONE_CONF" ls "${OFFSITE_DEST}" >/dev/null 2>&1; then
+            _ok "  rclone can READ inside ${OFFSITE_DEST}"
+          else
+            _bad "  rclone can list buckets but CANNOT read inside ${OFFSITE_DEST}"
+            _note "    That is a permission split, not a wrong path: the token"
+            _note "    reaches the account but is not allowed to read objects."
+            _note "    Set it to Object Read & Write in the R2 dashboard."
+          fi
         else
           _bad "  rclone CANNOT reach the remote. Its own words:"
           rclone --config "$RCLONE_CONF" lsd "${OFFSITE_DEST%%/*}:" 2>&1 | tail -8 | sed 's/^/      /'
-          _note "  Read that message literally -- it distinguishes the three"
-          _note "  causes that look identical from outside:"
-          _note "    403 / SignatureDoesNotMatch -> the secret key is wrong or empty"
-          _note "    404 / NoSuchBucket          -> the bucket name is wrong"
-          _note "    dial tcp / timeout          -> genuinely a network problem"
+          _note "  Read that message literally -- it distinguishes causes that"
+          _note "  look identical from outside:"
+          _note "    SignatureDoesNotMatch -> the secret key is wrong or empty"
+          _note "    dial tcp / timeout    -> genuinely a network problem"
+          _note "    403 Forbidden         -> see below; it is usually NOT the key"
+          echo ""
+          _note "  ON A PLAIN 403, ESPECIALLY WITH CREDENTIALS YOU KNOW WORK:"
+          _note "  Cloudflare R2 returns 403 -- not 404 -- for a bucket the token"
+          _note "  cannot see. It will not confirm whether a bucket exists to an"
+          _note "  unauthorised caller. So correct keys plus a WRONG BUCKET NAME"
+          _note "  produces the same error as bad keys, which sends you off to"
+          _note "  re-enter credentials that were never the problem."
+          _note "  A 403 on HeadObject specifically is a READ being refused."
+          _note "  rclone HEADs an object before uploading (to decide skip vs"
+          _note "  overwrite) and this tool HEADs after, to verify the size. A"
+          _note "  token with Object WRITE but not Object READ produces exactly"
+          _note "  this: PutObject would succeed, HeadObject 403s, and the"
+          _note "  transfer aborts before or after the bytes move."
+          _note "  Check, in this order:"
+          _note "    1. the token permission: it must be Object Read AND Write."
+          _note "       'Object Write' alone is the usual answer to a HeadObject"
+          _note "       403 on a bucket you can otherwise see."
+          _note "    2. that the token is scoped to THIS bucket, not another"
+          _note "    3. the bucket name and prefix, character by character --"
+          _note "       R2 returns 403 rather than 404 for a bucket a token"
+          _note "       cannot see, so a typo looks identical to bad keys"
+          _note "  A 403 on HeadObject specifically means the upload may have"
+          _note "  succeeded and the size verification was refused -- so check"
+          _note "  the bucket contents in the dashboard before assuming nothing"
+          _note "  was written."
+          echo ""
+          _note "  Configured now:  ${OFFSITE_DEST}"
         fi ;;
       scp|rsync)
         if ssh $(_ssh_opts) -o BatchMode=yes "${OFFSITE_DEST%%:*}" true 2>/dev/null; then

@@ -414,12 +414,57 @@ else
   exit 1
 fi
 
+# ── Weekly refresh helper ────────────────────────────────────────────────────
+# This used to be a single enormous cron line, and it had two real defects for
+# something running WEEKLY AS ROOT:
+#
+#   * It wrote to PREDICTABLE /tmp paths (/tmp/geolite-refresh.tar.gz and
+#     /tmp/geolite-refresh) and untarred into one of them. A local user can
+#     pre-create either as a symlink and redirect a root-owned write -- CWE-377,
+#     the same class already fixed across the rest of this codebase.
+#   * The curl had no --max-time, so a hung MaxMind connection left a root cron
+#     job running until the next reboot.
+#
+# It is now a real script: mktemp'd, bounded, and verified before it replaces
+# a working database with a truncated download.
+cat > /usr/local/bin/wp-geoip-refresh.sh << 'GEOREFRESH'
+#!/bin/sh
+# Weekly GeoLite2-Country refresh. Installed by wp-geoip-setup.sh.
+set -u
+NETRC="${MAXMIND_NETRC:-/root/.maxmind-netrc}"
+DEST=/home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb
+URL='https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz'
+
+[ -r "$NETRC" ] || { logger -t geoip-update "no netrc — skipping refresh"; exit 0; }
+
+_wd=$(mktemp -d) || exit 1
+trap 'rm -rf "$_wd"' EXIT INT TERM
+
+if ! curl -fsSL --max-time 180 --netrc-file "$NETRC" "$URL" -o "$_wd/db.tar.gz"; then
+  logger -t geoip-update "download FAILED — keeping the existing database"
+  exit 1
+fi
+tar xzf "$_wd/db.tar.gz" -C "$_wd" --strip-components=1 2>/dev/null || {
+  logger -t geoip-update "extract FAILED — keeping the existing database"; exit 1; }
+
+_new=$(find "$_wd" -name '*.mmdb' -size +1k 2>/dev/null | head -1)
+[ -n "$_new" ] || { logger -t geoip-update "no usable .mmdb in the archive — keeping the existing database"; exit 1; }
+
+# Replace atomically, so a crash mid-copy cannot leave a half-written database
+# that Apache then fails to load.
+cp -f "$_new" "${DEST}.new" && mv -f "${DEST}.new" "$DEST" \
+  && logger -t geoip-update "GeoLite2-Country refreshed ($(stat -c %s "$DEST" 2>/dev/null) bytes)" \
+  || logger -t geoip-update "install FAILED — keeping the existing database"
+GEOREFRESH
+chmod 0755 /usr/local/bin/wp-geoip-refresh.sh
+
 grep -q "GeoLite2-Country database refresh" /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root << GEOCRON
 # Weekly GeoLite2-Country database refresh (Wednesday 06:00 UTC)
 # Credentials read from ${MAXMIND_NETRC} (chmod 600, root-owned) via
 # --netrc-file — never placed on this line, so they never sit in
 # /etc/crontabs/root itself or reappear in argv/ps output while cron runs it.
-0 6 * * 3 curl -fsSL --netrc-file ${MAXMIND_NETRC} 'https://download.maxmind.com/geoip/databases/GeoLite2-Country/download?suffix=tar.gz' -o /tmp/geolite-refresh.tar.gz && mkdir -p /tmp/geolite-refresh && tar xzf /tmp/geolite-refresh.tar.gz -C /tmp/geolite-refresh --strip-components=1 && find /tmp/geolite-refresh -name '*.mmdb' -exec cp {} /home/wpuser/wp/geoip-db/GeoLite2-Country.mmdb \; && rm -rf /tmp/geolite-refresh /tmp/geolite-refresh.tar.gz && logger -t geoip-update "GeoLite2-Country refreshed"
+
+0 6 * * 3 /usr/local/bin/wp-geoip-refresh.sh
 GEOCRON
 
 echo "=== wp-geoip-setup.sh done — GeoIP ${GEOIP_MODE} (${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST}) active ==="

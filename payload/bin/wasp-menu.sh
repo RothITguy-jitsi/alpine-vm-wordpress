@@ -314,6 +314,7 @@ menu_testing() {
 
   ${B}Testing & validation${R}  ${DIM}(prove it works — nothing here changes the site)${R}
     1) ${GRN}Commission check (guided)${R}      ${DIM}runs the full sequence below${R}
+   20) ${GRN}Known-defect triage${R}            ${DIM}wasp-triage.sh${R}
     ---
     2) Quick health (exit code)      ${DIM}validate-wordpress.sh --check${R}
     3) Full validation               ${DIM}validate-wordpress.sh${R}
@@ -328,6 +329,8 @@ menu_testing() {
    11) Mail path works               ${DIM}wp-mail.sh doctor${R}
    12) wp-cli can reach the site     ${DIM}wp-plugins.sh doctor${R}
    14) MFA / Two Factor status       ${DIM}wp-plugins.sh status${R}
+   18) Install Two Factor NOW        ${DIM}wasp-mfa-deferred.sh --now${R}
+   19) Why hasn't MFA installed?     ${DIM}wasp-mfa-deferred.sh --status${R}
    15) WordPress core version        ${DIM}wp-plugins.sh core-version${R}
    13) ${RED}[!]${R} Prove OFFSITE recovery      ${DIM}wasp-offsite-backup.sh remote-restore-drill${R}
     b) back
@@ -335,6 +338,7 @@ EOF
     printf '\n  select: '; read -r c
     case "$c" in
       1) commission_check ;;
+      20) _have wasp-triage.sh && run "Known-defect triage" 0 wasp-triage.sh || _missing wasp-triage.sh ;;
       2) _have validate-wordpress.sh && run "Quick health" 0 validate-wordpress.sh --check || _missing validate-wordpress.sh ;;
       3) _have validate-wordpress.sh && run "Full validation" 0 validate-wordpress.sh || _missing validate-wordpress.sh ;;
       4) _have wasp-selftest.sh && run "Self-test: all" 0 wasp-selftest.sh all || _missing wasp-selftest.sh ;;
@@ -347,6 +351,8 @@ EOF
       11) _have wp-mail.sh && run "Mail doctor" 0 wp-mail.sh doctor || _missing wp-mail.sh ;;
       12) _have wp-plugins.sh && run "wp-cli doctor" 0 wp-plugins.sh doctor || _missing wp-plugins.sh ;;
       14) _have wp-plugins.sh && run "Plugin / MFA status" 0 wp-plugins.sh status || _missing wp-plugins.sh ;;
+      18) _have wasp-mfa-deferred.sh && run "Install Two Factor now" 0 wasp-mfa-deferred.sh --now || _missing wasp-mfa-deferred.sh ;;
+      19) _have wasp-mfa-deferred.sh && run "Deferred MFA installer status" 0 wasp-mfa-deferred.sh --status || _missing wasp-mfa-deferred.sh ;;
       15) _have wp-plugins.sh && run "WordPress core version (files vs image)" 0 wp-plugins.sh core-version || _missing wp-plugins.sh ;;
       16) _have wp-plugins.sh && run "WordPress file integrity (checksums)" 0 wp-plugins.sh verify || _missing wp-plugins.sh ;;
       13) _have wasp-offsite-backup.sh && run "Remote restore drill" 1 wasp-offsite-backup.sh remote-restore-drill || _missing wasp-offsite-backup.sh ;;
