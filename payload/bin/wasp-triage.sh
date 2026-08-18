@@ -127,6 +127,20 @@ fi
 
 # ── 6. Is anything actually reaching off-site? ──────────────────────────────
 if [ -r /etc/wp-install/rclone.conf ] || grep -q '^OFFSITE_METHOD=' /etc/wp-install/vars.sh 2>/dev/null; then
+  # Age of the last SUCCESSFUL copy, checked before the error file, because an
+  # expired token produces an unchanging error that reads as one failure when
+  # it is actually every failure since a date.
+  if [ -r /etc/wp-install/offsite-last-ok ]; then
+    _oo=$(cat /etc/wp-install/offsite-last-ok 2>/dev/null)
+    _oa=$(( ( $(date +%s) - ${_oo:-0} ) / 86400 ))
+    if [ "$_oa" -ge 2 ]; then
+      _finding CRIT "No off-site backup has succeeded for ${_oa} days." \
+        "Local backups may be fine and this client still has no off-VM copy. Hardware loss takes the backups with the machine. A common cause is an object-storage token with an expiry date: it returns 403 while still displaying the correct permissions and bucket, so nothing on the VM looks wrong." \
+        "doas wasp-offsite-backup.sh doctor   -- and check the token's STATUS column in the provider console, not just its permissions"
+    else
+      _pass "Off-site copy succeeded ${_oa} day(s) ago"
+    fi
+  fi
   if [ -s /etc/wp-install/offsite-last-error ]; then
     _finding WARN "The last off-site backup push FAILED." \
       "Local backups are fine; the off-VM copy is not. A VM lost to hardware failure takes its backups with it." \

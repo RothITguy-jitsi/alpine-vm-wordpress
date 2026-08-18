@@ -130,6 +130,21 @@ if [ "$CHECK_MODE" = "1" ]; then
   # CRITICAL, not warning: the VM completed its build but was explicitly not
   # certified, and that must not fade quietly into a green dashboard.
   [ -s /etc/wp-install/PRODUCTION-BLOCKERS ] && { _p=2; _msg="${_msg}PRODUCTION-BLOCKER "; }
+  # OFF-SITE STALENESS. A failed push is already reported, but a token that
+  # EXPIRES fails every push silently from that day on -- and on a real fleet
+  # that went unnoticed for a week, because nothing on the VM changed. The only
+  # signal that survives a silent, ongoing failure is the AGE of the newest
+  # remote copy, so that is what is checked. Nothing off-site for two days on a
+  # daily schedule means the last two runs failed, whatever the reason.
+  if [ -r /etc/wp-install/offsite-last-ok ]; then
+    _oo=$(cat /etc/wp-install/offsite-last-ok 2>/dev/null)
+    _oa=$(( ( $(date +%s) - ${_oo:-0} ) / 86400 ))
+    if [ "$_oa" -ge 2 ]; then
+      [ "$_p" -lt 1 ] && _p=1
+      [ "$_oa" -ge 7 ] && _p=2
+      _msg="${_msg}offsite-stale-${_oa}d "
+    fi
+  fi
 
   # --check --prom : same signal as Prometheus text for a textfile collector or
   # scrape endpoint (docs/FLEET.md Layer C). Stable metric names so a Grafana

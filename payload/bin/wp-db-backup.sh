@@ -158,6 +158,11 @@ if [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
   if /usr/local/bin/wasp-offsite-backup.sh push "${BACKUP_FILE}" >"$_OFFLOG" 2>&1; then
     logger -t wp-db-backup "off-VM copy sent and size-verified"
     rm -f "$_LAST_OFF_ERR"
+    # Timestamp of the last SUCCESSFUL off-site copy. Its age is the only
+    # signal that survives a silently-failing push -- an expired token keeps
+    # failing identically forever, so "when did this last work" is the question
+    # that actually detects it.
+    date +%s > /etc/wp-install/offsite-last-ok 2>/dev/null || true
   else
     logger -t wp-db-backup "OFF-VM COPY FAILED — the local backup is fine, the remote copy is not"
     sed 's/^/  /' "$_OFFLOG" 2>/dev/null | logger -t wp-db-backup
