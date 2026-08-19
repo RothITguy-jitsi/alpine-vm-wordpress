@@ -6,6 +6,52 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13d — A pasted label, and two fixes that were made but never shipped
+
+The R2 failure was finally visible in one line of the config:
+
+    secret_access_key = Secret Access Key: 14550d5c...
+
+The label had been copied along with the value from the provider's panel.
+rclone sent that whole string as the secret, every signature failed, and the
+only symptom was `AccessDenied` on `ListBuckets` — indistinguishable from a
+wrong or expired token, which is exactly where the investigation went. Two
+sessions were spent on token permissions, bucket scope, and expiry, all of
+which were correct throughout.
+
+**Guarded in two places.** `set-credentials` now refuses a value containing a
+space or a colon before writing it: these keys are hex, and a provider's panel
+puts a label beside the value where it is easy to copy both. And `doctor` scans
+an EXISTING `rclone.conf` for the same shape, because the twelve VMs already
+deployed may be in that state right now and the symptom gives no hint.
+
+**Also shipped: two fixes made last session and never packaged.** Worth naming
+rather than quietly including, since the operator had to ask:
+
+- `wasp-offsite-backup.sh set-credentials` — replacing storage credentials
+  previously meant hand-editing `rclone.conf`, which is how the pasted label
+  got in. It keeps the old file as `.prev`, and tests the new keys against the
+  destination before declaring success rather than leaving the operator to find
+  out at the next backup.
+- The commission check printed the build's own VERSION NOTE as though it were a
+  failure, because the note contained the word "failed". The filter now matches
+  `[FAIL]` markers rather than prose.
+
+Two things carry forward, both recorded so they are not lost:
+
+**CrowdSec does not see failed 2FA attempts.** A correct password with a wrong
+TOTP code fires no `wp_login_failed`, so the WordPress scenarios never trigger
+and no ban is issued. The Two Factor plugin's own rate limiter stops the
+attempt — which is why it felt handled — but an attacker holding a valid
+password can grind codes without ever earning a firewall ban. The login guard
+returning 429 early may also be starving CrowdSec of the events it needs.
+
+**Credentials pasted into a support channel are compromised.** The keys, account
+token and R2 token from this diagnosis should be rotated regardless of whether
+the backup now works.
+
+---
+
 ## 2026.08.13c — The off-site failure was an expired token, and nothing noticed for a week
 
 The operator sent the R2 token screen. It reads:

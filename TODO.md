@@ -527,3 +527,25 @@ redirect loop that no individual check caught (see the 2026.08.11h entry).
 duplication safe, but the real fix is one function emitting both. Worth doing
 the next time this area is touched.
 
+### CrowdSec does not see failed 2FA attempts
+
+Found in the field. A login with the CORRECT password and a wrong TOTP code
+fires no `wp_login_failed` event, so CrowdSec's WordPress scenarios never see
+it and no ban is issued. The Two Factor plugin's own rate limiter stops the
+attempt, which is why it looks handled -- but an attacker who already holds a
+valid password can grind second factors indefinitely without ever earning a
+firewall ban.
+
+Two contributing parts, and they need separating before fixing:
+
+  * WordPress emits no standard event for a failed second factor, so there may
+    be nothing in the log for CrowdSec to parse. A custom acquisition rule
+    against the Two Factor plugin's own log lines is the likely shape.
+  * The login guard's 429 may fire early enough that WordPress never records
+    enough failures for a scenario to trigger at all -- a control working so
+    well it starves the one behind it.
+
+Worth doing properly rather than quickly: a scenario that bans too eagerly on
+2FA prompts will lock out the legitimate admin who fat-fingered a code twice,
+which is a worse outcome than the gap.
+
