@@ -54,7 +54,10 @@ if ! _probe=$(/usr/local/bin/wp-plugins.sh is-site-installed 2>&1); then
 fi
 
 _log "WordPress setup detected — installing Two Factor"
-if /usr/local/bin/wp-plugins.sh install two-factor --activate >> "$LOG" 2>&1; then
+_rc=0
+  _out=$(/usr/local/bin/wp-plugins.sh install two-factor --activate 2>&1) || _rc=$?
+  printf '%s\n' "$_out" >> "$LOG"
+  if [ "$_rc" -eq 0 ]; then
   _log "Two Factor installed and activated"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$STAMP"
   # Clear the production blocker this was responsible for, if it is the only one.
@@ -72,4 +75,15 @@ if /usr/local/bin/wp-plugins.sh install two-factor --activate >> "$LOG" 2>&1; th
   logger -t wasp-mfa "Two Factor plugin installed and activated after WordPress setup"
 else
   _log "Install attempt FAILED — will retry"
+  # Show wp-cli's ACTUAL output. This used to log only "FAILED", which is the
+  # one thing the operator already knows. Diagnosing it then meant re-running
+  # the underlying command by hand -- and a tool whose whole purpose is making
+  # a silent failure visible should not itself be the thing hiding it.
+  if [ -n "${_out:-}" ]; then
+    _log "  wp-cli said:"
+    printf '%s\n' "$_out" | tail -12 | while IFS= read -r _l; do _log "    ${_l}"; done
+  fi
+  _log "  If this says 'unexpected error ... server configuration', check that"
+  _log "  wp-config.php has WP_PROXY_HOST when the egress proxy is enabled:"
+  _log "    doas grep WP_PROXY /home/wpuser/wp/html/wp-config.php"
 fi

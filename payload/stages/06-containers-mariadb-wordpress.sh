@@ -536,6 +536,56 @@ done
 [ "$WP_READY" = "0" ] && warn "WordPress did not pass full health validation after 24 attempts — check: podman logs wordpress"
 ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>/dev/null)"
 
+# ── Verify wp-config.php actually received WORDPRESS_CONFIG_EXTRA ────────────
+# The official image writes wp-config.php ONLY on first run. Once the file
+# exists, WORDPRESS_CONFIG_EXTRA is ignored entirely -- so any later recreation
+# of the container (the GeoIP rebuild does exactly this) cannot add defines,
+# and passing the variable correctly is not the same as the defines arriving.
+#
+# Found on a live VM: WP_PROXY_HOST was absent from wp-config.php while the
+# egress proxy was enabled. WordPress's HTTP API therefore had no proxy, and
+# `wp plugin install` failed with "An unexpected error occurred. Something may
+# be wrong with WordPress.org or this server's configuration" -- WITHOUT ever
+# opening a connection, which Squid's access log confirmed by showing nothing
+# at all for those attempts. Two sessions were spent on egress theories for a
+# proxy that was working perfectly; the request never reached it.
+#
+# So verify the file rather than trusting the variable, and repair it in place.
+_WPCFG=/home/wpuser/wp/html/wp-config.php
+if [ -f "$_WPCFG" ] && [ -n "${WP_CONFIG_EXTRA:-}" ]; then
+  _missing=0
+  for _need in WP_PROXY_HOST DISALLOW_FILE_MODS WP_HOME; do
+    case "$WP_CONFIG_EXTRA" in
+      *"$_need"*)
+        grep -q "$_need" "$_WPCFG" 2>/dev/null || _missing=1 ;;
+    esac
+  done
+  if [ "$_missing" = 1 ]; then
+    warn "wp-config.php is missing defines that were passed to the container."
+    warn "  The image writes that file only on first run, so a later rebuild"
+    warn "  cannot add them. Injecting them now."
+    cp -a "$_WPCFG" "${_WPCFG}.pre-inject" 2>/dev/null || true
+    # Insert before the marker the image itself writes.
+    _tmp=$(mktemp) || _tmp=""
+    if [ -n "$_tmp" ]; then
+      awk -v extra="$WP_CONFIG_EXTRA" '
+        /That.s all, stop editing/ && !done { print extra; done=1 }
+        { print }
+      ' "$_WPCFG" > "$_tmp" && mv -f "$_tmp" "$_WPCFG"
+      chown 33:33 "$_WPCFG" 2>/dev/null || true
+      chmod 640 "$_WPCFG" 2>/dev/null || true
+      if grep -q WP_PROXY_HOST "$_WPCFG" 2>/dev/null || [ "${EGRESS_PROXY:-0}" != "1" ]; then
+        ok "  wp-config.php repaired (backup at ${_WPCFG}.pre-inject)"
+        podman restart wordpress >/dev/null 2>&1 || true
+      else
+        warn "  Injection did not take — inspect ${_WPCFG} by hand."
+      fi
+    fi
+  else
+    ok "  wp-config.php contains the expected defines"
+  fi
+fi
+
 # ── Re-assert the mu-plugins now that WordPress has finished unpacking ───────
 # These were written BEFORE the container's first start, which is too early.
 # The official image's entrypoint extracts WordPress core into the docroot when
