@@ -6,6 +6,48 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13g — MFA root cause: wp-config.php never received the proxy defines
+
+Found by the one check that could distinguish the theories -- Squid's access
+log showing NOTHING for an install attempt that had just failed. The request
+never left the VM, so every egress explanation was wrong, including two of mine.
+
+    doas grep -n WP_PROXY /home/wpuser/wp/html/wp-config.php
+    (no output)
+
+**`WORDPRESS_CONFIG_EXTRA` was passed correctly and ignored.** The official
+WordPress image writes `wp-config.php` ONLY on first run; once the file exists
+the variable has no effect. Any later recreation of the container -- and the
+GeoIP rebuild does exactly that -- cannot add defines. So the proxy constants
+were built correctly, passed correctly on `podman run`, and never reached the
+file.
+
+WordPress's HTTP API reads `WP_PROXY_HOST` from wp-config, not from the
+environment. Without it, `plugins_api()` attempted a direct connection that the
+firewall drops, and reported "An unexpected error occurred. Something may be
+wrong with WordPress.org or this server's configuration" -- a message that
+points at WordPress.org for what is a local configuration gap. Two sessions
+went into egress theories for a proxy working perfectly.
+
+**Now verified rather than assumed.** After WordPress is confirmed healthy, the
+install checks that the defines it passed are actually present in
+`wp-config.php` and injects them if not, keeping a `.pre-inject` backup and
+restarting the container. Same shape as the mu-plugin repair added earlier, and
+the same underlying lesson: with this image, passing a value is not the same as
+the value arriving.
+
+**The deferred MFA installer no longer hides the reason.** It logged "Install
+attempt FAILED" and discarded wp-cli's output -- the one line that would have
+identified this on the first run rather than the tenth. It now logs what wp-cli
+actually said, and names this specific cause with the command to check it.
+
+Adding that introduced an unguarded `_out=$(cmd); _rc=$?`, and
+`check-seterr-capture.py` caught it immediately -- the check written for
+exactly that trap, catching it in the act, three releases after the bug that
+prompted it.
+
+---
+
 ## 2026.08.13f — Squid was working. The check was wrong.
 
 The operator ran `podman logs squid` and it settled two things at once:
