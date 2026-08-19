@@ -155,6 +155,7 @@ menu_backup() {
     1) Run a backup now              ${DIM}wp-db-backup.sh${R}
     2) Off-site backup status        ${DIM}wasp-offsite-backup.sh status${R}
     7) Why is nothing off-VM?        ${DIM}wasp-offsite-backup.sh doctor${R}
+    8) Replace storage credentials   ${DIM}wasp-offsite-backup.sh set-credentials${R}
     3) List off-site backups         ${DIM}wasp-offsite-backup.sh list${R}
     4) ${RED}[!]${R} Prove offsite recovery      ${DIM}wasp-offsite-backup.sh remote-restore-drill${R}
     5) ${RED}[!]${R} Restore from backup          ${DIM}wasp-offsite-backup.sh restore${R}
@@ -166,6 +167,7 @@ EOF
       1) _have wp-db-backup.sh && run "Run a backup" 0 wp-db-backup.sh || _missing wp-db-backup.sh ;;
       2) _have wasp-offsite-backup.sh && run "Off-site status" 0 wasp-offsite-backup.sh status || _missing wasp-offsite-backup.sh ;;
       7) _have wasp-offsite-backup.sh && run "Off-site diagnosis" 0 wasp-offsite-backup.sh doctor || _missing wasp-offsite-backup.sh ;;
+      8) _have wasp-offsite-backup.sh && run "Replace storage credentials" 1 wasp-offsite-backup.sh set-credentials || _missing wasp-offsite-backup.sh ;;
       3) _have wasp-offsite-backup.sh && run "List off-site" 0 wasp-offsite-backup.sh list || _missing wasp-offsite-backup.sh ;;
       4) _have wasp-offsite-backup.sh && run "Remote restore drill" 1 wasp-offsite-backup.sh remote-restore-drill || _missing wasp-offsite-backup.sh ;;
       5) _have wasp-offsite-backup.sh && run "Restore from backup" 1 wasp-offsite-backup.sh restore || _missing wasp-offsite-backup.sh ;;
@@ -412,8 +414,8 @@ EOF
       # Prefer explicit failure markers; fall back to the tail only if none
       # are found.
       if grep -qE '✗|FAIL|failed|not holding|Unknown option' "$_cc_log" 2>/dev/null; then
-        grep -E '✗|FAIL|failed|not holding|Unknown option' "$_cc_log" \
-          | grep -vE 'CHECKS FAILED|Result: FAILED|failed [0-9]+$' \
+        grep -E '✗|\[FAIL\]|not holding|Unknown option' "$_cc_log" \
+          | grep -vE 'CHECKS FAILED|Result: FAILED|failed [0-9]+$|silently for a week' \
           | head -8 | sed 's/^/       /'
       else
         tail -8 "$_cc_log" | sed 's/^/       /'

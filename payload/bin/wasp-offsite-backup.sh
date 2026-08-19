@@ -565,12 +565,96 @@ case "${1:-status}" in
     else
       _bad "Remote ${_b} is ${_rsz} bytes, local is ${_sz}"; exit 1
     fi ;;
+  set-credentials|creds)
+    # Replace the object-storage credentials WITHOUT hand-editing rclone.conf.
+    # Added because there was no command for it: an operator whose token had
+    # expired had to open the config in an editor, which is both error-prone
+    # and the sort of thing nobody wants to do on a client VM at 5pm.
+    _configured || { _bad "Off-site backup is not configured. Run: doas wasp-offsite-backup.sh init"; exit 1; }
+    case "$OFFSITE_METHOD" in
+      s3|rclone) : ;;
+      *) _bad "This only applies to s3/rclone destinations (this VM uses ${OFFSITE_METHOD})."; exit 1 ;;
+    esac
+    _hdr "Replace object-storage credentials"
+    _note "The current keys stay in place until both new values are entered."
+    _note "Nothing is written if you cancel."
+    echo ""
+    printf '  Access key ID     : '
+    read -r _ak
+    [ -n "$_ak" ] || { _bad "Cancelled — nothing changed."; exit 1; }
+    printf '  Secret access key : '
+    stty -echo 2>/dev/null; read -r _sk; stty echo 2>/dev/null; echo
+    [ -n "$_sk" ] || { _bad "Cancelled — nothing changed."; exit 1; }
+
+    # REJECT A PASTED LABEL. Found in the field: rclone.conf contained
+    #     secret_access_key = Secret Access Key: 14550d5c...
+    # because the label was copied along with the value from the provider's
+    # panel. rclone sent the whole string as the secret, every signature
+    # failed, and the only symptom was AccessDenied on ListBuckets a day
+    # later -- indistinguishable from a wrong or expired token, which is
+    # where the investigation went instead.
+    #
+    # These keys are hex or base64: no spaces, no colons. Refusing here costs
+    # a second and saves that entire detour.
+    for _v in "$_ak" "$_sk"; do
+      case "$_v" in
+        *[[:space:]]*|*:*)
+          _bad "That value contains a space or a colon."
+          _note "  Provider panels put a label next to the value, and it is easy"
+          _note "  to copy both. Paste ONLY the key itself -- no 'Access Key ID:'"
+          _note "  or 'Secret Access Key:' prefix, and no trailing spaces."
+          _note "  Nothing was changed."
+          exit 1 ;;
+      esac
+    done
+
+    # Keep a copy, so a mistyped key is recoverable without a redeploy.
+    cp -a "$RCLONE_CONF" "${RCLONE_CONF}.prev" 2>/dev/null || true
+    chmod 600 "${RCLONE_CONF}.prev" 2>/dev/null || true
+
+    _tmp=$(mktemp) || exit 1
+    sed -e "s|^access_key_id *=.*|access_key_id = ${_ak}|" \
+        -e "s|^secret_access_key *=.*|secret_access_key = ${_sk}|" \
+        "$RCLONE_CONF" > "$_tmp" && mv -f "$_tmp" "$RCLONE_CONF"
+    chmod 600 "$RCLONE_CONF"
+    _sk=""; _ak=""
+    _ok "Credentials replaced (previous kept at ${RCLONE_CONF}.prev)"
+    echo ""
+
+    # Prove it before declaring success -- the whole reason this exists is that
+    # a credential problem was invisible for a week.
+    _note "Testing…"
+    if rclone --config "$RCLONE_CONF" ls "${OFFSITE_DEST}" >/dev/null 2>&1; then
+      _ok "The new credentials can READ ${OFFSITE_DEST}"
+      _note "Now send one:  doas wp-db-backup.sh"
+    else
+      _bad "The new credentials still cannot read ${OFFSITE_DEST}:"
+      rclone --config "$RCLONE_CONF" ls "${OFFSITE_DEST}" 2>&1 | tail -6 | sed 's/^/    /'
+      _note "  Roll back with:  doas mv ${RCLONE_CONF}.prev ${RCLONE_CONF}"
+      _note "  Or diagnose:     doas wasp-offsite-backup.sh doctor"
+      exit 1
+    fi ;;
+
   doctor)
     # Answers "why is nothing off-VM" in one command, in the order the
     # questions actually arise. Added because an operator reasonably suspected
     # Squid, and nothing on the box could confirm or rule that out.
     _configured || { _bad "Off-VM backup is not configured. Run: doas wasp-offsite-backup.sh init"; exit 1; }
     _hdr "Off-VM backup diagnosis"
+
+    # Look for a pasted label in the existing config before anything else --
+    # it produces AccessDenied that reads exactly like a bad or expired token.
+    if [ -r "$RCLONE_CONF" ] && grep -qiE '^(access_key_id|secret_access_key) *=.*(:| [A-Za-z]+ )' "$RCLONE_CONF" 2>/dev/null; then
+      _bad "rclone.conf looks like it contains a PASTED LABEL, not just a key:"
+      grep -inE '^(access_key_id|secret_access_key) *=' "$RCLONE_CONF" \
+        | sed -e 's/= *\(.\{0,18\}\).*/= \1…/' -e 's/^/    /'
+      _note "  A value containing a colon or spaces is not a valid key. The"
+      _note "  provider's panel puts a label beside the value and both get"
+      _note "  copied. Every request then fails signature validation, which"
+      _note "  surfaces as AccessDenied -- identical to a wrong token."
+      _note "  Fix:  doas wasp-offsite-backup.sh set-credentials"
+      echo ""
+    fi
 
     _note "1. Does the egress proxy apply to this at all?"
     _note "   No. rclone/scp run on the HOST, so they use the nftables OUTPUT"
