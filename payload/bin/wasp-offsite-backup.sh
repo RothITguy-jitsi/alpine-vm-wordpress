@@ -847,6 +847,20 @@ case "${1:-status}" in
       sleep 2; _n=$((_n+1)); done
     [ "$_rdy" = 1 ] || { _bad "Throwaway database did not become ready"; podman rm -f "$_cont" >/dev/null 2>&1; exit 1; }
 
+    # Credentials via a defaults file INSIDE the container, not MYSQL_PWD.
+    #
+    # On a real drill the readiness ping passed and the restore then failed with
+    # ERROR 1045 using the same MYSQL_PWD. The two commands resolve credentials
+    # differently -- mariadb-admin over the socket can satisfy unix_socket auth
+    # while the client falls back to password auth -- and chasing which is which
+    # is not worth it when the documented, unambiguous mechanism exists.
+    #
+    # A defaults file is read by every MariaDB client identically, keeps the
+    # password out of argv AND out of the environment, and is deleted with the
+    # throwaway container seconds later.
+    podman exec "$_cont" sh -c \
+      'umask 077; printf "[client]\npassword=%s\n" "$1" > /tmp/.drill.cnf' _ "$_rpw" 2>/dev/null
+
     _note "Restoring the decrypted dump…"
     # Password via MYSQL_PWD in the environment, not -p on the command line.
     # On a real drill the readiness ping succeeded and the restore then failed
@@ -854,8 +868,8 @@ case "${1:-status}" in
     # that the restore pipes a dump on stdin. Passing the credential as an
     # environment variable removes the quoting from the equation entirely and
     # keeps it out of argv inside the container as a bonus.
-    if gzip -dc "$_plain" | podman exec -i -e MYSQL_PWD="$_rpw" "$_cont" \
-         mariadb -uroot --database=drill 2>"$_ERRF"; then
+    if gzip -dc "$_plain" | podman exec -i "$_cont" \
+         mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot --database=drill 2>"$_ERRF"; then
       _ok "Restore completed into the throwaway database"
     else
       _bad "Restore FAILED even though the object decrypted."
@@ -868,7 +882,9 @@ case "${1:-status}" in
     fi
 
     # 5. Sanity-check content: a restore that loads an empty dump is not a pass.
-    _tables=$(podman exec -e MYSQL_PWD="$_rpw" "$_cont" \
+    _tables=$(podman exec "$_cont" \
+      mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='drill';" 2>/dev/null) || _tables=""
+    _unused=$(podman exec -e MYSQL_PWD="$_rpw" "$_cont" \
       mariadb -uroot -N -e 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema="drill";' 2>/dev/null)
     if [ "${_tables:-0}" -gt 0 ]; then
       _ok "Restored database contains ${_tables} table(s)"

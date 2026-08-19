@@ -696,6 +696,25 @@ scan_image() {
       # MANIFEST_UNKNOWN, is last and easily missed. Detect it and say so
       # plainly, because the remedy is completely different: pick a tag that
       # exists, rather than debug the scanner.
+      # A LOCALLY BUILT image has no registry to exist in, and saying it does
+      # not is true and useless. Reported from a live VM: the GeoIP layer is
+      # built on the host as localhost/wordpress-geoip:..., and every scan
+      # reported "does not exist in the registry" for the one image most worth
+      # scanning, because it is the only one this project assembles itself.
+      # Trivy can read it straight from local storage.
+      case "${img}" in
+        localhost/*)
+          if podman image exists "${img}" 2>/dev/null; then
+            echo "  ℹ  ${img} is built locally — scanning from local storage." >&2
+            if trivy image --severity HIGH,CRITICAL --scanners vuln \
+                 --image-src podman "${img}" 2>>"${_trivy_err}"; then
+              return 0
+            fi
+            echo "  ⚠  Local scan of ${img} did not complete:" >&2
+            tail -5 "${_trivy_err}" 2>/dev/null | sed 's/^/       /' >&2
+            return 1
+          fi ;;
+      esac
       if grep -qiE "MANIFEST_UNKNOWN|manifest unknown|unknown tag|not found|NAME_UNKNOWN" "${_trivy_err}" 2>/dev/null; then
         echo "  ✗  The image tag does not exist in the registry:" >&2
         echo "       ${img}" >&2

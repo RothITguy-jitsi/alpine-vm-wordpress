@@ -91,10 +91,29 @@ status)
   printf '  Mode : %s\n' "$_m"
   [ "$_exp" = 1 ] && _note "(a maintenance window expired just now and was closed)"
 
-  if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+  # Ask podman with a FILTER rather than grepping its formatted output, and
+  # confirm the proxy is actually SERVING rather than merely present.
+  #
+  # Reported from a live VM: this said "Squid is NOT running" while Squid's own
+  # access log showed it tunnelling to api.wordpress.org and correctly refusing
+  # example.com in the same second. A false negative here is expensive -- it
+  # sent an investigation after a working proxy and made every downstream
+  # failure look like a consequence of it.
+  if podman ps --filter 'name=^squid$' --filter status=running \
+       --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
     _ok "Squid is running"
+    # Running is not the same as answering. One probe settles it.
+    if podman exec squid squid -k check >/dev/null 2>&1; then
+      _ok "  and responding to its own control interface"
+    else
+      _note "  (control check did not answer; see: doas podman logs --tail 30 squid)"
+    fi
   else
     _bad "Squid is NOT running"
+    _note "  If Squid's access log shows recent traffic, this check is wrong,"
+    _note "  not Squid. Confirm directly:"
+    _note "    doas podman ps -a --filter name=squid"
+    _note "    doas podman logs --tail 20 squid"
     _note "WordPress web egress is therefore failing — which is the intended"
     _note "behaviour, not a secondary fault. The boundary fails closed."
     _note "  doas podman logs --tail 30 squid"
