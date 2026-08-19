@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.13d"
-WASP_VERSION_NOTE="set-credentials command with a pasted-label guard (a copied Secret Access Key: prefix caused a day of AccessDenied); commission check no longer prints the version note as a failure"
+WASP_VERSION="2026.08.13f"
+WASP_VERSION_NOTE="Squid was working the whole time: the status check was wrong and the pinger FATAL was noise; both fixed"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified

@@ -6,6 +6,89 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13f — Squid was working. The check was wrong.
+
+The operator ran `podman logs squid` and it settled two things at once:
+
+    TCP_TUNNEL/200 CONNECT api.wordpress.org:443       allowed
+    TCP_TUNNEL/200 CONNECT downloads.wordpress.org:443 the plugin downloading
+    TCP_DENIED/403 example.com:443                     denied
+    TCP_DENIED/403 169.254.169.254                     metadata denied
+    TCP_DENIED/403 api.wordpress.org:22                non-443 CONNECT denied
+
+Every allowed destination tunnels, every denied one is refused, cloud metadata
+is blocked and CONNECT is confined to 443. **The egress boundary is doing
+exactly what it was built to do**, and had been the whole time
+`wasp-egress status` was reporting "Squid is NOT running".
+
+**The status check was the fault.** It grepped `podman ps` formatted output for
+an exact name. It now asks podman with a filter, and then probes the control
+interface — because running is not the same as answering. When it does report
+Squid down it now says how to disprove it, since a false negative here sent an
+investigation after a working proxy and made every downstream failure look like
+a consequence of it.
+
+**And the FATAL in the log was the pinger, not Squid.** The pinger measures ICMP
+round-trip times to choose between CACHE PEERS. There are none here — this is a
+single forward proxy — so it has nothing to measure, and it cannot work anyway
+because raw ICMP sockets need CAP_NET_RAW and this container runs
+`--cap-drop ALL` deliberately. Squid carries on serving perfectly; the FATAL
+belongs to the helper process.
+
+Now `pinger_enable off`. The reasoning is the same one applied to the empty-ACL
+warnings earlier in this series: a config whose normal state contains the word
+FATAL is one where a real fatal error goes unread. That is not hypothetical
+here — an operator read it exactly that way, and reasonably.
+
+Worth stating plainly for the record: of the three failures in that commission
+run, one was a broken check, one was noise from a helper that should never have
+been enabled, and the third — MFA — was downstream of believing the first two.
+The log also shows `CONNECT downloads.wordpress.org:443` succeeding, which is
+the plugin fetch working.
+
+---
+
+## 2026.08.13e — The restore drill reached the database
+
+The most significant line in this log is not a failure:
+
+    Decrypted with the recovery key
+    Archive passes gzip integrity
+    Starting a throwaway MariaDB (isolated, no host port)...
+
+The off-site object was pulled from R2, decrypted with the operator's recovery
+key, and verified intact. Every part of the chain this project has been unable
+to demonstrate for weeks — the token, the bucket, the encryption, the key
+custody — worked. Only the final restore failed.
+
+**ERROR 1045 on the restore, and MYSQL_PWD was the wrong mechanism.** The
+readiness ping passed with the same credential moments earlier, so the container
+was up and the password was right. `mariadb-admin` and the `mariadb` client
+resolve credentials differently over a socket — one can satisfy unix_socket auth
+where the other falls back to a password — and chasing which is which is not
+worth it when an unambiguous mechanism exists. The drill now writes a
+`[client]` defaults file inside the throwaway container and passes
+`--defaults-extra-file`. Every MariaDB client reads it identically, the password
+is in neither argv nor the environment, and it is destroyed with the container
+seconds later.
+
+**Trivy was asking a registry about an image built on the host.** The GeoIP
+layer is assembled locally as `localhost/wordpress-geoip:...`, so every scan
+reported "the image tag does not exist in the registry" — true, useless, and
+aimed at the one image most worth scanning, because it is the only one this
+project builds itself. Local images are now scanned straight from podman
+storage.
+
+**Still failing, and the cause is upstream of all of it: Squid is not running.**
+`wasp-egress status` reports it plainly, and everything downstream follows —
+the MFA install cannot reach wordpress.org, the egress test gets no answer, and
+the deferred installer retries every ten minutes against a closed path. The
+boundary is failing closed, which is correct behaviour, but the proxy being down
+is not. `doas podman logs --tail 30 squid` is the next step, and it is the one
+thing that has to be resolved before the MFA and egress failures mean anything.
+
+---
+
 ## 2026.08.13d — A pasted label, and two fixes that were made but never shipped
 
 The R2 failure was finally visible in one line of the config:
