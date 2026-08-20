@@ -6,6 +6,48 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13h — ERROR 1045: the restore was invalidating its own credentials
+
+Third attempt at this, and the first two were fixing the wrong thing.
+
+    ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+                        (using password: YES)
+
+**"using password: YES" is the tell.** A password WAS sent and rejected — by a
+server that had accepted the identical credential for the readiness ping
+seconds earlier. The credential was never wrong. It stopped being right
+partway through the restore.
+
+The backup is `mariadb-dump --all-databases`, which includes the **`mysql`
+schema**. Restoring that into the throwaway container overwrites its own
+`global_priv` table with the SOURCE system's credentials — so the connection
+executing the restore invalidates itself mid-stream, and every statement after
+that point fails.
+
+That explains everything the earlier attempts could not: the object decrypts,
+gzip integrity passes, the container starts, the ping authenticates, and only
+the restore fails. Two releases were spent on how the password was passed —
+`MYSQL_PWD`, then a defaults file — when the password was correct each time.
+
+**Fixed by skipping the system schemas.** `mysql`, `performance_schema`,
+`information_schema` and `sys` are filtered out of the stream before it reaches
+the client. They are not what a drill proves: the question is whether the
+SITE's data comes back, and restoring another system's user table into a
+throwaway container proves nothing and breaks the restore doing it. The table
+count now excludes them too, so the verification reflects restored site data
+rather than the scratch server's own schema.
+
+The awk filter is anchored on the `-- Current Database:` markers mariadb-dump
+emits, and was tested against that exact output rather than assumed.
+
+**Worth recording as a diagnostic lesson.** The error named the failure
+precisely — "using password: YES" distinguishes a rejected password from a
+missing one — and I read past it twice, treating it as a credential-passing
+problem because that is the shape 1045 usually has. The detail that would have
+settled it on the first attempt was there from the beginning.
+
+---
+
 ## 2026.08.13g — MFA root cause: wp-config.php never received the proxy defines
 
 Found by the one check that could distinguish the theories -- Squid's access

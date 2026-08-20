@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.13g"
-WASP_VERSION_NOTE="MFA ROOT CAUSE: wp-config.php never received WP_PROXY_HOST because the image writes that file only on first run; now verified and repaired at install"
+WASP_VERSION="2026.08.13h"
+WASP_VERSION_NOTE="Restore drill ERROR 1045 root cause: the all-databases dump overwrote the scratch containers own credentials mid-restore; system schemas are now skipped"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
