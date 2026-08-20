@@ -54,12 +54,19 @@ _wpcli_image() {
 }
 _wp() {
   # shellcheck disable=SC2086
+  # The wp-cli container also mounts /var/www/private (read-only). Without it
+  # the SMTP mu-plugin loads, finds no config, and returns early -- so
+  # PHPMailer falls back to PHP mail() and tries a local sendmail that does not
+  # exist: "sendmail: can't connect to remote host (127.0.0.1)". Every other
+  # mail check passes, because the relay, DNS and firewall are fine; the
+  # credential simply was not visible to the process being asked to send.
   podman run --rm \
     --network "container:wordpress" \
     --user 33:33 \
     --env-file /etc/wordpress/env \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     ${WPCLI_ENV:-} \
+    -v /home/wpuser/wp/secrets:/var/www/private:ro \
     -v /home/wpuser/wp/html:/var/www/html \
     "$(_wpcli_image)" wp --path=/var/www/html "$@"
 }

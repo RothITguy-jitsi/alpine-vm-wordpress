@@ -886,14 +886,22 @@ case "${1:-status}" in
     #
     # The system schemas are not what a drill is proving. Skip them and restore
     # the site's data, which is the thing that has to come back.
-    if gzip -dc "$_plain" \
-       | awk '
-           /^-- Current Database: `(mysql|performance_schema|information_schema|sys)`/ { skip=1; next }
-           /^-- Current Database: `/ { skip=0 }
-           !skip
-         ' \
-       | podman exec -i "$_cont" \
-         mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot 2>"$_ERRF"; then
+    # USE THE FORM THAT DEMONSTRABLY WORKS.
+    #
+    # wasp-selftest.sh restores the identical dump into an identical throwaway
+    # container with `-p"$pw"` inline, and it PASSES -- the same run that fails
+    # here reports "[PASS] Archive restored without error". Two theories were
+    # tried instead and both were wrong: MYSQL_PWD, then a defaults file, and
+    # then filtering the mysql schema on the assumption the restore was
+    # invalidating its own credentials. The local path does none of that and
+    # succeeds, which disproves all three.
+    #
+    # So this now matches the working code rather than improving on it. The
+    # password is random, the container is unreachable from the host network,
+    # and it is destroyed seconds later -- argv exposure inside it is a smaller
+    # risk than a restore drill that has never once completed.
+    if gzip -dc "$_plain" | podman exec -i "$_cont" \
+         mariadb -u root -p"$_rpw" 2>"$_ERRF"; then
       _ok "Restore completed into the throwaway database"
     else
       _bad "Restore FAILED even though the object decrypted."
