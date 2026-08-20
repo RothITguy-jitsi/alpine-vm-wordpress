@@ -868,8 +868,32 @@ case "${1:-status}" in
     # that the restore pipes a dump on stdin. Passing the credential as an
     # environment variable removes the quoting from the equation entirely and
     # keeps it out of argv inside the container as a bonus.
-    if gzip -dc "$_plain" | podman exec -i "$_cont" \
-         mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot --database=drill 2>"$_ERRF"; then
+    # STRIP THE mysql SCHEMA before restoring.
+    #
+    # The backup is `mariadb-dump --all-databases`, which includes the `mysql`
+    # database -- and restoring that into the throwaway container overwrites
+    # its own credential tables with the SOURCE system's. Partway through the
+    # restore the connection's password stops being valid and every remaining
+    # statement fails with:
+    #     ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+    #                         (using password: YES)
+    # "using password: YES" is the tell: a password WAS sent and rejected, by a
+    # server whose credentials the restore had just replaced.
+    #
+    # This cost three attempts, each blamed on how the password was passed --
+    # MYSQL_PWD, then a defaults file -- when the credential was correct every
+    # time and the restore was invalidating it mid-stream.
+    #
+    # The system schemas are not what a drill is proving. Skip them and restore
+    # the site's data, which is the thing that has to come back.
+    if gzip -dc "$_plain" \
+       | awk '
+           /^-- Current Database: `(mysql|performance_schema|information_schema|sys)`/ { skip=1; next }
+           /^-- Current Database: `/ { skip=0 }
+           !skip
+         ' \
+       | podman exec -i "$_cont" \
+         mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot 2>"$_ERRF"; then
       _ok "Restore completed into the throwaway database"
     else
       _bad "Restore FAILED even though the object decrypted."
@@ -883,7 +907,7 @@ case "${1:-status}" in
 
     # 5. Sanity-check content: a restore that loads an empty dump is not a pass.
     _tables=$(podman exec "$_cont" \
-      mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='drill';" 2>/dev/null) || _tables=""
+      mariadb --defaults-extra-file=/tmp/.drill.cnf -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','performance_schema','information_schema','sys');" 2>/dev/null) || _tables=""
     _unused=$(podman exec -e MYSQL_PWD="$_rpw" "$_cont" \
       mariadb -uroot -N -e 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema="drill";' 2>/dev/null)
     if [ "${_tables:-0}" -gt 0 ]; then
