@@ -6,6 +6,157 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13m — Two files held the destination, and neither said which won
+
+An operator changed the backup bucket. They edited `OFFSITE_DEST` in
+`/etc/wp-install/vars.sh`, confirmed the edit with grep, confirmed the value
+sourced correctly with `. vars.sh; echo $OFFSITE_DEST` — and `status` kept
+reporting the old destination.
+
+Nothing they did was wrong. The tool reads `/etc/wp-install/offsite.conf` and
+never looks at `vars.sh`, which holds a second copy as the install-time record.
+Two files carried the same setting, no documentation stated the precedence, and
+editing the wrong one produced **no error, no warning, and no result** — the
+worst combination available, because there is nothing to notice.
+
+Closed three ways:
+
+- **`set-destination`** writes both files and, before reporting success, tests
+  that the new destination is actually readable. A wrong bucket or a token
+  scoped to the previous one is caught immediately rather than at the next
+  scheduled backup. Previous config kept as `.prev`.
+- **`status` detects the mismatch** and names which file is in force, so the
+  same hour cannot be lost twice.
+- The precedence is stated in the code, in the README, and in the tool's own
+  output.
+
+That completes the pair — `set-credentials` was added earlier after hand-editing
+`rclone.conf` introduced a pasted label prefix that took two sessions to find.
+Both of those hours were spent because a config that needs changing occasionally
+had no command to change it, and an editor was the only route.
+
+The general lesson, recorded in TODO: a setting stored in two places with no
+stated precedence is not a duplication problem, it is a correctness problem.
+
+---
+
+## 2026.08.13l — CrowdSec never saw a single login failure. It was a filename.
+
+Reported from the field: repeated wrong passwords at the login screen produced
+the application-layer 429 and **no CrowdSec ban, ever**. My first diagnosis
+blamed failed 2FA attempts not firing `wp_login_failed`. That was wrong twice
+over — the Two Factor plugin does fire it (upstream issue #471 concerns it
+passing the wrong argument count), and the gap was not about 2FA at all.
+
+**CrowdSec's acquisition watched `/var/log/wordpress/error.log`. PHP writes to
+`php-errors.log`.** Different file. The Login Guard's events never reached
+CrowdSec — not the 2FA ones, not any of them.
+
+What makes this worth writing down is that **every component was correct**:
+
+  * the mu-plugin logged in exactly the format the parser expected
+  * the parser's grok matched that format precisely
+  * the scenario was installed, valid, and correctly filtered
+  * the bouncer was registered, pulling, and had its nftables set
+
+A complete, healthy chain that could never fire, because the first link read the
+wrong file. Every individual check passed. `crowdsec-doctor` — added three
+releases ago specifically to prove remediation works — passed too, because it
+tested each component and the test ban it injects goes in via `cscli`,
+downstream of the acquisition.
+
+Fixed: the acquisition now watches both files. And `crowdsec-doctor` gained the
+check that would have caught it — whether the file PHP actually writes to
+appears in the acquisition config. Component health is not chain health, and
+this is the second time in this series that a diagnostic proved the pieces while
+missing the join between them.
+
+**The 2FA question is still open, and deliberately not claimed as fixed.**
+Whether a wrong second factor with a correct password produces an event at all
+now needs testing on hardware. It may already be covered. TODO records the
+correction rather than quietly rewriting the original wrong entry, because a
+diagnosis that was confidently wrong is worth keeping visible.
+
+---
+
+## 2026.08.13k — Documentation caught up with what is now proven
+
+Housekeeping, but the kind that matters: the docs were still describing
+off-site recovery as an open question after it had been demonstrated.
+
+**README** now states that recovery is proven on hardware, with the date and
+the measured RTO — and immediately qualifies it: the MECHANISM is proven; your
+key, token and destination are not, until the drill runs on your deployment.
+That distinction is the whole point of the drill existing as a recurring step
+rather than a one-off note, and blurring it would be the same overclaiming this
+project treats as a defect elsewhere.
+
+**TODO** closes "Restore has never been proven end to end", which had been open
+since the first entry in this log. It records what was proven and what was not,
+so nobody reads the closure as broader than it is.
+
+**MSP-RUNBOOK** gains a section on recovery time: the reference RTO, the
+instruction to use the drill's own number instead because it scales with
+database size and link speed, what the drill proves (the object is retrievable,
+decryptable and loadable) versus what it does not (that the live site comes
+back — a different and more disruptive exercise), and the note that an RTO
+drifting upward over months is the early warning that a database has outgrown
+its recovery window.
+
+**README also documents `wasp-triage.sh --recheck-blockers`**, with the reason
+it exists: a VM passing 53 of 53 checks while `--check` reported CRITICAL from
+a resolved condition. A marker that cries wolf trains an operator to read past
+the one thing designed to be unmissable.
+
+Verified across the set: 82 internal links resolve, 20 operator tools
+documented, version claims agree with the shipped image tag, spelling clean, all
+code fences balanced, and all 20 static checks plus the syntax sweep and the
+21-case MFA harness pass.
+
+---
+
+## 2026.08.13j — Off-site recovery proven. The last assumption is now evidence.
+
+    Pulled from offsite, decrypted with the recovery key, restored, and
+    verified non-empty. This is evidence, not an assumption.
+
+    object      : wp-db-20260820-152722.sql.gz.age
+    fetch       : 2s     decrypt+gzip: 19s     restore: 12s
+    TOTAL (RTO) : 33s
+
+The remote restore drill completed on hardware. An encrypted object was pulled
+from Cloudflare R2, decrypted with the operator's age key, restored into an
+isolated throwaway MariaDB and verified to contain 12 tables — in 33 seconds.
+
+That was the last unproven claim in this platform. Everything else had been
+demonstrated; recovery had only ever been argued for. It is now measured, with
+an RTO a client can be quoted.
+
+Alongside it, in the same run: **53 checks passed, 0 warnings, 0 failures.**
+MFA enforced with the Two Factor plugin active. Mail delivered end to end and
+received. CrowdSec blocking. Egress enforcing. Core at 7.0.4 matching the pinned
+image. Digest pinning intact.
+
+**The one remaining failure was a stale blocker, and that is now fixable.**
+`--check` returned CRITICAL from a PRODUCTION-BLOCKER written before MFA was
+installed by hand — while full validation confirmed MFA active in the same
+minute. Blockers were written once and never re-tested, so a condition that had
+been resolved kept reporting itself.
+
+That matters more than a cosmetic mismatch. A stale blocker is as damaging as a
+missing one: it trains an operator to read past the single thing designed to be
+unmissable. `wasp-triage.sh --recheck-blockers` now re-tests each recorded
+blocker against the running system, clears the ones that are genuinely resolved,
+keeps the ones that are not, and removes the marker only when the file is empty.
+`--check` names the command in its own output, and it is on the menu.
+
+Worth stating plainly at this point in the series: the deferred installer always
+cleared its own blocker. A manual install had no path to. The gap was not in the
+control — it was in assuming the only route to a fixed state was the automated
+one.
+
+---
+
 ## 2026.08.13i — Copying what works, instead of theorising about what does not
 
 The same run that failed the remote restore drill PASSED the local one:

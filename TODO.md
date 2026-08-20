@@ -477,7 +477,22 @@ decommissioning; it does not cover the operator being unavailable.
 Worth a documented custody list — what exists, where it is held, and who else
 can reach it — rather than tooling.
 
-### Restore has never been proven end to end — MEANS NOW EXIST, run still owed
+### Restore proven end to end — CLOSED 2026-08-20
+
+Proven on hardware. `remote-restore-drill` pulled an encrypted object from
+Cloudflare R2, decrypted it with the operator's age key, restored it into an
+isolated throwaway MariaDB and verified 12 tables — **RTO 33 seconds** for a
+977 KB archive.
+
+That closes the last item in this project that rested on reasoning rather than
+evidence. Everything else had been demonstrated; recovery had only ever been
+argued for.
+
+Still true, and the reason the drill exists rather than a one-off note: this
+proves the MECHANISM. Each deployment's own key, token and destination are
+unproven until the drill runs there. It is a monthly item on the MSP checklist,
+not a box ticked once.
+
 
 `wasp-selftest.sh restore-test` proves the *local* backup restores. The gap was
 that nobody had taken an *encrypted, off-VM* copy, decrypted it elsewhere, and
@@ -527,7 +542,34 @@ redirect loop that no individual check caught (see the 2026.08.11h entry).
 duplication safe, but the real fix is one function emitting both. Worth doing
 the next time this area is touched.
 
-### CrowdSec does not see failed 2FA attempts
+### CrowdSec does not see failed logins — ROOT CAUSE FOUND 2026-08-20
+
+**The original diagnosis in this entry was wrong**, and it is left below so the
+correction is visible rather than quietly rewritten.
+
+The real cause was not the 2FA hook. It was a filename. CrowdSec's acquisition
+watched `/var/log/wordpress/error.log`, while PHP's `error_log` directive writes
+to `php-errors.log` — so the Login Guard's events never reached CrowdSec at all.
+Not the 2FA ones; NONE of them.
+
+What makes this worth recording: every component was correct. The mu-plugin
+logged in exactly the format the parser expected, the parser's grok matched it,
+the scenario was installed and valid, the bouncer was registered and pulling,
+and the nftables set existed. A complete, healthy chain that could never fire,
+because the first link read the wrong file. The operator saw the application
+layer's 429 and no firewall ban, which is precisely the symptom.
+
+Fixed: the acquisition now watches both files, and `crowdsec-doctor` checks that
+the file PHP actually writes to appears in the acquisition — so a future
+mismatch is reported rather than silently swallowing every event.
+
+Still open, and genuinely separate: whether a failed SECOND FACTOR with a
+correct password produces an event at all. The Two Factor plugin does fire
+`wp_login_failed` (upstream issue #471 concerns it passing the wrong argument
+count), so it may already be covered now that the events are visible. That needs
+testing on hardware rather than reasoning — deliberately not claimed as fixed.
+
+### (original entry, kept for the record) CrowdSec does not see failed 2FA attempts
 
 Found in the field. A login with the CORRECT password and a wrong TOTP code
 fires no `wp_login_failed` event, so CrowdSec's WordPress scenarios never see
@@ -548,4 +590,19 @@ Two contributing parts, and they need separating before fixing:
 Worth doing properly rather than quickly: a scenario that bans too eagerly on
 2FA prompts will lock out the legitimate admin who fat-fingered a code twice,
 which is a worse outcome than the gap.
+
+### Two files held OFFSITE_DEST — CLOSED 2026-08-20
+
+`offsite.conf` is what the tool reads; `vars.sh` held a second copy as the
+install record, and nothing said which won. An operator changed the bucket in
+`vars.sh`, verified the edit three ways, and `status` kept reporting the old
+destination — correctly, because that file is never read.
+
+Closed three ways: `set-destination` writes both and tests the result before
+declaring success, `status` reports a mismatch rather than silently preferring
+one, and the precedence is stated in the code and the README.
+
+The general lesson is worth keeping: a setting stored in two places with no
+stated precedence is not a duplication problem, it is a correctness problem.
+Anyone editing the wrong one gets no error, no warning, and no result.
 

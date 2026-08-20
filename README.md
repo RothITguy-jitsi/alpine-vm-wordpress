@@ -129,8 +129,12 @@ automated pipeline.
 
 **Current state.** In use across roughly a dozen client sites. Admin MFA,
 egress filtering, checksum verification, core updates and local restore are all
-proven on real hardware. Off-site restore has a tool and a documented drill; run
-it yourself before depending on it. The `CHANGELOG.md` is deliberately a
+proven on real hardware — including **off-site restore**, demonstrated end to
+end on 2026-08-20: an encrypted object pulled from object storage, decrypted
+with the recovery key, restored into an isolated database and verified
+non-empty, with a measured RTO of 33 seconds. Run the drill yourself on YOUR
+deployment before depending on it; the claim here is that the mechanism works,
+not that your key and destination do. The `CHANGELOG.md` is deliberately a
 post-mortem log rather than a feature list — if you want to know how much of
 this was learned the hard way, read it.
 
@@ -477,7 +481,10 @@ tells you what is still owed:
 
 - **The offsite restore drill** (option 13) — it needs your recovery key and
   pulls a real encrypted object, so it stays a separate, deliberate step. Until
-  it has run, offsite recovery is an assumption rather than evidence.
+  it has run **on this VM**, offsite recovery is an assumption rather than
+  evidence. The mechanism is proven; your key, token and destination are not,
+  until the drill says so. It prints an RTO — record it against the client's
+  RPO target.
 - **The MFA lockout test**, if enforcement is on — deliberately lock out a test
   admin and confirm the console recovery brings them back.
 
@@ -564,6 +571,49 @@ doas wp-hardening.sh enable  php-exec      # block them again
 Before turning it off, it is worth asking whether the plugin that needs shell
 access is worth the exposure — usually there is an alternative that does the
 same job in PHP.
+
+## Changing the backup destination or credentials
+
+Both have commands. Neither needs an editor:
+
+```sh
+doas wasp-offsite-backup.sh set-destination     # remote:bucket/prefix
+doas wasp-offsite-backup.sh set-credentials     # access key + secret
+```
+
+Each keeps the previous config as `.prev`, and **tests the new value against
+the destination before reporting success** — so a wrong bucket or an unscoped
+token is caught immediately rather than at the next scheduled backup.
+
+**Two files carry the destination, and only one is read.** The tool uses
+`/etc/wp-install/offsite.conf`; `vars.sh` holds a copy as the install-time
+record. That split cost an operator an hour: they edited `vars.sh`, confirmed
+the edit, confirmed it sourced correctly, and `status` kept reporting the old
+value — because the tool never reads that file. `status` now detects the
+disagreement and says which one is in force. `set-destination` updates both so
+they stop diverging.
+
+## When a blocker no longer applies
+
+A PRODUCTION-BLOCKER is written when a fail-closed control does not pass at
+install, and `validate-wordpress.sh --check` reports CRITICAL while the marker
+exists. Blockers are not re-tested on their own, so once you fix the underlying
+condition the marker keeps reporting it.
+
+```sh
+doas wasp-triage.sh --recheck-blockers
+```
+
+That re-tests each recorded blocker against the running system, clears the ones
+genuinely resolved, keeps the ones that are not, and removes the marker only
+when the file is empty. It is on the Testing menu, and `--check` names it in its
+own output.
+
+This exists because a stale blocker is as damaging as a missing one. Seen on a
+real VM: full validation passed 53 of 53 with MFA enforced and active, while
+`--check` still reported CRITICAL from a blocker written before the plugin was
+installed by hand. A marker that cries wolf trains an operator to read past the
+one thing designed to be unmissable.
 
 ## Commercial themes and plugins
 

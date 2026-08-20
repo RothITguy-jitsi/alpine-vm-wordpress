@@ -264,6 +264,26 @@ Work the fleet in this order, worst first:
 Record the triage output per client in the ticket. On a fleet, "I think I fixed
 that one" is not a record.
 
+## Recovery time, and what you can tell a client
+
+`wasp-offsite-backup.sh remote-restore-drill` prints a measured RTO. On the
+reference deployment that is **33 seconds** for a 977 KB archive — 2s to fetch,
+19s to decrypt and verify, 12s to restore.
+
+Use the drill's own number rather than that one. It scales with database size
+and link speed, and a client's RPO/RTO conversation should be grounded in their
+VM, not a reference figure.
+
+What the drill proves, precisely: that the object in off-site storage can be
+retrieved, decrypted with the key you hold, and loaded into a working database.
+What it does not prove is that the site comes back — that is a restore into
+production, which is a different and more disruptive exercise.
+
+Run it monthly, and after any change to the backup key, the destination, or the
+encryption recipient. Record the RTO in the ticket each time; a number that
+drifts upward is the early warning that a database has outgrown its recovery
+window.
+
 ## Key custody
 
 Fill in [docs/KEY-CUSTODY.md](docs/KEY-CUSTODY.md) per client and store it

@@ -160,8 +160,8 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-WASP_VERSION="2026.08.13i"
-WASP_VERSION_NOTE="Remote drill now mirrors the local restore that has always worked; wp-cli container mounts the secrets dir so mail stops falling back to PHP mail()"
+WASP_VERSION="2026.08.13m"
+WASP_VERSION_NOTE="set-destination command; two files held OFFSITE_DEST with no stated precedence, so editing the wrong one gave no error and no result - now detected and reported"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
