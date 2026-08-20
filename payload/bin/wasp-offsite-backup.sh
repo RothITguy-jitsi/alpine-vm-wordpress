@@ -59,6 +59,21 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root (or via doas)" >&2; exit 1
 fi
 
+# ── One source of truth: offsite.conf ────────────────────────────────────────
+# vars.sh ALSO carries OFFSITE_DEST, written at install as the provisioning
+# record. This tool reads offsite.conf and nothing else.
+#
+# That split cost a real operator an hour. They edited OFFSITE_DEST in vars.sh
+# to change bucket, confirmed the edit with grep, confirmed the value sourced
+# correctly with `. vars.sh; echo $OFFSITE_DEST` -- and `status` kept reporting
+# the old destination, because the tool never reads that file. Nothing was
+# wrong with what they did; two files held the same setting and neither said
+# which one wins.
+#
+# offsite.conf is authoritative because it is what runs. vars.sh remains the
+# install-time record. To avoid the same hour happening twice, a mismatch is
+# now DETECTED and reported rather than silently ignored -- and
+# `set-destination` exists so nobody has to hand-edit either file.
 CONF=/etc/wp-install/offsite.conf
 SSH_KEY=/etc/wp-install/offsite-key
 RCLONE_CONF=/etc/wp-install/rclone.conf
@@ -477,7 +492,66 @@ do_restore() {
 }
 
 case "${1:-status}" in
+  set-destination|set-dest)
+    # Change the backup destination without hand-editing a config file. The
+    # equivalent for credentials already exists; the destination did not, so
+    # the only route was an editor -- which is how the wrong file got edited.
+    _configured || { _bad "Off-site backup is not configured. Run: doas wasp-offsite-backup.sh init"; exit 1; }
+    _new="${2:-}"
+    if [ -z "$_new" ]; then
+      echo "Current destination: ${OFFSITE_DEST}"
+      echo ""
+      echo "Format: remote:bucket/prefix   (the part before ':' is the rclone"
+      echo "remote name and normally stays as it is)"
+      printf '  New destination: '
+      read -r _new
+    fi
+    [ -n "$_new" ] || { _bad "Cancelled — nothing changed."; exit 1; }
+    case "$_new" in
+      *[!A-Za-z0-9:/._-]*) _bad "Refusing that value: it contains characters a remote path should not."; exit 1 ;;
+      *:*) : ;;
+      *) _bad "Expected remote:bucket/prefix — there is no ':' in that value."; exit 1 ;;
+    esac
+
+    cp -a "$CONF" "${CONF}.prev" 2>/dev/null || true
+    _t=$(mktemp) || exit 1
+    sed "s|^OFFSITE_DEST=.*|OFFSITE_DEST=${_new}|" "$CONF" > "$_t" && mv -f "$_t" "$CONF"
+    chmod 600 "$CONF"
+    # Keep the provisioning record in step, so the two files stop disagreeing.
+    if [ -w /etc/wp-install/vars.sh ]; then
+      sed -i "s|^OFFSITE_DEST=.*|OFFSITE_DEST=\"${_new}\"|" /etc/wp-install/vars.sh 2>/dev/null || true
+    fi
+    _ok "Destination set to ${_new} (previous kept at ${CONF}.prev)"
+    echo ""
+    _note "Testing that it is reachable and readable…"
+    if rclone --config "$RCLONE_CONF" ls "$_new" >/dev/null 2>&1; then
+      _ok "Reachable. Send one now:  doas wp-db-backup.sh"
+    else
+      _bad "Cannot read ${_new}:"
+      rclone --config "$RCLONE_CONF" ls "$_new" 2>&1 | tail -6 | sed 's/^/    /'
+      _note "  A new bucket needs a token scoped to IT, not the previous one."
+      _note "  Roll back:  doas mv ${CONF}.prev ${CONF}"
+      exit 1
+    fi ;;
+
   status)
+    # If vars.sh and offsite.conf disagree, SAY SO. Someone has edited one of
+    # them expecting it to take effect, and silently preferring the other is
+    # how an hour disappears. The tool reads offsite.conf; vars.sh is the
+    # install-time record.
+    if [ -r /etc/wp-install/vars.sh ]; then
+      _vd=$(sed -n 's/^OFFSITE_DEST=//p' /etc/wp-install/vars.sh 2>/dev/null \
+            | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+      if [ -n "$_vd" ] && [ -n "${OFFSITE_DEST:-}" ] && [ "$_vd" != "$OFFSITE_DEST" ]; then
+        _bad "CONFIG MISMATCH — two files disagree about the destination:"
+        _note "    /etc/wp-install/offsite.conf : ${OFFSITE_DEST}   <- this one is used"
+        _note "    /etc/wp-install/vars.sh      : ${_vd}   <- install record only"
+        _note "  If you edited vars.sh expecting a change, it had no effect."
+        _note "  Set it properly with:  doas wasp-offsite-backup.sh set-destination"
+        echo ""
+      fi
+    fi
+
     # Surface the last push failure FIRST. Someone running `status` after a
     # complaint about the offsite copy wants the cause, and it was already
     # captured -- there is no reason to make them find it.

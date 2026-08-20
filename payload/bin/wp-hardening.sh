@@ -285,6 +285,25 @@ case "${1:-status}" in
          echo "     Registered but never pulled — check the API key in"
          echo "     /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"; fi
 
+    # Does the acquisition actually SEE the login events? Every component can
+    # be healthy while the first link reads the wrong file -- which is exactly
+    # what happened: mu-plugin logging correctly, parser grok matching, scenario
+    # valid, bouncer pulling, and no ban ever issued because the acquisition
+    # watched error.log while PHP wrote php-errors.log.
+    printf "  %-38s " "5b. CrowdSec sees Login Guard events"
+    _acq=$(podman exec crowdsec sh -c 'cat /etc/crowdsec/acquis.yaml 2>/dev/null' 2>/dev/null)
+    _phplog=$(podman exec wordpress sh -c 'ls -1 /var/log/apache2/php-errors.log 2>/dev/null' 2>/dev/null)
+    if [ -n "$_phplog" ] && ! printf '%s' "$_acq" | grep -q 'php-errors.log'; then
+      echo "NO"
+      echo "     PHP writes login events to php-errors.log, but the acquisition"
+      echo "     does not list that file. The parser and scenario will never"
+      echo "     receive them, and no ban can be issued however many attempts"
+      echo "     are made. Add it to /etc/crowdsec/acquis.yaml and restart."
+      _cs_fail=$((_cs_fail+1))
+    else
+      echo "yes"
+    fi
+
     printf "  %-38s " "6. nftables has the crowdsec set"
     if nft list ruleset 2>/dev/null | grep -qi "crowdsec"; then echo "yes"
     else echo "NO"; _cs_fail=$((_cs_fail+1))

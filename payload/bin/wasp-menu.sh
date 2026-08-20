@@ -156,6 +156,7 @@ menu_backup() {
     2) Off-site backup status        ${DIM}wasp-offsite-backup.sh status${R}
     7) Why is nothing off-VM?        ${DIM}wasp-offsite-backup.sh doctor${R}
     8) Replace storage credentials   ${DIM}wasp-offsite-backup.sh set-credentials${R}
+    9) Change backup destination     ${DIM}wasp-offsite-backup.sh set-destination${R}
     3) List off-site backups         ${DIM}wasp-offsite-backup.sh list${R}
     4) ${RED}[!]${R} Prove offsite recovery      ${DIM}wasp-offsite-backup.sh remote-restore-drill${R}
     5) ${RED}[!]${R} Restore from backup          ${DIM}wasp-offsite-backup.sh restore${R}
@@ -168,6 +169,7 @@ EOF
       2) _have wasp-offsite-backup.sh && run "Off-site status" 0 wasp-offsite-backup.sh status || _missing wasp-offsite-backup.sh ;;
       7) _have wasp-offsite-backup.sh && run "Off-site diagnosis" 0 wasp-offsite-backup.sh doctor || _missing wasp-offsite-backup.sh ;;
       8) _have wasp-offsite-backup.sh && run "Replace storage credentials" 1 wasp-offsite-backup.sh set-credentials || _missing wasp-offsite-backup.sh ;;
+      9) _have wasp-offsite-backup.sh && run "Change backup destination" 1 wasp-offsite-backup.sh set-destination || _missing wasp-offsite-backup.sh ;;
       3) _have wasp-offsite-backup.sh && run "List off-site" 0 wasp-offsite-backup.sh list || _missing wasp-offsite-backup.sh ;;
       4) _have wasp-offsite-backup.sh && run "Remote restore drill" 1 wasp-offsite-backup.sh remote-restore-drill || _missing wasp-offsite-backup.sh ;;
       5) _have wasp-offsite-backup.sh && run "Restore from backup" 1 wasp-offsite-backup.sh restore || _missing wasp-offsite-backup.sh ;;
@@ -317,6 +319,7 @@ menu_testing() {
   ${B}Testing & validation${R}  ${DIM}(prove it works — nothing here changes the site)${R}
     1) ${GRN}Commission check (guided)${R}      ${DIM}runs the full sequence below${R}
    20) ${GRN}Known-defect triage${R}            ${DIM}wasp-triage.sh${R}
+   21) Re-test production blockers   ${DIM}wasp-triage.sh --recheck-blockers${R}
     ---
     2) Quick health (exit code)      ${DIM}validate-wordpress.sh --check${R}
     3) Full validation               ${DIM}validate-wordpress.sh${R}
@@ -341,6 +344,7 @@ EOF
     case "$c" in
       1) commission_check ;;
       20) _have wasp-triage.sh && run "Known-defect triage" 0 wasp-triage.sh || _missing wasp-triage.sh ;;
+      21) _have wasp-triage.sh && run "Re-test production blockers" 0 wasp-triage.sh --recheck-blockers || _missing wasp-triage.sh ;;
       2) _have validate-wordpress.sh && run "Quick health" 0 validate-wordpress.sh --check || _missing validate-wordpress.sh ;;
       3) _have validate-wordpress.sh && run "Full validation" 0 validate-wordpress.sh || _missing validate-wordpress.sh ;;
       4) _have wasp-selftest.sh && run "Self-test: all" 0 wasp-selftest.sh all || _missing wasp-selftest.sh ;;

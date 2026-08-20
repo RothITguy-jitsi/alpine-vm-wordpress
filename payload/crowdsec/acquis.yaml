@@ -10,7 +10,21 @@ labels:
 ---
 # WordPress error log — carries WPVM Login Guard events. Read-only mount,
 # already present on the crowdsec container (/var/log/wordpress).
+#
+# BOTH filenames, deliberately. PHP's error_log directive points at
+# php-errors.log (see payload/php-conf/security.ini), while Apache's own error
+# log is error.log. This acquisition watched only the latter, so the Login
+# Guard's events -- written with error_log() and therefore landing in
+# php-errors.log -- never reached CrowdSec at all.
+#
+# The effect was a complete chain that did nothing: the mu-plugin logged
+# correctly, the parser's grok matched the format exactly, the scenario was
+# installed and valid, the bouncer was registered and pulling. Every component
+# worked and no ban was ever issued, because the first link read the wrong
+# file. Reported from a live VM: repeated wrong passwords produced the
+# application-layer 429 and no firewall block.
 filenames:
   - /var/log/wordpress/error.log
+  - /var/log/wordpress/php-errors.log
 labels:
   type: wpvm-login

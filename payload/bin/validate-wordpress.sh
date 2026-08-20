@@ -129,7 +129,7 @@ if [ "$CHECK_MODE" = "1" ]; then
   # A production blocker means a fail-closed control did not pass at install.
   # CRITICAL, not warning: the VM completed its build but was explicitly not
   # certified, and that must not fade quietly into a green dashboard.
-  [ -s /etc/wp-install/PRODUCTION-BLOCKERS ] && { _p=2; _msg="${_msg}PRODUCTION-BLOCKER "; }
+  [ -s /etc/wp-install/PRODUCTION-BLOCKERS ] && { _p=2; _msg="${_msg}PRODUCTION-BLOCKER(run:wasp-triage.sh--recheck-blockers) "; }
   # OFF-SITE STALENESS. A failed push is already reported, but a token that
   # EXPIRES fails every push silently from that day on -- and on a real fleet
   # that went unnoticed for a week, because nothing on the VM changed. The only

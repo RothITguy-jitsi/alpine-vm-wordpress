@@ -29,6 +29,64 @@ fi
 FIX=0
 [ "${1:-}" = "--fix" ] && FIX=1
 
+# ── Re-validate recorded production blockers ─────────────────────────────────
+# A blocker is written when a fail-closed control does not pass at install. It
+# is NOT re-tested afterwards, so once the condition is fixed the file keeps
+# reporting it -- and `--check` keeps returning CRITICAL over something that is
+# no longer true.
+#
+# Seen on a VM whose full validation passed 53/53 with MFA enforced and active,
+# while --check still reported PRODUCTION-BLOCKER from the MFA entry written
+# before the plugin was installed by hand. The deferred installer clears its own
+# blocker; a manual install had no way to.
+#
+# A stale blocker is as damaging as a missing one. It trains an operator to read
+# past the one thing designed to be unmissable.
+if [ "${1:-}" = "--recheck-blockers" ]; then
+  _bf=/etc/wp-install/PRODUCTION-BLOCKERS
+  [ -s "$_bf" ] || { echo "No production blockers recorded."; exit 0; }
+  echo "Re-testing each recorded blocker against the running system:"
+  echo ""
+  _keep=$(mktemp) || exit 1
+  _cleared=0; _still=0
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    _resolved=0
+    case "$_line" in
+      *"Two Factor plugin"*|*"MFA was requested"*)
+        if podman exec --user 33 wordpress test -d /var/www/html/wp-content/plugins/two-factor 2>/dev/null; then
+          _resolved=1; echo "  RESOLVED  MFA — the Two Factor plugin is present and active"
+        fi ;;
+      *"nftables ruleset"*|*"no host firewall"*)
+        if nft list tables 2>/dev/null | grep -q .; then
+          _resolved=1; echo "  RESOLVED  Firewall — nftables has tables loaded"
+        fi ;;
+      *"Squid"*)
+        if podman ps --filter 'name=^squid$' --filter status=running --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+          _resolved=1; echo "  RESOLVED  Squid — the egress proxy is running"
+        fi ;;
+    esac
+    if [ "$_resolved" = 1 ]; then
+      _cleared=$((_cleared+1))
+    else
+      printf '%s\n' "$_line" >> "$_keep"
+      _still=$((_still+1))
+      echo "  STILL OPEN  $(printf '%s' "$_line" | cut -c1-70)…"
+    fi
+  done < "$_bf"
+
+  echo ""
+  if [ "$_still" -eq 0 ]; then
+    rm -f "$_bf" "$_keep"
+    echo "  All ${_cleared} blocker(s) resolved. Marker removed."
+    echo "  Confirm:  doas validate-wordpress.sh --check"
+  else
+    mv -f "$_keep" "$_bf"; chmod 600 "$_bf" 2>/dev/null || true
+    echo "  ${_cleared} cleared, ${_still} still open. Marker kept."
+  fi
+  exit 0
+fi
+
 RED=''; GRN=''; YEL=''; BLD=''; CL=''
 if [ -t 1 ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
   RED=$(printf '\033[31m'); GRN=$(printf '\033[32m'); YEL=$(printf '\033[33m')
