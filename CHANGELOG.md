@@ -6,6 +6,47 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13n — Squid did not survive a reboot
+
+A commission check that had passed cleanly came back after a reboot with:
+
+    api.wordpress.org via proxy — no response
+    The boundary is NOT holding.
+
+**Squid was the only container in this stack without an OpenRC service.**
+wordpress, mariadb, crowdsec and cs-firewall-bouncer all had one; Squid relied
+on `podman run --restart=always`, which podman honours while its own machinery
+is running but NOT across a reboot under OpenRC — there is no systemd generator
+here to bring it back.
+
+So every reboot left the firewall still redirecting WordPress to
+10.89.10.2:3128 with nothing listening there. That is worse than the proxy
+being absent by design: outbound requests hang until they time out, and the
+failure reads as a policy problem rather than a missing service. The gap only
+shows after a reboot, which is exactly the event nobody tests before handing a
+VM over.
+
+The new service deliberately declares `before wp-container` rather than
+`need wp-container` — the proxy should be up before WordPress starts making
+requests through it. It also verifies Squid is still running ten seconds after
+start, because a Squid whose policy fails to parse exits immediately, and
+reporting success for that is how a VM comes up with a firewall pointing at
+nothing.
+
+**Also: `crowdsec-doctor` was crying wolf.** It reported "NO last_pull
+recorded — attackers may be detected and NOT blocked" on a VM where step 7 —
+an actual injected ban reaching nftables in 8 seconds — had just passed. The
+`last_pull` field is absent until the first pull is recorded and its name has
+varied between CrowdSec releases, so its absence proves nothing. Now
+informational, with the live test named as the authority.
+
+That is the second check in two releases that reported a fault on a working
+control. Both were mine, and both had the same shape: inferring health from a
+field rather than from behaviour, when a behavioural test was sitting right
+next to it.
+
+---
+
 ## 2026.08.13m — Two files held the destination, and neither said which won
 
 An operator changed the backup bucket. They edited `OFFSITE_DEST` in
