@@ -104,6 +104,19 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
     "${SQUID_RUN_IMAGE}" \
     >/dev/null 2>&1 && ok "Squid running on 10.89.10.2:3128" \
     || _squid_start_failed=1
+
+  # Register the boot service. Squid was the ONLY container here without one,
+  # relying on --restart=always, which podman does not honour across a reboot
+  # under OpenRC. Every reboot left the firewall redirecting WordPress to a
+  # proxy that was not running -- and the resulting timeouts read as a policy
+  # failure rather than a missing service.
+  if [ -f "${PAYLOAD_DIR}/init.d/squid-container" ]; then
+    install -m 0755 "${PAYLOAD_DIR}/init.d/squid-container" /etc/init.d/squid-container
+    rc-update add squid-container default 2>/dev/null || true
+    ok "  squid-container service registered (survives reboot)"
+  else
+    warn "  No squid-container service — the proxy will NOT come back after a reboot."
+  fi
   if [ "${_squid_start_failed:-0}" = "1" ]; then
     if [ "${DEPLOYMENT_PROFILE:-standard}" = "production" ]; then
       block_production "Squid did not start (EGRESS_PROXY=1). Egress fails closed, so ALL WordPress web access (updates, plugin/theme APIs, licence checks) is broken -- completing the install would ship a site that cannot reach the internet at all. Refusing. Check: podman logs squid. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install where a dead proxy is acceptable."

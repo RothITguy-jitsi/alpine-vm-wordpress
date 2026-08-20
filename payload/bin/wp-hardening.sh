@@ -279,11 +279,17 @@ case "${1:-status}" in
     printf "  %-38s " "5. Bouncer has pulled recently"
     # A registered bouncer that never pulls is the "registered but inactive"
     # state the console flags after 24h. last_pull is the field that matters.
-    _lp=$(podman exec crowdsec cscli bouncers list -o json 2>/dev/null | grep -o '"last_pull":"[^"]*"' | head -1 | cut -d'"' -f4)
+    # Informational, NOT a failure. On a live VM this reported "NO last_pull
+    # recorded" while step 7 -- an actual injected ban reaching nftables in 8
+    # seconds -- passed. The field is absent until the first pull is recorded
+    # and its name has varied between CrowdSec releases, so its absence proves
+    # nothing. The live test is the authority; treating this as a fault meant
+    # reporting "attackers may be detected and NOT blocked" about a VM that was
+    # demonstrably blocking.
+    _lp=$(podman exec crowdsec cscli bouncers list -o json 2>/dev/null \
+          | grep -oE '"last_pull":"?[^",]*' | head -1 | cut -d'"' -f3-)
     if [ -n "$_lp" ]; then echo "yes (${_lp})"
-    else echo "NO last_pull recorded"; _cs_fail=$((_cs_fail+1))
-         echo "     Registered but never pulled — check the API key in"
-         echo "     /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"; fi
+    else echo "not recorded (see step 7 — that is the authority)"; fi
 
     # Does the acquisition actually SEE the login events? Every component can
     # be healthy while the first link reads the wrong file -- which is exactly

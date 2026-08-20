@@ -1,0 +1,87 @@
+#!/sbin/openrc-run
+name="squid-container"
+description="Egress filtering proxy (Podman)"
+
+# WHY THIS FILE EXISTS
+#
+# Squid was the only container in this stack without an OpenRC service. It
+# relied on `podman run --restart=always`, which podman honours while its own
+# machinery is running but NOT across a reboot on OpenRC — there is no systemd
+# generator here to bring it back.
+#
+# So every reboot left the VM with no egress proxy. Reported from the field:
+# a commission check that had passed cleanly before a reboot came back with
+#     api.wordpress.org via proxy — no response
+#     The boundary is NOT holding.
+# The firewall was still redirecting WordPress's traffic to 10.89.10.2:3128,
+# and nothing was listening there. That is worse than the proxy being absent by
+# design: outbound requests hang until they time out, and the failure reads as
+# a policy problem rather than a missing service.
+#
+# wordpress, mariadb, crowdsec and cs-firewall-bouncer all had services. This
+# one was missed, and the gap only shows after a reboot — which is exactly the
+# event nobody tests before handing a VM over.
+
+depend() {
+  # Needs the network and the container network to exist. Deliberately does NOT
+  # `need wp-container`: the proxy should be up BEFORE WordPress starts making
+  # requests through it, not after.
+  need net
+  after sysfs
+  before wp-container
+}
+
+start() {
+  ebegin "Starting Squid egress proxy"
+  export PODMAN_IGNORE_CGROUPSV1_WARNING=1
+
+  if ! podman container exists squid 2>/dev/null; then
+    eend 1 "The squid container does not exist — re-run the installer or wasp-egress"
+    return 1
+  fi
+
+  podman start squid >/dev/null 2>&1
+  _rc=$?
+
+  # Started is not the same as serving. A Squid whose policy fails to parse
+  # exits immediately, and reporting success for that is how a VM comes up
+  # with a firewall pointing at nothing. Give it a moment, then confirm.
+  if [ "$_rc" -eq 0 ]; then
+    _up=0
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 1
+      if podman ps --filter 'name=^squid$' --filter status=running \
+           --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+        _up=1; break
+      fi
+    done
+    if [ "$_up" = 1 ]; then
+      eend 0
+      return 0
+    fi
+    eerror "Squid started and then exited. Its policy may not parse:"
+    podman logs --tail 15 squid 2>&1 | sed 's/^/    /'
+    eerror "  WordPress egress will fail until this is fixed:"
+    eerror "    doas podman exec squid squid -k parse"
+    eend 1
+    return 1
+  fi
+  eend 1
+  return 1
+}
+
+stop() {
+  ebegin "Stopping Squid egress proxy"
+  podman stop -t 10 squid >/dev/null 2>&1
+  eend 0
+}
+
+status() {
+  if podman ps --filter 'name=^squid$' --filter status=running \
+       --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
+    einfo "squid is running"
+    return 0
+  fi
+  einfo "squid is NOT running — WordPress egress is blocked"
+  return 3
+}
