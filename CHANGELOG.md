@@ -6,6 +6,48 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 2026.08.13i — Copying what works, instead of theorising about what does not
+
+The same run that failed the remote restore drill PASSED the local one:
+
+    remote-restore-drill : ERROR 1045, Access denied
+    wasp-selftest.sh     : [PASS] Archive restored without error
+                           [PASS] siteurl present in restored data
+
+Same dump, same throwaway MariaDB, same host, minutes apart. The local path
+restores with `-p"$pw"` inline and no filtering of any kind, and it has been
+working the entire time.
+
+That disproves all three theories tried on this: MYSQL_PWD, a defaults file,
+and skipping the mysql schema on the assumption the restore was invalidating
+its own credentials. If any of those were the cause, the local restore would
+fail too. It does not.
+
+**The remote drill now uses the local form.** Not an improvement on it -- the
+same code. The password is random, the container is unreachable from the host
+network and destroyed seconds later, so argv exposure inside it is a smaller
+risk than a drill that has never once completed. Three releases were spent
+making that path more sophisticated than the one that worked.
+
+**Mail: the wp-cli container could not see the relay password.** The test failed
+with:
+
+    sendmail: can't connect to remote host (127.0.0.1): Connection refused
+
+The SMTP mu-plugin reads its credentials from `/var/www/private`, which the
+WordPress container mounts and the wp-cli container did not. The plugin loads,
+finds no config, returns early, and PHPMailer falls back to PHP `mail()` --
+which tries a local sendmail that does not exist. Every other mail check passes,
+because the relay, DNS, firewall and mu-plugin are all correct; the credential
+simply was not visible to the process being asked to send. Both wp-cli callers
+now mount it read-only.
+
+Adding that comment put it between line continuations, and
+`check-line-continuation.py` failed the build immediately -- the same check that
+caught the same mistake three releases ago, in the same position.
+
+---
+
 ## 2026.08.13h — ERROR 1045: the restore was invalidating its own credentials
 
 Third attempt at this, and the first two were fixing the wrong thing.
